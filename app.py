@@ -795,11 +795,503 @@ def analyze_broker(df):
 
 
 # ══════════════════════════════════════════════════════════════════════
+#  MODULE A — RELATIVE STRENGTH vs IHSG
+#  RS = stock outperformance vs benchmark (^JKSE)
+#  Rising RS + positive CMF = smart money rotating IN to this stock
+# ══════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_ihsg(period="1y"):
+    """Load IHSG benchmark (^JKSE) from Yahoo Finance."""
+    try:
+        df = yf.download("^JKSE", period=period, interval="1d",
+                         progress=False, auto_adjust=True)
+        if df.empty: return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df = df.rename(columns={"Close":"close"})
+        return df[["close"]].dropna()
+    except: return None
+
+
+def calc_rs(stock_df: pd.DataFrame, ihsg_df: pd.DataFrame,
+            windows: list = [20, 60]) -> dict:
+    """
+    Calculate Relative Strength of stock vs IHSG.
+
+    RS(n) = (stock_return_n / ihsg_return_n) × 100
+
+    RS > 100 = outperforming IHSG (strong)
+    RS < 100 = underperforming IHSG (weak)
+    RS trend rising = money rotating IN
+    RS trend falling = money rotating OUT
+
+    Returns dict with RS values, trend, and interpretation.
+    """
+    # Align dates
+    merged = stock_df[["close"]].rename(columns={"close":"stock"}).join(
+        ihsg_df[["close"]].rename(columns={"close":"ihsg"}), how="inner")
+    if len(merged) < max(windows) + 5:
+        return {"available": False}
+
+    results = {}
+    for w in windows:
+        stock_ret = merged["stock"] / merged["stock"].shift(w) - 1
+        ihsg_ret  = merged["ihsg"]  / merged["ihsg"].shift(w)  - 1
+        # RS ratio — normalize to 100
+        rs = (1 + stock_ret) / (1 + ihsg_ret.replace(0, np.nan)) * 100
+        results[f"rs{w}"]  = rs
+        results[f"val{w}"] = float(rs.iloc[-1]) if not pd.isna(rs.iloc[-1]) else 100.0
+        # RS trend (5-day slope normalized)
+        rs_slope = rs.diff(5).iloc[-1]
+        results[f"trend{w}"] = "rising" if rs_slope > 0 else "falling"
+
+    # RS20 momentum score (0-100)
+    rs20  = results.get("val20", 100.0)
+    rs60  = results.get("val60", 100.0)
+    t20   = results.get("trend20","flat")
+    t60   = results.get("trend60","flat")
+
+    score = 50.0
+    # RS level component (max ±25)
+    score += np.clip((rs20 - 100) * 1.5, -25, 25)
+    # RS trend component (max ±15)
+    if t20 == "rising":  score += 10
+    if t20 == "falling": score -= 10
+    if t60 == "rising":  score += 5
+    if t60 == "falling": score -= 5
+    # RS acceleration: short RS > long RS = improving momentum
+    if rs20 > rs60: score += 5
+    else:           score -= 5
+
+    score = int(np.clip(round(score), 0, 100))
+
+    # Interpretation
+    if rs20 > 110 and t20 == "rising":
+        interp = "STRONG OUTPERFORM"
+        color  = "#00e676"
+        note   = f"Stock outperforms IHSG by {rs20-100:.1f}% (20d) with rising momentum — smart money rotating IN."
+    elif rs20 > 102:
+        interp = "OUTPERFORM"
+        color  = "#88ffbb"
+        note   = f"Stock beats IHSG by {rs20-100:.1f}% (20d). Positive RS trend."
+    elif rs20 > 97 and rs20 <= 102:
+        interp = "IN LINE"
+        color  = "#ffab00"
+        note   = f"Stock moving in line with IHSG (RS {rs20:.1f}). No clear alpha."
+    elif rs20 < 90 and t20 == "falling":
+        interp = "STRONG UNDERPERFORM"
+        color  = "#ff1744"
+        note   = f"Stock underperforms IHSG by {100-rs20:.1f}% (20d) with falling momentum — smart money rotating OUT."
+    else:
+        interp = "UNDERPERFORM"
+        color  = "#ff8888"
+        note   = f"Stock lags IHSG by {100-rs20:.1f}% (20d)."
+
+    results.update({
+        "available": True,
+        "score": score,
+        "interp": interp,
+        "color": color,
+        "note": note,
+        "rs20_val": rs20,
+        "rs60_val": rs60,
+        "trend20": t20,
+        "trend60": t60,
+        "merged": merged,
+    })
+    return results
+
+
+def chart_rs(rs_data: dict, ticker: str) -> go.Figure:
+    """
+    Dual-panel RS chart:
+    Top: Normalized price comparison (stock vs IHSG rebased to 100)
+    Bottom: RS ratio line with 100 baseline
+    """
+    merged = rs_data["merged"]
+    rs20   = rs_data.get("rs20")
+    rs60   = rs_data.get("rs60")
+
+    # Rebase both to 100
+    base_stock = merged["stock"].iloc[0]
+    base_ihsg  = merged["ihsg"].iloc[0]
+    stock_rb   = merged["stock"] / base_stock * 100
+    ihsg_rb    = merged["ihsg"]  / base_ihsg  * 100
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        row_heights=[0.55, 0.45], vertical_spacing=0.04)
+
+    # Panel 1: Price comparison rebased
+    fig.add_trace(go.Scatter(
+        x=merged.index, y=stock_rb, name=ticker,
+        line=dict(color="#00e676", width=2),
+        fill=None,
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=merged.index, y=ihsg_rb, name="IHSG (^JKSE)",
+        line=dict(color="#5a7a9a", width=1.5, dash="dash"),
+    ), row=1, col=1)
+    # Shade area between
+    fig.add_trace(go.Scatter(
+        x=merged.index, y=stock_rb,
+        fill=None, mode="lines", line=dict(width=0),
+        showlegend=False,
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=merged.index, y=ihsg_rb,
+        fill="tonexty",
+        fillcolor="rgba(0,230,118,0.08)",
+        mode="lines", line=dict(width=0),
+        showlegend=False,
+        name="Alpha zone",
+    ), row=1, col=1)
+
+    # Panel 2: RS ratio lines
+    if rs20 is not None:
+        rs20_clean = rs20.dropna()
+        fig.add_trace(go.Scatter(
+            x=rs20_clean.index, y=rs20_clean,
+            name="RS 20d", line=dict(color="#00e676", width=2),
+        ), row=2, col=1)
+    if rs60 is not None:
+        rs60_clean = rs60.dropna()
+        fig.add_trace(go.Scatter(
+            x=rs60_clean.index, y=rs60_clean,
+            name="RS 60d", line=dict(color="#ffab00", width=1.5, dash="dot"),
+        ), row=2, col=1)
+
+    # Reference lines
+    fig.add_hline(y=100, line_color="rgba(255,171,0,0.5)", line_dash="dash",
+                  line_width=1, row=2, col=1)
+    fig.add_hline(y=110, line_color="rgba(0,230,118,0.2)", line_dash="dot",
+                  row=2, col=1)
+    fig.add_hline(y=90,  line_color="rgba(255,23,68,0.2)",  line_dash="dot",
+                  row=2, col=1)
+    fig.add_hrect(y0=95, y1=105, fillcolor="rgba(255,171,0,0.03)",
+                  line_width=0, row=2, col=1)
+
+    fig.update_layout(
+        paper_bgcolor="#05080c", plot_bgcolor="#090d12",
+        font=dict(color="#cdd8e6", family="IBM Plex Mono, monospace", size=11),
+        legend=dict(bgcolor="#0b1018", bordercolor="#141e2e",
+                    font=dict(size=10), orientation="h", y=1.02),
+        margin=dict(l=0, r=0, t=10, b=0),
+        height=480, hovermode="x unified",
+    )
+    for i in [1, 2]:
+        fig.update_xaxes(gridcolor="#141e2e", showgrid=True, row=i, col=1)
+        fig.update_yaxes(gridcolor="#141e2e", showgrid=True, row=i, col=1)
+    fig.update_yaxes(title_text=f"Rebased to 100", row=1, col=1)
+    fig.update_yaxes(title_text="RS Ratio", row=2, col=1)
+    return fig
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  MODULE B — BACKTESTING ENGINE
+#  Walk-forward signal simulation on historical data
+#  "If we followed this system's signals, what would the P&L look like?"
+# ══════════════════════════════════════════════════════════════════════
+
+def _compute_signal_on_slice(df_slice: pd.DataFrame) -> str:
+    """
+    Compute a simplified entry signal on a historical window.
+    Returns: 'STRONG BUY' / 'BUY' / 'WATCH' / 'AVOID' / 'STRONG AVOID'
+    Uses only technical indicators (no broker data for historical).
+    """
+    if len(df_slice) < 20:
+        return "WATCH"
+    try:
+        c_ = cmf(df_slice)
+        o_ = obv(df_slice)
+        m_ = mfi(df_slice)
+        ts = tech_score(df_slice, c_, o_, m_)
+        wp, _, _ = wyckoff(df_slice, c_, o_)
+        cmf_v = float(c_.iloc[-1]) if not pd.isna(c_.iloc[-1]) else 0
+        mfi_v = float(m_.iloc[-1]) if not pd.isna(m_.iloc[-1]) else 50
+        obv_up = o_.iloc[-1] > o_.iloc[-min(10, len(o_)-1)]
+
+        met, fail = 0, 0
+        if ts >= 65:     met  += 2
+        elif ts <= 35:   fail += 2
+        elif ts >= 55:   met  += 1
+        if cmf_v > 0.12: met  += 1
+        elif cmf_v < -0.12: fail += 1
+        if obv_up:       met  += 1
+        else:            fail += 1
+        if 15 <= mfi_v <= 45: met += 1
+        elif mfi_v > 75: fail += 1
+        if wp in ("B","C"): met += 1
+        elif wp == "E":  fail += 1
+
+        last = df_slice.iloc[-1]
+        av   = df_slice["volume"].tail(20).mean()
+        vr   = last["volume"] / av if av > 0 else 1
+        if vr >= 1.5: met += 1
+
+        if met >= 6: return "STRONG BUY"
+        if met >= 4 and fail <= 1: return "BUY"
+        if fail >= 4: return "STRONG AVOID"
+        if fail >= 3: return "AVOID"
+        return "WATCH"
+    except:
+        return "WATCH"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def run_backtest(ticker: str, period: str = "2y",
+                 hold_days_list: tuple = (5, 10, 20),
+                 min_signal: str = "BUY") -> dict:
+    """
+    Walk-forward backtest using rolling 60-day lookback windows.
+
+    For each trading day t (from day 60 to end - max_hold):
+      1. Compute signal on df[t-60:t]
+      2. If signal >= min_signal, record entry at close[t]
+      3. Measure return at t+5, t+10, t+20 days
+      4. Also vs IHSG for alpha measurement
+
+    Returns comprehensive statistics.
+    """
+    df = load_price(ticker, period)
+    ihsg = load_ihsg(period)
+    if df is None or len(df) < 80:
+        return {"available": False, "error": "Insufficient price data"}
+
+    LOOKBACK  = 60   # days of history to compute signal
+    MAX_HOLD  = max(hold_days_list)
+    SIGNAL_ORDER = ["WATCH", "AVOID", "STRONG AVOID", "BUY", "STRONG BUY"]
+    min_idx = SIGNAL_ORDER.index(min_signal)
+
+    records = []
+    for i in range(LOOKBACK, len(df) - MAX_HOLD):
+        window  = df.iloc[i-LOOKBACK:i]
+        sig     = _compute_signal_on_slice(window)
+
+        if SIGNAL_ORDER.index(sig) < min_idx:
+            continue
+
+        entry_price = float(df["close"].iloc[i])
+        entry_date  = df.index[i]
+        row = {
+            "date":       entry_date,
+            "signal":     sig,
+            "entry":      entry_price,
+        }
+        for h in hold_days_list:
+            exit_idx   = i + h
+            exit_price = float(df["close"].iloc[exit_idx])
+            ret        = (exit_price - entry_price) / entry_price * 100
+            row[f"ret_{h}d"] = round(ret, 3)
+            # vs IHSG alpha
+            if ihsg is not None:
+                ihsg_aligned = ihsg.reindex(df.index, method="ffill")
+                ihsg_entry = float(ihsg_aligned["close"].iloc[i])
+                ihsg_exit  = float(ihsg_aligned["close"].iloc[exit_idx])
+                ihsg_ret   = (ihsg_exit - ihsg_entry) / ihsg_entry * 100
+                row[f"alpha_{h}d"] = round(ret - ihsg_ret, 3)
+        records.append(row)
+
+    if not records:
+        return {"available": False, "error": "No signals generated in this period"}
+
+    df_res = pd.DataFrame(records)
+
+    # ── Statistics per holding period
+    stats = {}
+    for h in hold_days_list:
+        col = f"ret_{h}d"
+        if col not in df_res.columns: continue
+        rets  = df_res[col].dropna()
+        alpha_col = f"alpha_{h}d"
+        alphas = df_res[alpha_col].dropna() if alpha_col in df_res.columns else pd.Series([0])
+        wins  = (rets > 0).sum()
+        total = len(rets)
+        avg   = rets.mean()
+        med   = rets.median()
+        best  = rets.max()
+        worst = rets.min()
+        std   = rets.std()
+        sharpe = (avg / std * np.sqrt(252 / h)) if std > 0 else 0
+        # Max drawdown from equity curve
+        cumret = (1 + rets/100).cumprod()
+        roll_max = cumret.cummax()
+        drawdown = (cumret - roll_max) / roll_max * 100
+        max_dd = drawdown.min()
+        profit_factor = abs(rets[rets>0].sum() / rets[rets<0].sum()) if (rets<0).any() else np.inf
+        stats[h] = {
+            "total_signals" : total,
+            "win_rate"      : round(wins/total*100, 1),
+            "avg_ret"       : round(avg, 2),
+            "median_ret"    : round(med, 2),
+            "best"          : round(best, 2),
+            "worst"         : round(worst, 2),
+            "sharpe"        : round(sharpe, 2),
+            "max_dd"        : round(max_dd, 2),
+            "profit_factor" : round(min(profit_factor, 99), 2),
+            "avg_alpha"     : round(alphas.mean(), 2),
+            "pct_beat_ihsg" : round((alphas > 0).mean() * 100, 1),
+        }
+
+    # ── Equity curves for each holding period
+    eq_curves = {}
+    for h in hold_days_list:
+        col = f"ret_{h}d"
+        if col not in df_res.columns: continue
+        rets = df_res[col].dropna() / 100
+        eq   = (1 + rets).cumprod() * 100   # start at 100
+        eq_curves[h] = {"dates": df_res["date"].values[:len(eq)], "equity": eq.values}
+
+    # ── Signal distribution
+    sig_dist = df_res["signal"].value_counts().to_dict()
+
+    # ── Monthly return heatmap data
+    df_res["month"] = pd.to_datetime(df_res["date"]).dt.to_period("M")
+    if f"ret_{hold_days_list[0]}d" in df_res.columns:
+        monthly = df_res.groupby("month")[f"ret_{hold_days_list[0]}d"].mean().reset_index()
+        monthly["month_str"] = monthly["month"].astype(str)
+    else:
+        monthly = pd.DataFrame()
+
+    return {
+        "available"  : True,
+        "ticker"     : ticker,
+        "period"     : period,
+        "min_signal" : min_signal,
+        "df_signals" : df_res,
+        "stats"      : stats,
+        "eq_curves"  : eq_curves,
+        "sig_dist"   : sig_dist,
+        "monthly"    : monthly,
+        "hold_days"  : list(hold_days_list),
+        "n_total"    : len(df_res),
+    }
+
+
+def chart_equity_curve(bt: dict) -> go.Figure:
+    """Equity curve for all holding periods + IHSG benchmark."""
+    fig = go.Figure()
+    colors = {5:"#00e676", 10:"#00b0ff", 20:"#ffab00", 30:"#e040fb"}
+    hold_days = bt.get("hold_days", [5, 10, 20])
+    for h in hold_days:
+        eq = bt["eq_curves"].get(h)
+        if eq is None: continue
+        c = colors.get(h, "#5a7a9a")
+        fig.add_trace(go.Scatter(
+            x=eq["dates"], y=eq["equity"],
+            name=f"Hold {h}d",
+            line=dict(color=c, width=2),
+            hovertemplate=f"Hold {h}d: %{{y:.1f}}<extra></extra>",
+        ))
+    # Baseline
+    fig.add_hline(y=100, line_color="#2a3d52", line_dash="dash", line_width=1)
+    fig.update_layout(
+        paper_bgcolor="#05080c", plot_bgcolor="#090d12",
+        font=dict(color="#cdd8e6", family="IBM Plex Mono, monospace", size=11),
+        legend=dict(bgcolor="#0b1018", bordercolor="#141e2e", font=dict(size=10)),
+        margin=dict(l=0, r=0, t=10, b=0), height=320,
+        yaxis=dict(title="Portfolio Value (start=100)", gridcolor="#141e2e"),
+        xaxis=dict(gridcolor="#141e2e"),
+        hovermode="x unified",
+    )
+    return fig
+
+
+def chart_return_distribution(bt: dict, hold: int = 10) -> go.Figure:
+    """Histogram of returns for a given holding period."""
+    col = f"ret_{hold}d"
+    df_s = bt["df_signals"]
+    if col not in df_s.columns:
+        return go.Figure()
+    rets = df_s[col].dropna()
+    colors_bar = ["#00e676" if r >= 0 else "#ff1744" for r in rets]
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(
+        x=rets, nbinsx=40,
+        marker_color="#00b0ff", opacity=0.7,
+        name=f"Returns ({hold}d hold)",
+        hovertemplate="Return: %{x:.1f}%<br>Count: %{y}<extra></extra>",
+    ))
+    fig.add_vline(x=0,       line_color="#5a7a9a", line_dash="solid", line_width=1)
+    fig.add_vline(x=rets.mean(), line_color="#ffab00", line_dash="dash",
+                  annotation_text=f"Mean {rets.mean():.1f}%",
+                  annotation_font_color="#ffab00")
+    fig.update_layout(
+        paper_bgcolor="#05080c", plot_bgcolor="#090d12",
+        font=dict(color="#cdd8e6", family="IBM Plex Mono, monospace", size=11),
+        margin=dict(l=0, r=0, t=10, b=0), height=260,
+        xaxis=dict(title="Return (%)", gridcolor="#141e2e"),
+        yaxis=dict(title="Count", gridcolor="#141e2e"),
+        bargap=0.05,
+    )
+    return fig
+
+
+def chart_monthly_heatmap(monthly_df: pd.DataFrame, hold_d: int) -> go.Figure:
+    """Monthly average return bar chart."""
+    if monthly_df.empty:
+        return go.Figure()
+    col = f"ret_{hold_d}d"
+    if col not in monthly_df.columns:
+        return go.Figure()
+    colors = ["#00e676" if v >= 0 else "#ff1744" for v in monthly_df[col]]
+    fig = go.Figure(go.Bar(
+        x=monthly_df["month_str"], y=monthly_df[col],
+        marker_color=colors, opacity=0.8,
+        text=[f"{v:.1f}%" for v in monthly_df[col]],
+        textposition="outside",
+        textfont=dict(color="#cdd8e6", size=9),
+    ))
+    fig.add_hline(y=0, line_color="#5a7a9a", line_width=1)
+    fig.update_layout(
+        paper_bgcolor="#05080c", plot_bgcolor="#090d12",
+        font=dict(color="#cdd8e6", family="IBM Plex Mono, monospace", size=11),
+        margin=dict(l=0, r=0, t=10, b=0), height=240,
+        xaxis=dict(gridcolor="#141e2e", tickangle=45),
+        yaxis=dict(title="Avg Return (%)", gridcolor="#141e2e"),
+    )
+    return fig
+
+
+def chart_signal_scatter(df_signals: pd.DataFrame, hold: int = 10) -> go.Figure:
+    """Scatter: entry date vs return, colored by signal strength."""
+    col = f"ret_{hold}d"
+    if col not in df_signals.columns:
+        return go.Figure()
+    df_s = df_signals[[col,"date","signal"]].dropna()
+    sig_colors = {"STRONG BUY":"#00e676","BUY":"#88ffbb",
+                  "WATCH":"#ffab00","AVOID":"#ff8888","STRONG AVOID":"#ff1744"}
+    fig = go.Figure()
+    for sig in df_s["signal"].unique():
+        mask = df_s["signal"] == sig
+        sub  = df_s[mask]
+        fig.add_trace(go.Scatter(
+            x=sub["date"], y=sub[col],
+            mode="markers",
+            name=sig,
+            marker=dict(color=sig_colors.get(sig,"#5a7a9a"),
+                        size=7, opacity=0.7,
+                        line=dict(width=0.5, color="#05080c")),
+            hovertemplate=f"{sig}<br>Date: %{{x}}<br>Return: %{{y:.1f}}%<extra></extra>",
+        ))
+    fig.add_hline(y=0, line_color="#5a7a9a", line_dash="dash", line_width=1)
+    fig.update_layout(
+        paper_bgcolor="#05080c", plot_bgcolor="#090d12",
+        font=dict(color="#cdd8e6", family="IBM Plex Mono, monospace", size=11),
+        legend=dict(bgcolor="#0b1018", bordercolor="#141e2e", font=dict(size=10)),
+        margin=dict(l=0, r=0, t=10, b=0), height=280,
+        xaxis=dict(gridcolor="#141e2e"),
+        yaxis=dict(title=f"Return (%, {hold}d hold)", gridcolor="#141e2e"),
+    )
+    return fig
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  ENTRY SIGNAL
 # ══════════════════════════════════════════════════════════════════════
 
 def entry_signal(final,ts,br_score,wp,cmf_v,obv_up,mfi_v,vr,crossing,
-                 goreng,sm_buy,sm_sell,chg,own):
+                 goreng,sm_buy,sm_sell,chg,own,rs_data=None):
     met,fail,watch = [],[],[]
     if final>=70: met.append(f"Composite {final}/100 (Strong)")
     elif final>=55: met.append(f"Composite {final}/100 (Positive)")
@@ -829,20 +1321,45 @@ def entry_signal(final,ts,br_score,wp,cmf_v,obv_up,mfi_v,vr,crossing,
         if own.get("political"): watch.append("Political ties detected")
         ff = own.get("float",30)
         if ff<15: fail.append(f"Low float {ff}% — FCA/manipulation risk")
+
+    # ── RS vs IHSG factor (important context)
+    rs_bonus = 0
+    if rs_data and rs_data.get("available"):
+        rs_interp = rs_data.get("interp","")
+        rs20      = rs_data.get("rs20_val",100)
+        t20       = rs_data.get("trend20","flat")
+        if rs_interp == "STRONG OUTPERFORM":
+            met.append(f"RS vs IHSG: Strong Outperform ({rs20:.1f}) — smart money rotation IN")
+            rs_bonus = 8
+        elif rs_interp == "OUTPERFORM":
+            met.append(f"RS vs IHSG: Outperform ({rs20:.1f}) — beating market")
+            rs_bonus = 4
+        elif rs_interp == "STRONG UNDERPERFORM":
+            fail.append(f"RS vs IHSG: Strong Underperform ({rs20:.1f}) — money rotating OUT")
+            rs_bonus = -8
+        elif rs_interp == "UNDERPERFORM":
+            fail.append(f"RS vs IHSG: Underperform ({rs20:.1f}) — lagging market")
+            rs_bonus = -4
+        else:
+            watch.append(f"RS vs IHSG: In Line ({rs20:.1f}) — moving with market")
+
+    # Adjust final with RS (max ±8 points)
+    final_adj = int(np.clip(final + rs_bonus, 0, 100))
+
     nm=len(met); nf=len(fail)
-    if crossing=="ACC" and final>=65:
+    if crossing=="ACC" and final_adj>=65:
         sig,color,cls="STRONG BUY","#00e676","sc-buy"
         why="Accumulation Cross confirmed. Foreign institutions buying while retail sells."
         risk,action="LOW-MEDIUM","Enter now. Stop-loss below recent 10-day support."
-    elif nm>=4 and nf<=1 and final>=65:
+    elif nm>=4 and nf<=1 and final_adj>=65:
         sig,color,cls="BUY","#00e676","sc-buy"
-        why=f"{nm} conditions confirmed. Smart money accumulation detected."
+        why=f"{nm} conditions confirmed. Smart money accumulation + RS positive."
         risk,action="MEDIUM","Consider entry. Confirm with volume breakout."
-    elif crossing=="DIS" or (nf>=3 and final<=40):
+    elif crossing=="DIS" or (nf>=3 and final_adj<=40):
         sig,color,cls="STRONG AVOID","#ff1744","sc-sell"
         why="Distribution signals confirmed. Smart money exiting while retail buys."
         risk,action="HIGH","Do not enter. Reduce position if holding."
-    elif nf>=2 and final<=45:
+    elif nf>=2 and final_adj<=45:
         sig,color,cls="AVOID","#ff1744","sc-sell"
         why=f"{nf} bearish signals active. Risk outweighs reward."
         risk,action="MEDIUM-HIGH","Hold off. Wait for reversal signals."
@@ -855,7 +1372,9 @@ def entry_signal(final,ts,br_score,wp,cmf_v,obv_up,mfi_v,vr,crossing,
         why="Mixed signals. No clear smart money direction."
         risk,action="MEDIUM","Monitor. Enter only when 3+ conditions align."
     return dict(sig=sig,color=color,cls=cls,why=why,risk=risk,
-                action=action,met=met,fail=fail,watch=watch)
+                action=action,met=met,fail=fail,watch=watch,
+                final_adj=final_adj,rs_bonus=rs_bonus)
+
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1016,6 +1535,21 @@ def chart_sh_pie(sh_list):
 
 
 # ══════════════════════════════════════════════════════════════════════
+#  UI HELPER FUNCTIONS
+# ══════════════════════════════════════════════════════════════════════
+
+def _kpi(label: str, value: str, color: str, sub: str) -> str:
+    """Compact KPI card returning HTML string for use inside st.markdown grid."""
+    return f"""<div style='background:#0b1018;border:1px solid #141e2e;padding:10px;border-radius:3px'>
+      <div style='font-family:"IBM Plex Mono",monospace;font-size:8px;
+                  color:#5a7a9a;letter-spacing:1.5px;margin-bottom:3px'>{label}</div>
+      <div style='font-family:"IBM Plex Mono",monospace;font-size:1.1rem;
+                  font-weight:700;color:{color}'>{value}</div>
+      <div style='font-size:9px;color:#2a3d52;margin-top:2px'>{sub}</div>
+    </div>"""
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  SIDEBAR
 # ══════════════════════════════════════════════════════════════════════
 
@@ -1065,30 +1599,128 @@ with st.sidebar:
             st.cache_data.clear(); st.rerun()
 
     st.markdown("---")
-    st.markdown("**STOCKBIT TOKEN** *(for real broker data)*")
-    st.markdown("""
-    <div style='font-size:10px;color:#5a7a9a;line-height:1.8;font-family:"IBM Plex Mono",monospace'>
-    1. Open <b>stockbit.com</b> → Login<br>
-    2. F12 → Network → Refresh<br>
-    3. Any request → Headers<br>
-    4. Find: <span style='color:#ffab00'>authorization: Bearer eyJ...</span><br>
-    5. Copy text <i>after</i> "Bearer " → paste below
-    </div>""", unsafe_allow_html=True)
-    sb_token = st.text_input("Bearer Token","",type="password",
-                              placeholder="eyJhbGciOi...",key="sb_token")
-    if sb_token:
-        st.success("✅ Token active") if len(sb_token)>20 else st.error("❌ Invalid")
+    # Token section — show status prominently
+    _has_token = bool(st.session_state.get("sb_token","")) and len(st.session_state.get("sb_token","")) > 20
+    if _has_token:
+        st.markdown("""
+        <div style='background:rgba(0,230,118,.1);border:1px solid rgba(0,230,118,.4);
+                    border-radius:3px;padding:8px 12px;margin-bottom:8px;
+                    font-family:"IBM Plex Mono",monospace;font-size:11px;color:#00e676'>
+          ✅ STOCKBIT TOKEN ACTIVE<br>
+          <span style='font-size:9px;color:#5a7a9a'>Real broker data enabled</span>
+        </div>""", unsafe_allow_html=True)
+    else:
+        st.markdown("""
+        <div style='background:rgba(255,171,0,.08);border:1px solid rgba(255,171,0,.3);
+                    border-radius:3px;padding:8px 12px;margin-bottom:8px;
+                    font-family:"IBM Plex Mono",monospace;font-size:11px;color:#ffab00'>
+          ⚠️ STOCKBIT TOKEN NOT SET<br>
+          <span style='font-size:9px;color:#5a7a9a'>Using IDX API / Demo data</span>
+        </div>""", unsafe_allow_html=True)
+    with st.expander("🔑 Set Stockbit Token", expanded=not _has_token):
+        st.markdown("""
+        <div style='font-size:10px;color:#5a7a9a;line-height:1.8;font-family:"IBM Plex Mono",monospace'>
+        1. Open <b>stockbit.com</b> → Login<br>
+        2. F12 → Network tab → Refresh (F5)<br>
+        3. Click any request → Headers<br>
+        4. Find: <span style='color:#ffab00'>authorization: Bearer eyJ...</span><br>
+        5. Copy text <i>after</i> "Bearer " → paste below
+        </div>""", unsafe_allow_html=True)
+        sb_token = st.text_input("Bearer Token", "", type="password",
+                                  placeholder="eyJhbGciOiJSUzI1NiIs...", key="sb_token")
+        if sb_token:
+            if len(sb_token) > 20:
+                st.success("✅ Token saved for this session")
+            else:
+                st.error("❌ Token too short — paste full token")
+    # If already set but expander collapsed, still bind variable
+    if "sb_token" in st.session_state:
+        sb_token = st.session_state.get("sb_token", "")
+    else:
+        sb_token = ""
 
     st.markdown("---")
     st.markdown("**ACCUMULATION WINDOW**")
-    accu_days = st.select_slider("Trading days", [5,10,15,20,30], value=20)
+    st.markdown("""<div style='font-size:10px;color:#5a7a9a;font-family:"IBM Plex Mono",monospace;margin-bottom:4px'>
+    Berapa hari trading untuk hitung posisi kumulatif broker</div>""", unsafe_allow_html=True)
+    accu_days = st.select_slider("Trading days", [5,10,15,20,30,45,60,90], value=20)
 
     st.markdown("---")
     st.markdown("**SCREENER WATCHLIST**")
-    st.caption("Any IDX tickers, comma-separated. No limit.")
-    wl_raw = st.text_area("Tickers",
-        "BBCA,BBRI,BMRI,TLKM,ASII,BREN,AMMN,ADRO,ANTM,KLBF,ICBP,GOTO,MDKA,BYAN,UNTR",
-        height=75)
+    st.markdown("""
+    <div style='font-size:10px;color:#5a7a9a;font-family:"IBM Plex Mono",monospace;margin-bottom:6px'>
+    Ketik kode saham IDX apa saja, pisahkan koma.<br>
+    <b style='color:#00e676'>Tidak ada batasan jumlah</b> — bisa 5 sampai 100+ saham.
+    </div>""", unsafe_allow_html=True)
+
+    # Preset watchlist buttons
+    col_p1, col_p2, col_p3 = st.columns(3)
+    with col_p1:
+        load_lq45   = st.button("LQ45",      use_container_width=True, key="btn_lq45")
+    with col_p2:
+        load_idx30  = st.button("IDX30",     use_container_width=True, key="btn_idx30")
+    with col_p3:
+        load_growth = st.button("GROWTH",    use_container_width=True, key="btn_growth")
+
+    # Default / preset values
+    DEFAULT_WL = (
+        "BBCA,BBRI,BMRI,BBNI,BBTN,"
+        "TLKM,EXCL,ISAT,TBIG,TOWR,"
+        "ASII,UNTR,AALI,BSDE,CTRA,"
+        "BREN,BRPT,TPIA,CUAN,CDIA,"
+        "ADRO,ADMR,MDKA,BYAN,PTBA,ANTM,INCO,"
+        "AMMN,MEDC,PGAS,"
+        "KLBF,KAEF,SIDO,MIKA,"
+        "ICBP,INDF,UNVR,MYOR,ROTI,"
+        "GOTO,BUKA,EMTK,DCII,"
+        "BMRI,AMRT,ACES,MAPI,ERAA"
+    )
+    LQ45_WL = (
+        "BBCA,BBRI,BMRI,BBNI,TLKM,ASII,UNVR,KLBF,ICBP,INDF,"
+        "ADRO,PTBA,ANTM,MDKA,INCO,PGAS,MEDC,AKRA,"
+        "BSDE,CTRA,SMGR,BRPT,TPIA,"
+        "GOTO,EMTK,BUKA,"
+        "BMRI,BBTN,ARTO,BJTM,NISP,"
+        "ASRI,PWON,LPKR,"
+        "EXCL,ISAT,TBIG,"
+        "MAPI,AMRT,LPPF,"
+        "AALI,SIMP,PALM"
+    )
+    IDX30_WL = (
+        "BBCA,BBRI,BMRI,TLKM,ASII,"
+        "ADRO,ANTM,INCO,PTBA,MDKA,"
+        "ICBP,INDF,UNVR,KLBF,"
+        "BSDE,CTRA,SMGR,"
+        "GOTO,BUKA,EMTK,DCII,"
+        "BRPT,TPIA,PGAS,MEDC,"
+        "EXCL,ISAT,"
+        "MAPI,AMRT"
+    )
+    GROWTH_WL = (
+        "BREN,BRPT,TPIA,CUAN,CDIA,SSIA,"
+        "AMMN,MDKA,ADMR,BYAN,"
+        "DCII,TOWR,TLKM,"
+        "BBCA,BMRI,BBRI,"
+        "KLBF,SIDO,MIKA,"
+        "GOTO,BUKA,EMTK,"
+        "PANI,CBDK,"
+        "ASII,UNTR,"
+        "ICBP,MYOR"
+    )
+
+    if load_lq45:
+        st.session_state["wl_val"] = LQ45_WL
+    elif load_idx30:
+        st.session_state["wl_val"] = IDX30_WL
+    elif load_growth:
+        st.session_state["wl_val"] = GROWTH_WL
+
+    wl_raw = st.text_area(
+        "Tickers (comma-separated)",
+        value=st.session_state.get("wl_val", DEFAULT_WL),
+        height=130,
+        key="wl_area",
+    )
 
     st.markdown("---")
     st.markdown("""
@@ -1130,9 +1762,10 @@ st.markdown(f"""
   </div>
 </div>""", unsafe_allow_html=True)
 
-tab_a, tab_bh, tab_s, tab_o, tab_g = st.tabs([
+tab_a, tab_bh, tab_bt, tab_s, tab_o, tab_g = st.tabs([
     "  ANALYSIS  ",
     "  BROKER SHAREHOLDING  ",
+    "  BACKTEST & RS  ",
     "  SCREENER  ",
     "  OWNERSHIP DB  ",
     "  GUIDE  ",
@@ -1179,6 +1812,10 @@ with tab_a:
             own    = OWNER_DB.get(ticker_input.upper().replace(".JK",""))
             ksei   = fetch_ksei_composition(ticker_input)
             sh_list, sh_src, sh_date = fetch_shareholders(ticker_input)
+        with st.spinner("Computing Relative Strength vs IHSG (^JKSE) ..."):
+            ihsg_df = load_ihsg(period)
+            rs_data = calc_rs(df, ihsg_df) if ihsg_df is not None else {"available": False}
+
         final = int(np.clip(round(ts*.6 + br["score"]*.4), 0, 100))
         last  = df.iloc[-1]; prev = df.iloc[-2]
         chg   = (last["close"]-prev["close"]) / prev["close"] * 100
@@ -1187,7 +1824,8 @@ with tab_a:
         ob_up = o_.iloc[-1] > o_.iloc[-min(10,len(o_)-1)]
         ent   = entry_signal(final,ts,br["score"],wp,float(c_.iloc[-1]),
                               ob_up,float(m_.iloc[-1]),vr,br["crossing"],
-                              br["goreng"],br["sm_buyers"],br["sm_sellers"],chg,own)
+                              br["goreng"],br["sm_buyers"],br["sm_sellers"],chg,own,
+                              rs_data=rs_data)
         st.session_state["res"] = dict(
             df=df,c=c_,o=o_,m=m_,wp=wp,wn=wn,wd=wd,ts=ts,
             br=br,bdf=bdf,src=src,final=final,ent=ent,
@@ -1196,7 +1834,8 @@ with tab_a:
             obv_up=ob_up,ticker=ticker_input,
             fund=fund,own=own,ksei=ksei,
             sh_list=sh_list,sh_src=sh_src,sh_date=sh_date,
-            ez=ez,fetched=datetime.now().strftime("%H:%M:%S WIB"),
+            ez=ez,rs_data=rs_data,
+            fetched=datetime.now().strftime("%H:%M:%S WIB"),
         )
 
     if "res" in st.session_state:
@@ -1271,14 +1910,107 @@ with tab_a:
         # ── KEY METRICS
         st.markdown('<div class="sec" style="margin-top:12px">KEY METRICS</div>', unsafe_allow_html=True)
         c1,c2,c3,c4,c5,c6 = st.columns(6)
-        c1.metric("COMPOSITE",  f"{R['final']}/100", delta=ent["sig"])
-        c2.metric("TECHNICAL",  f"{R['ts']}/100")
-        c3.metric("BROKER",     f"{br['score']}/100")
+        c1.metric("COMPOSITE",  f"{R['final']}/100", delta=ent["sig"],
+                  help="Skor akhir = Technical 60% + Broker Flow 40%. ≥65 = Akumulasi, ≤35 = Distribusi.")
+        c2.metric("TECHNICAL",  f"{R['ts']}/100",
+                  help="Skor teknikal: CMF + OBV + MFI divergence + candlestick position + volume ratio.")
+        c3.metric("BROKER",     f"{br['score']}/100",
+                  help="Skor broker flow: net lot asing, crossing signal, kategori broker, goreng alert.")
         c4.metric("CMF (14)",   f"{R['cmf_v']:.4f}",
-                  delta="Inflow" if R["cmf_v"]>.1 else "Outflow" if R["cmf_v"]<-.1 else "Neutral")
+                  delta="Inflow" if R["cmf_v"]>.1 else "Outflow" if R["cmf_v"]<-.1 else "Neutral",
+                  help="Chaikin Money Flow. >+0.15 = uang masuk kuat (akumulasi). <-0.15 = uang keluar (distribusi). Dihitung 14 hari.")
         c5.metric("MFI (14)",   f"{R['mfi_v']:.1f}",
-                  delta="Oversold" if R["mfi_v"]<30 else "Overbought" if R["mfi_v"]>70 else "Normal")
-        c6.metric("VOL RATIO",  f"{R['vr']:.1f}x", delta=f"Ph {R['wp']} {R['wn']}")
+                  delta="Oversold" if R["mfi_v"]<30 else "Overbought" if R["mfi_v"]>70 else "Normal",
+                  help="Money Flow Index. <30 = oversold (potensi reversal naik). >70 = overbought (potensi koreksi). Seperti RSI tapi memperhitungkan volume.")
+        c6.metric("VOL RATIO",  f"{R['vr']:.1f}x", delta=f"Ph {R['wp']} {R['wn']}",
+                  help="Volume hari ini ÷ rata-rata 20 hari. >1.5x = aktivitas signifikan. >2x = potensi pergerakan besar.")
+
+        # ── INDICATOR LEGEND
+        obv_status = "Rising ▲" if R["obv_up"] else "Falling ▼"
+        obv_color  = "#00e676" if R["obv_up"] else "#ff1744"
+        cmf_interp = ("Strong accumulation" if R["cmf_v"]>0.15
+                      else "Mild accumulation" if R["cmf_v"]>0.05
+                      else "Strong distribution" if R["cmf_v"]<-0.15
+                      else "Mild distribution" if R["cmf_v"]<-0.05
+                      else "Neutral / balanced")
+        mfi_interp = ("🔴 Overbought — potensi koreksi" if R["mfi_v"]>70
+                      else "🟢 Oversold — potensi reversal" if R["mfi_v"]<30
+                      else "🟡 Normal range")
+        wyck_emoji = {"A":"🔵","B":"🟡","C":"⭐","D":"🟠","E":"🔴"}.get(R["wp"],"🔵")
+
+        st.markdown(f"""
+        <div style='display:grid;grid-template-columns:repeat(6,1fr);gap:6px;margin-bottom:12px'>
+
+          <div style='background:#0b1018;border:1px solid #141e2e;border-top:2px solid #5a7a9a;
+                      padding:10px;border-radius:3px'>
+            <div style='font-family:"IBM Plex Mono",monospace;font-size:8px;color:#5a7a9a;
+                        letter-spacing:1px;margin-bottom:4px'>COMPOSITE SCORE</div>
+            <div style='font-size:10px;color:#cdd8e6;line-height:1.5'>
+              Skor gabungan 0–100.<br>
+              <b style='color:#00e676'>≥ 65</b> = Akumulasi<br>
+              <b style='color:#ffab00'>35–64</b> = Neutral<br>
+              <b style='color:#ff1744'>≤ 35</b> = Distribusi
+            </div>
+          </div>
+
+          <div style='background:#0b1018;border:1px solid #141e2e;border-top:2px solid #00b0ff;
+                      padding:10px;border-radius:3px'>
+            <div style='font-family:"IBM Plex Mono",monospace;font-size:8px;color:#5a7a9a;
+                        letter-spacing:1px;margin-bottom:4px'>OBV (On Balance Volume)</div>
+            <div style='font-size:10px;color:#cdd8e6;line-height:1.5'>
+              Kumulasi volume. Sekarang:<br>
+              <b style='color:{obv_color}'>{obv_status}</b><br>
+              Rising + harga turun = bandar diam-diam beli.
+            </div>
+          </div>
+
+          <div style='background:#0b1018;border:1px solid #141e2e;border-top:2px solid #00e676;
+                      padding:10px;border-radius:3px'>
+            <div style='font-family:"IBM Plex Mono",monospace;font-size:8px;color:#5a7a9a;
+                        letter-spacing:1px;margin-bottom:4px'>CMF (14) — Chaikin Money Flow</div>
+            <div style='font-size:10px;color:#cdd8e6;line-height:1.5'>
+              {cmf_interp}<br>
+              <b style='color:#00e676'>&gt;+0.15</b> = Akumulasi kuat<br>
+              <b style='color:#ff1744'>&lt;−0.15</b> = Distribusi kuat
+            </div>
+          </div>
+
+          <div style='background:#0b1018;border:1px solid #141e2e;border-top:2px solid #ffab00;
+                      padding:10px;border-radius:3px'>
+            <div style='font-family:"IBM Plex Mono",monospace;font-size:8px;color:#5a7a9a;
+                        letter-spacing:1px;margin-bottom:4px'>MFI (14) — Money Flow Index</div>
+            <div style='font-size:10px;color:#cdd8e6;line-height:1.5'>
+              {mfi_interp}<br>
+              RSI + Volume = lebih akurat.<br>
+              Divergence harga↓ + MFI↑ = bandar beli diam-diam.
+            </div>
+          </div>
+
+          <div style='background:#0b1018;border:1px solid #141e2e;border-top:2px solid #e040fb;
+                      padding:10px;border-radius:3px'>
+            <div style='font-family:"IBM Plex Mono",monospace;font-size:8px;color:#5a7a9a;
+                        letter-spacing:1px;margin-bottom:4px'>VOL RATIO — Rasio Volume</div>
+            <div style='font-size:10px;color:#cdd8e6;line-height:1.5'>
+              Vol hari ini ÷ MA20 vol.<br>
+              <b style='color:#00e676'>&gt;1.5x</b> = aktivitas tinggi<br>
+              <b style='color:#5a7a9a'>&lt;0.5x</b> = sepi/konsolidasi
+            </div>
+          </div>
+
+          <div style='background:#0b1018;border:1px solid #141e2e;border-top:2px solid #00e5ff;
+                      padding:10px;border-radius:3px'>
+            <div style='font-family:"IBM Plex Mono",monospace;font-size:8px;color:#5a7a9a;
+                        letter-spacing:1px;margin-bottom:4px'>{wyck_emoji} WYCKOFF PHASE</div>
+            <div style='font-size:10px;color:#cdd8e6;line-height:1.5'>
+              <b>Ph A</b>: Selling Climax<br>
+              <b>Ph B</b>: Building Cause<br>
+              <b style='color:#00e676'>Ph C</b>: Spring ← Entry ideal<br>
+              <b>Ph D</b>: Breakout · <b>Ph E</b>: Markup
+            </div>
+          </div>
+
+        </div>
+        """, unsafe_allow_html=True)
 
         # ── CHART + RIGHT PANEL
         col_ch, col_r = st.columns([3,1])
@@ -1471,10 +2203,122 @@ with tab_a:
                   Check <a href="https://web.ksei.co.id" target="_blank" style="color:#5a7a9a">web.ksei.co.id</a>
                 </div>""", unsafe_allow_html=True)
 
+        # ── RELATIVE STRENGTH vs IHSG
+        rs_data = R.get("rs_data", {})
+        if rs_data and rs_data.get("available"):
+            st.markdown("---")
+            st.markdown('<div class="sec">RELATIVE STRENGTH vs IHSG (^JKSE)</div>',
+                        unsafe_allow_html=True)
+            rs20v = rs_data.get("rs20_val",100)
+            rs60v = rs_data.get("rs60_val",100)
+            t20   = rs_data.get("trend20","flat")
+            t60   = rs_data.get("trend60","flat")
+            rc    = rs_data.get("color","#ffab00")
+            interp= rs_data.get("interp","IN LINE")
+            note  = rs_data.get("note","")
+            rs_score = rs_data.get("score",50)
+            rs_bonus = ent.get("rs_bonus",0)
+
+            # RS banner
+            st.markdown(f"""
+            <div style='background:#0b1018;border:1px solid #141e2e;
+                        border-left:4px solid {rc};padding:14px 18px;border-radius:3px;
+                        margin-bottom:12px'>
+              <div style='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px'>
+                <div>
+                  <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;
+                              color:#5a7a9a;letter-spacing:2px;margin-bottom:4px'>RS STATUS</div>
+                  <div style='font-family:"IBM Plex Mono",monospace;font-size:1.6rem;
+                              font-weight:700;color:{rc}'>{interp}</div>
+                  <div style='font-size:11px;color:#cdd8e6;margin-top:4px'>{note}</div>
+                </div>
+                <div style='display:flex;gap:20px;font-family:"IBM Plex Mono",monospace'>
+                  <div style='text-align:center'>
+                    <div style='font-size:9px;color:#5a7a9a;letter-spacing:1px'>RS 20D</div>
+                    <div style='font-size:1.3rem;font-weight:700;
+                                color:{"#00e676" if rs20v>=100 else "#ff1744"}'>{rs20v:.1f}</div>
+                    <div style='font-size:9px;color:{"#00e676" if t20=="rising" else "#ff1744"}'>
+                      {"▲ Rising" if t20=="rising" else "▼ Falling"}</div>
+                  </div>
+                  <div style='text-align:center'>
+                    <div style='font-size:9px;color:#5a7a9a;letter-spacing:1px'>RS 60D</div>
+                    <div style='font-size:1.3rem;font-weight:700;
+                                color:{"#00e676" if rs60v>=100 else "#ff1744"}'>{rs60v:.1f}</div>
+                    <div style='font-size:9px;color:{"#00e676" if t60=="rising" else "#ff1744"}'>
+                      {"▲ Rising" if t60=="rising" else "▼ Falling"}</div>
+                  </div>
+                  <div style='text-align:center'>
+                    <div style='font-size:9px;color:#5a7a9a;letter-spacing:1px'>RS SCORE</div>
+                    <div style='font-size:1.3rem;font-weight:700;color:{rc}'>{rs_score}/100</div>
+                    <div style='font-size:9px;color:#5a7a9a'>
+                      Score adj: <span style='color:{"#00e676" if rs_bonus>0 else "#ff1744" if rs_bonus<0 else "#5a7a9a"}'>
+                      {rs_bonus:+d}</span></div>
+                  </div>
+                </div>
+              </div>
+            </div>""", unsafe_allow_html=True)
+
+            # RS chart
+            st.plotly_chart(chart_rs(rs_data, R["ticker"]), use_container_width=True)
+
+            # RS interpretation boxes
+            col_r1, col_r2, col_r3 = st.columns(3)
+            with col_r1:
+                st.markdown(f"""
+                <div style='background:#0b1018;border:1px solid #141e2e;padding:12px;border-radius:3px'>
+                  <div class='sec'>RS INTERPRETATION</div>
+                  <div style='font-size:11px;color:#cdd8e6;line-height:1.7'>
+                    RS 20d <b>{">100" if rs20v>100 else "<100"}</b>
+                    = saham {"outperform" if rs20v>=100 else "underperform"} IHSG<br>
+                    Trend: <b style='color:{"#00e676" if t20=="rising" else "#ff1744"}'>
+                    {"Menguat ▲" if t20=="rising" else "Melemah ▼"}</b><br>
+                    RS 20d {">" if rs20v>rs60v else "<"} RS 60d
+                    = momentum {"accelerating" if rs20v>rs60v else "decelerating"}
+                  </div>
+                </div>""", unsafe_allow_html=True)
+            with col_r2:
+                st.markdown(f"""
+                <div style='background:#0b1018;border:1px solid #141e2e;padding:12px;border-radius:3px'>
+                  <div class='sec'>CONTEXT: RS vs ALPHA</div>
+                  <div style='font-size:11px;color:#cdd8e6;line-height:1.7'>
+                    Saham naik karena IHSG naik = <b style='color:#ffab00'>bukan alpha</b><br>
+                    Saham naik saat IHSG turun = <b style='color:#00e676'>alpha murni</b><br>
+                    Smart money selalu masuk ke <b>saham dengan RS rising</b>
+                    bahkan sebelum harga breakout
+                  </div>
+                </div>""", unsafe_allow_html=True)
+            with col_r3:
+                # Best use case
+                rs_signal = ""
+                if rs20v > 105 and t20 == "rising":
+                    rs_signal = "✅ RS SETUP IDEAL — RS positif + trend naik. Konfluens dengan sinyal teknikal."
+                elif rs20v < 95 and t20 == "falling":
+                    rs_signal = "⚠️ RS NEGATIF — Saham lemah vs market. Tunggu RS stabilize sebelum entry."
+                elif rs20v > 100 and t20 == "falling":
+                    rs_signal = "🟡 RS MEMBALIK — Masih outperform tapi momentum melemah. Monitor."
+                elif rs20v < 100 and t20 == "rising":
+                    rs_signal = "🔄 RS RECOVERY — Mulai recover dari underperform. Potensi rotation masuk."
+                else:
+                    rs_signal = "➡️ RS NETRAL — Bergerak seiring IHSG. Sinyal broker lebih dominan."
+                st.markdown(f"""
+                <div style='background:#0b1018;border:1px solid #141e2e;padding:12px;border-radius:3px;
+                            border-left:3px solid {rc}'>
+                  <div class='sec'>RS SIGNAL</div>
+                  <div style='font-size:11px;color:#cdd8e6;line-height:1.7'>{rs_signal}</div>
+                </div>""", unsafe_allow_html=True)
+        else:
+            st.markdown("""
+            <div style='padding:8px 12px;background:#0b1018;border:1px solid #141e2e;
+                        border-radius:3px;margin-top:8px;font-family:"IBM Plex Mono",monospace;
+                        font-size:10px;color:#5a7a9a'>
+              RS vs IHSG: IHSG data unavailable — check ^JKSE on Yahoo Finance
+            </div>""", unsafe_allow_html=True)
+
         # ── ALERTS
         for alert in br["alerts"]:
             {"success":st.success,"danger":st.error,"warn":st.warning}.get(
                 alert["t"],st.info)(alert["m"])
+
 
     else:
         # Empty state
@@ -1525,17 +2369,19 @@ with tab_bh:
     with col_btn:
         run_bh = st.button("▶  CALCULATE", use_container_width=True)
     with col_tip:
-        so_display = "—"
+        # Try to get shares outstanding from anywhere available
+        so_preview = 0
         if "res" in st.session_state:
-            f_ = st.session_state["res"].get("fund",{})
-            so = f_.get("shares_out",0)
-            if so: so_display = f"{so/1e9:.2f}B shares"
+            so_preview = st.session_state["res"].get("fund",{}).get("shares_out",0) or 0
+        if not so_preview and "bh_res" in st.session_state:
+            so_preview = st.session_state["bh_res"].get("shares_out",0) or 0
+        so_display = f"{so_preview/1e9:.2f}B shares" if so_preview else "Will be fetched automatically"
         st.markdown(f"""
         <div style='padding:7px 12px;background:#0b1018;border:1px solid #141e2e;
                     border-radius:3px;font-family:"IBM Plex Mono",monospace;font-size:10px;color:#5a7a9a'>
           Ticker: <b style='color:#eaf0f8'>{ticker_input}.JK</b>
           &nbsp;·&nbsp; Window: {accu_days} trading days
-          &nbsp;·&nbsp; Shares outstanding: <b style='color:#cdd8e6'>{so_display}</b>
+          &nbsp;·&nbsp; Shares OS: <b style='color:#cdd8e6'>{so_display}</b>
         </div>""", unsafe_allow_html=True)
 
     if run_bh:
@@ -1547,19 +2393,30 @@ with tab_bh:
                 ts_est = st.session_state.get("res",{}).get("ts",50)
                 accu_df = demo_broker(ticker_input, ts_est)
                 accu_src = "demo"; days_got = accu_days
-        # Get shares outstanding
+
+        # Auto-fetch shares outstanding — no dependency on Analysis tab
         shares_out = 0
+        # 1. From Analysis tab cache
         if "res" in st.session_state:
             shares_out = st.session_state["res"].get("fund",{}).get("shares_out",0) or 0
+        # 2. Fetch directly if not available
         if not shares_out:
-            fund2 = fundamentals(ticker_input)
-            shares_out = fund2.get("shares_out",0) or 0
+            with st.spinner(f"Fetching shares outstanding for {ticker_input} ..."):
+                fund2 = fundamentals(ticker_input)
+                shares_out = fund2.get("shares_out",0) or 0
+        # 3. Try yfinance info directly as last resort
+        if not shares_out:
+            try:
+                info = yf.Ticker(ticker_input.upper().replace(".JK","") + ".JK").info
+                shares_out = info.get("sharesOutstanding",0) or info.get("impliedSharesOutstanding",0) or 0
+            except: pass
 
         sh_df = calc_broker_shareholding(accu_df, shares_out)
         st.session_state["bh_res"] = dict(
             accu_df=accu_df, sh_df=sh_df,
             src=accu_src, days=days_got,
             shares_out=shares_out,
+            ticker=ticker_input,
             fetched=datetime.now().strftime("%H:%M:%S WIB"),
         )
 
@@ -1695,7 +2552,354 @@ with tab_bh:
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  TAB 3 — SCREENER
+#  TAB 3 — BACKTEST & RELATIVE STRENGTH
+# ══════════════════════════════════════════════════════════════════════
+
+with tab_bt:
+    st.markdown("#### BACKTESTING ENGINE & RELATIVE STRENGTH ANALYSIS")
+
+    # ── Top explanation
+    st.markdown("""
+    <div style='display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px'>
+      <div style='padding:12px 16px;background:#0b1018;border:1px solid #141e2e;
+                  border-left:3px solid #00e676;border-radius:3px'>
+        <div style='font-family:"IBM Plex Mono",monospace;font-size:10px;
+                    font-weight:700;color:#00e676;letter-spacing:2px;margin-bottom:6px'>
+          BACKTESTING ENGINE</div>
+        <div style='font-size:11px;color:#cdd8e6;line-height:1.6'>
+          Simulasi historis: jika kita mengikuti sinyal sistem ini di masa lalu,
+          berapa return-nya? Menghitung win rate, Sharpe ratio, max drawdown,
+          equity curve, dan perbandingan alpha vs IHSG.
+          <br><br>
+          <b style='color:#ffab00'>Metodologi:</b> Walk-forward, 60-hari lookback window,
+          hanya menggunakan indikator teknikal (CMF · OBV · MFI · Wyckoff · Volume).
+          Broker data tidak tersedia secara historis.
+        </div>
+      </div>
+      <div style='padding:12px 16px;background:#0b1018;border:1px solid #141e2e;
+                  border-left:3px solid #00b0ff;border-radius:3px'>
+        <div style='font-family:"IBM Plex Mono",monospace;font-size:10px;
+                    font-weight:700;color:#00b0ff;letter-spacing:2px;margin-bottom:6px'>
+          RELATIVE STRENGTH vs IHSG</div>
+        <div style='font-size:11px;color:#cdd8e6;line-height:1.6'>
+          Mengukur seberapa kuat saham bergerak <b>relatif terhadap IHSG</b>.
+          Saham dengan RS naik = smart money sedang accumulate.
+          Saham yang naik hanya karena IHSG naik = bukan alpha, hindari.
+          <br><br>
+          <b style='color:#ffab00'>Key insight:</b> Smart money selalu masuk ke saham RS rising
+          <i>sebelum</i> breakout harga. RS adalah leading indicator.
+        </div>
+      </div>
+    </div>""", unsafe_allow_html=True)
+
+    # ── Controls
+    col_bt1, col_bt2, col_bt3, col_bt4 = st.columns([3, 2, 2, 2])
+    with col_bt1:
+        bt_ticker = st.text_input("Ticker for Backtest",
+                                   value=ticker_input, max_chars=10,
+                                   key="bt_ticker").upper().strip().replace(".JK","")
+    with col_bt2:
+        bt_period = st.selectbox("Data Period",
+                                  ["1y","2y","3y","5y"], index=1, key="bt_period")
+    with col_bt3:
+        bt_signal = st.selectbox("Min Signal to Trade",
+                                  ["BUY","STRONG BUY"], index=0, key="bt_signal")
+    with col_bt4:
+        bt_hold = st.selectbox("Primary Hold Period",
+                                [5, 10, 20, 30], index=1, key="bt_hold",
+                                format_func=lambda x: f"{x} days")
+
+    col_run1, col_run2 = st.columns([2, 8])
+    with col_run1:
+        run_bt = st.button("▶  RUN BACKTEST + RS", use_container_width=True)
+    with col_run2:
+        st.markdown(f"""
+        <div style='padding:7px 12px;background:#0b1018;border:1px solid #141e2e;
+                    border-radius:3px;font-family:"IBM Plex Mono",monospace;font-size:10px;color:#5a7a9a'>
+          <b style='color:#eaf0f8'>{bt_ticker}.JK</b>
+          &nbsp;·&nbsp; {bt_period} data
+          &nbsp;·&nbsp; Min signal: {bt_signal}
+          &nbsp;·&nbsp; Primary hold: {bt_hold}d
+          &nbsp;·&nbsp; Also computes RS 20d/60d vs ^JKSE
+        </div>""", unsafe_allow_html=True)
+
+    if run_bt:
+        st.session_state.pop("bt_res", None)
+
+        with st.spinner(f"Running walk-forward backtest for {bt_ticker} ({bt_period}) ..."):
+            bt_result = run_backtest(
+                bt_ticker, bt_period,
+                hold_days_list=(5, bt_hold) if bt_hold != 5 else (5, 10, 20),
+                min_signal=bt_signal,
+            )
+
+        with st.spinner("Computing Relative Strength vs IHSG (^JKSE) ..."):
+            df_bt = load_price(bt_ticker, bt_period)
+            ihsg_bt = load_ihsg(bt_period)
+            rs_bt = calc_rs(df_bt, ihsg_bt) if (df_bt is not None and ihsg_bt is not None) else {"available": False}
+
+        st.session_state["bt_res"] = {
+            "bt": bt_result, "rs": rs_bt,
+            "ticker": bt_ticker, "period": bt_period,
+            "hold": bt_hold, "signal": bt_signal,
+            "fetched": datetime.now().strftime("%H:%M:%S WIB"),
+        }
+
+    if "bt_res" in st.session_state:
+        BR = st.session_state["bt_res"]
+        bt  = BR["bt"]
+        rs  = BR["rs"]
+        hold = BR["hold"]
+
+        st.markdown("---")
+
+        # ══════════════════════
+        # SECTION A: BACKTEST
+        # ══════════════════════
+        st.markdown('<div class="sec">BACKTEST RESULTS</div>', unsafe_allow_html=True)
+
+        if not bt.get("available"):
+            st.error(f"Backtest failed: {bt.get('error','Unknown error')}. "
+                     f"Try a longer period (2y/3y) or check ticker.")
+        else:
+            # Summary metrics row
+            hold_days = bt["hold_days"]
+            primary_h = hold if hold in bt["stats"] else hold_days[0]
+            s = bt["stats"].get(primary_h, {})
+            if not s:
+                st.warning("No statistics generated. Try BUY instead of STRONG BUY.")
+            else:
+                # Color coding
+                wr_color  = "#00e676" if s["win_rate"]>=60 else "#ffab00" if s["win_rate"]>=50 else "#ff1744"
+                ar_color  = "#00e676" if s["avg_ret"]>0 else "#ff1744"
+                sh_color  = "#00e676" if s["sharpe"]>0.5 else "#ffab00" if s["sharpe"]>0 else "#ff1744"
+                al_color  = "#00e676" if s["avg_alpha"]>0 else "#ff1744"
+
+                # ── Main KPIs
+                st.markdown(f"""
+                <div style='display:grid;grid-template-columns:repeat(8,1fr);gap:6px;margin-bottom:14px'>
+                  {_kpi("TOTAL SIGNALS", str(s["total_signals"]), "#5a7a9a", "")}
+                  {_kpi("WIN RATE", f"{s['win_rate']}%", wr_color,
+                         "Good" if s["win_rate"]>=60 else "Weak")}
+                  {_kpi("AVG RETURN", f"{s['avg_ret']:+.2f}%", ar_color,
+                         f"{primary_h}d hold")}
+                  {_kpi("MEDIAN RET", f"{s['median_ret']:+.2f}%", ar_color, "")}
+                  {_kpi("SHARPE", f"{s['sharpe']:.2f}", sh_color,
+                         "Strong" if s["sharpe"]>1 else "OK" if s["sharpe"]>0.5 else "Weak")}
+                  {_kpi("MAX DRAWDOWN", f"{s['max_dd']:.1f}%", "#ff1744", "from equity peak")}
+                  {_kpi("AVG ALPHA", f"{s['avg_alpha']:+.2f}%", al_color, "vs IHSG")}
+                  {_kpi("BEAT IHSG %", f"{s['pct_beat_ihsg']}%", al_color,
+                         "of signals")}
+                </div>""", unsafe_allow_html=True)
+
+                # ── Interpretation
+                if s["win_rate"] >= 60 and s["avg_ret"] > 0 and s["sharpe"] > 0.5:
+                    st.success(
+                        f"✅ **Sistem ini profitable secara historis** untuk {bt_ticker}: "
+                        f"Win rate {s['win_rate']}%, avg return {s['avg_ret']:+.2f}% per {primary_h} hari, "
+                        f"Sharpe {s['sharpe']:.2f}, alpha {s['avg_alpha']:+.2f}% vs IHSG. "
+                        f"Sinyal **{bt_signal}** terbukti memberikan edge.")
+                elif s["win_rate"] < 50 or s["avg_ret"] < 0:
+                    st.error(
+                        f"⚠️ **Sistem kurang reliable** untuk {bt_ticker}: "
+                        f"Win rate {s['win_rate']}%, avg return {s['avg_ret']:+.2f}%. "
+                        f"Pertimbangkan menaikkan threshold sinyal ke STRONG BUY atau perbanyak konfirmasi.")
+                else:
+                    st.warning(
+                        f"🟡 **Hasil campuran**: Win rate {s['win_rate']}%, avg return {s['avg_ret']:+.2f}%. "
+                        f"Sistem bekerja tapi margin of safety tipis. Selalu gunakan stop-loss.")
+
+                # ── Multi-hold comparison table
+                if len(bt["stats"]) > 1:
+                    st.markdown('<div class="sec" style="margin-top:14px">COMPARISON BY HOLDING PERIOD</div>',
+                                unsafe_allow_html=True)
+                    rows_comp = []
+                    for h, hs in sorted(bt["stats"].items()):
+                        rows_comp.append({
+                            "Hold (days)"  : h,
+                            "Total Signals": hs["total_signals"],
+                            "Win Rate %"   : hs["win_rate"],
+                            "Avg Return %" : hs["avg_ret"],
+                            "Median Ret %": hs["median_ret"],
+                            "Best %"       : hs["best"],
+                            "Worst %"      : hs["worst"],
+                            "Sharpe"       : hs["sharpe"],
+                            "Max DD %"     : hs["max_dd"],
+                            "Profit Factor": hs["profit_factor"],
+                            "Avg Alpha %"  : hs["avg_alpha"],
+                            "Beat IHSG %"  : hs["pct_beat_ihsg"],
+                        })
+                    st.dataframe(pd.DataFrame(rows_comp), hide_index=True,
+                                  use_container_width=True)
+
+                st.markdown('<div class="sec" style="margin-top:14px">EQUITY CURVE</div>',
+                            unsafe_allow_html=True)
+                st.markdown("""
+                <div style='font-size:10px;color:#5a7a9a;font-family:"IBM Plex Mono",monospace;margin-bottom:6px'>
+                Portfolio value starting at 100, setiap sinyal dieksekusi equal weight.
+                Tidak memperhitungkan biaya transaksi dan slippage.
+                </div>""", unsafe_allow_html=True)
+                st.plotly_chart(chart_equity_curve(bt), use_container_width=True)
+
+                # ── Charts row
+                col_dist, col_scatter = st.columns(2)
+                with col_dist:
+                    st.markdown(f'<div class="sec">RETURN DISTRIBUTION — {primary_h}d hold</div>',
+                                unsafe_allow_html=True)
+                    st.plotly_chart(chart_return_distribution(bt, primary_h),
+                                    use_container_width=True)
+                with col_scatter:
+                    st.markdown(f'<div class="sec">SIGNAL ENTRY vs RETURN — {primary_h}d hold</div>',
+                                unsafe_allow_html=True)
+                    st.plotly_chart(chart_signal_scatter(bt["df_signals"], primary_h),
+                                    use_container_width=True)
+
+                # ── Monthly heatmap
+                if not bt["monthly"].empty:
+                    st.markdown(f'<div class="sec" style="margin-top:10px">MONTHLY AVERAGE RETURN — {primary_h}d hold</div>',
+                                unsafe_allow_html=True)
+                    st.plotly_chart(chart_monthly_heatmap(bt["monthly"], primary_h),
+                                    use_container_width=True)
+
+                # ── Signal log (last 20)
+                with st.expander("📋 Signal Log (last 20 signals)"):
+                    cols_show = ["date","signal","entry"] + [f"ret_{h}d" for h in bt["hold_days"] if f"ret_{h}d" in bt["df_signals"].columns]
+                    df_show = bt["df_signals"][cols_show].tail(20).copy()
+                    df_show["date"] = pd.to_datetime(df_show["date"]).dt.strftime("%d %b %Y")
+                    st.dataframe(df_show, hide_index=True, use_container_width=True)
+
+        # ══════════════════════
+        # SECTION B: RS DEEP DIVE
+        # ══════════════════════
+        st.markdown("---")
+        st.markdown('<div class="sec">RELATIVE STRENGTH ANALYSIS — {}</div>'.format(BR["ticker"]),
+                    unsafe_allow_html=True)
+
+        if not rs.get("available"):
+            st.warning("RS data unavailable — IHSG (^JKSE) could not be loaded from Yahoo Finance.")
+        else:
+            rs20v = rs.get("rs20_val",100)
+            rs60v = rs.get("rs60_val",100)
+            rc    = rs.get("color","#ffab00")
+            interp= rs.get("interp","IN LINE")
+            note  = rs.get("note","")
+            t20   = rs.get("trend20","flat")
+            t60   = rs.get("trend60","flat")
+
+            # RS banner
+            st.markdown(f"""
+            <div style='background:#0b1018;border:1px solid #141e2e;border-left:4px solid {rc};
+                        padding:14px 18px;border-radius:3px;margin-bottom:12px'>
+              <div style='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px'>
+                <div>
+                  <div style='font-family:"IBM Plex Mono",monospace;font-size:1.5rem;
+                              font-weight:700;color:{rc}'>{interp}</div>
+                  <div style='font-size:11px;color:#cdd8e6;margin-top:4px'>{note}</div>
+                </div>
+                <div style='display:flex;gap:24px;font-family:"IBM Plex Mono",monospace;text-align:center'>
+                  <div>
+                    <div style='font-size:9px;color:#5a7a9a'>RS 20D</div>
+                    <div style='font-size:1.4rem;font-weight:700;
+                                color:{"#00e676" if rs20v>=100 else "#ff1744"}'>{rs20v:.1f}</div>
+                    <div style='font-size:9px;color:{"#00e676" if t20=="rising" else "#ff1744"}'>
+                      {"▲ Rising" if t20=="rising" else "▼ Falling"}</div>
+                  </div>
+                  <div>
+                    <div style='font-size:9px;color:#5a7a9a'>RS 60D</div>
+                    <div style='font-size:1.4rem;font-weight:700;
+                                color:{"#00e676" if rs60v>=100 else "#ff1744"}'>{rs60v:.1f}</div>
+                    <div style='font-size:9px;color:{"#00e676" if t60=="rising" else "#ff1744"}'>
+                      {"▲ Rising" if t60=="rising" else "▼ Falling"}</div>
+                  </div>
+                  <div>
+                    <div style='font-size:9px;color:#5a7a9a'>RS SCORE</div>
+                    <div style='font-size:1.4rem;font-weight:700;color:{rc}'>{rs.get("score",50)}/100</div>
+                    <div style='font-size:9px;color:#5a7a9a'>0–100</div>
+                  </div>
+                </div>
+              </div>
+            </div>""", unsafe_allow_html=True)
+
+            st.plotly_chart(chart_rs(rs, BR["ticker"]), use_container_width=True)
+
+            # RS insight boxes
+            co1, co2 = st.columns(2)
+            with co1:
+                st.markdown(f"""
+                <div style='background:#0b1018;border:1px solid #141e2e;padding:14px;border-radius:3px'>
+                  <div class='sec'>CARA MEMBACA RS CHART</div>
+                  <div style='font-size:11px;color:#cdd8e6;line-height:1.8'>
+                    <b style='color:#00e676'>RS > 100</b> = {BR["ticker"]} outperform IHSG<br>
+                    <b style='color:#ff1744'>RS < 100</b> = {BR["ticker"]} underperform IHSG<br>
+                    <b style='color:#00e676'>RS Rising ▲</b> = smart money rotation masuk<br>
+                    <b style='color:#ff1744'>RS Falling ▼</b> = smart money rotation keluar<br>
+                    <b style='color:#ffab00'>RS 20d > RS 60d</b> = momentum menguat<br>
+                    <b style='color:#ffab00'>RS 20d < RS 60d</b> = momentum melemah<br><br>
+                    <b style='color:#eaf0f8'>Shaded area:</b> hijau = alpha zone (saham mengungguli IHSG)
+                  </div>
+                </div>""", unsafe_allow_html=True)
+            with co2:
+                # RS-based trade guidance
+                if rs20v > 105 and t20 == "rising" and t60 == "rising":
+                    rs_guide_title = "🔥 SETUP TERBAIK"
+                    rs_guide_color = "#00e676"
+                    rs_guide_body = (f"RS 20d ({rs20v:.1f}) dan RS 60d ({rs60v:.1f}) keduanya positif "
+                                     f"dan trending naik. Ini setup RS ideal — bandar aktif accumulate. "
+                                     f"Konfluens sinyal teknikal + RS = conviction tinggi untuk entry.")
+                elif rs20v > 100 and t20 == "rising":
+                    rs_guide_title = "✅ RS POSITIF"
+                    rs_guide_color = "#88ffbb"
+                    rs_guide_body = (f"Outperform IHSG dengan RS {rs20v:.1f}. Momentum naik. "
+                                     f"Entry valid jika teknikal juga konfirm (CMF+ / OBV rising).")
+                elif rs20v < 95 and t20 == "falling":
+                    rs_guide_title = "⛔ HINDARI DULU"
+                    rs_guide_color = "#ff1744"
+                    rs_guide_body = (f"RS lemah ({rs20v:.1f}) dan terus melemah. Saham underperform IHSG. "
+                                     f"Tunggu RS minimal berhenti turun dan membentuk base sebelum pertimbangkan entry. "
+                                     f"Sinyal teknikal bullish apapun harus dikurangi conviction-nya.")
+                elif rs20v < 100 and t20 == "rising":
+                    rs_guide_title = "🔄 WATCH: RS RECOVERY"
+                    rs_guide_color = "#ffab00"
+                    rs_guide_body = (f"RS masih di bawah 100 ({rs20v:.1f}) tapi mulai naik. "
+                                     f"Ini early recovery — monitor apakah RS bisa tembus 100. "
+                                     f"Jika RS menembus 100 + teknikal bagus = entry sinyal kuat.")
+                else:
+                    rs_guide_title = "➡️ MONITOR"
+                    rs_guide_color = "#ffab00"
+                    rs_guide_body = f"RS bergerak seiring IHSG ({rs20v:.1f}). Tidak ada RS edge saat ini. Fokus ke sinyal broker."
+
+                st.markdown(f"""
+                <div style='background:#0b1018;border:1px solid #141e2e;padding:14px;
+                            border-radius:3px;border-left:3px solid {rs_guide_color}'>
+                  <div class='sec'>{rs_guide_title}</div>
+                  <div style='font-size:11px;color:#cdd8e6;line-height:1.6'>{rs_guide_body}</div>
+                </div>""", unsafe_allow_html=True)
+
+        # ── Backtest disclaimer
+        st.markdown("---")
+        st.info("""
+        **⚠️ Disclaimer Backtest** — Past performance does not guarantee future results.
+        Backtest ini menggunakan indikator teknikal historis tanpa data broker (tidak tersedia historis).
+        Hasil backtest bisa terlihat lebih baik dari realita karena: (1) tidak ada biaya transaksi/slippage,
+        (2) look-ahead bias minimal tapi mungkin ada, (3) overfitting pada parameter default.
+        Gunakan sebagai referensi, bukan jaminan profit.
+        """)
+
+    else:
+        st.markdown("""
+        <div style='text-align:center;padding:60px 20px;border:1px dashed #141e2e;border-radius:4px'>
+          <div style='font-size:2rem;color:#141e2e;margin-bottom:12px'>◈</div>
+          <div style='font-family:"IBM Plex Mono",monospace;font-size:12px;color:#2a3d52;letter-spacing:2px'>
+            SET TICKER + PARAMETERS ABOVE · CLICK RUN BACKTEST + RS</div>
+          <div style='font-family:"IBM Plex Mono",monospace;font-size:10px;color:#1c2a3e;margin-top:6px'>
+            Walk-Forward Backtest · Equity Curve · Win Rate · Sharpe · Alpha vs IHSG · RS Chart
+          </div>
+        </div>""", unsafe_allow_html=True)
+
+
+# ── helper: small KPI box (used in backtest section)
+# ══════════════════════════════════════════════════════════════════════
+#  TAB 4 — SCREENER
 # ══════════════════════════════════════════════════════════════════════
 
 with tab_s:
@@ -1704,19 +2908,35 @@ with tab_s:
         t.strip().upper().replace(".JK","")
         for t in wl_raw.replace("\n",",").split(",") if t.strip()
     ]))
+
+    # Info banner
+    n_wl = len(wl)
+    ticker_preview = " · ".join(wl[:30]) + (f" ... +{n_wl-30} more" if n_wl>30 else "")
     st.markdown(f"""
-    <div style='padding:6px 12px;background:#0b1018;border:1px solid #141e2e;border-radius:3px;
-                margin-bottom:10px;font-family:"IBM Plex Mono",monospace;font-size:10px;color:#5a7a9a'>
-      {len(wl)} stocks: <span style='color:#cdd8e6'>{" · ".join(wl[:20])}{"..." if len(wl)>20 else ""}</span>
+    <div style='padding:10px 14px;background:#0b1018;border:1px solid #141e2e;
+                border-left:3px solid #00e676;border-radius:3px;margin-bottom:12px;
+                font-family:"IBM Plex Mono",monospace;font-size:10px'>
+      <div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:4px'>
+        <span style='color:#00e676;font-weight:700;letter-spacing:2px'>
+          {n_wl} STOCKS IN WATCHLIST</span>
+        <span style='color:#5a7a9a;font-size:9px'>
+          Edit in sidebar · No limit · Use preset buttons (LQ45/IDX30/GROWTH)</span>
+      </div>
+      <span style='color:#cdd8e6'>{ticker_preview}</span>
     </div>""", unsafe_allow_html=True)
 
-    if st.button("▶  SCAN ALL STOCKS"):
+    # Estimated time warning
+    if n_wl > 20:
+        est_min = round(n_wl * 3 / 60, 1)
+        st.info(f"⏱️ {n_wl} stocks — estimated **{est_min} min** to scan. Cached after first run.")
+
+    if st.button("▶  SCAN ALL STOCKS", use_container_width=False):
         if not wl:
             st.warning("Add tickers to the watchlist in the sidebar.")
         else:
             rows=[]; prog=st.progress(0)
             for i,tk in enumerate(wl):
-                prog.progress((i+1)/len(wl), text=f"Analyzing {tk} ...")
+                prog.progress((i+1)/len(wl), text=f"Analyzing {tk} ... ({i+1}/{len(wl)})")
                 df_tk = load_price(tk, period)
                 if df_tk is None or len(df_tk)<20: continue
                 c_=cmf(df_tk); o_=obv(df_tk); m_=mfi(df_tk)
@@ -1895,9 +3115,97 @@ with tab_g:
           <span style='color:#cdd8e6;font-size:12px'>{body}</span></div>
         </div>""", unsafe_allow_html=True)
 
+    # ── INDICATOR GUIDE
+    st.markdown("---")
+    st.markdown("##### 📐 INDIKATOR TEKNIKAL — PENJELASAN LENGKAP")
+    st.markdown("""
+    <div style='font-family:"IBM Plex Mono",monospace;font-size:10px;color:#5a7a9a;margin-bottom:10px'>
+    Semua indikator yang digunakan dalam Bandarmology PRO beserta cara membacanya.
+    </div>""", unsafe_allow_html=True)
+
+    indicators = [
+        ("CMF","Chaikin Money Flow (14)","#00e676",
+         "Mengukur apakah uang mengalir masuk atau keluar dari saham selama 14 hari.",
+         [("≥ +0.15","Akumulasi kuat — uang deras masuk","#00e676"),
+          ("+0.05 – +0.14","Akumulasi ringan","#88ffbb"),
+          ("-0.05 – +0.04","Netral / sideways","#5a7a9a"),
+          ("-0.15 – -0.06","Distribusi ringan","#ff8888"),
+          ("≤ -0.15","Distribusi kuat — uang deras keluar","#ff1744")],
+         "CMF > 0 saat harga turun = divergensi bullish (bandar diam-diam beli). CMF < 0 saat harga naik = distribusi tersembunyi."),
+
+        ("OBV","On Balance Volume","#00b0ff",
+         "Akumulasi kumulatif volume beli vs jual. Indikator paling murni untuk deteksi smart money.",
+         [("OBV Naik + Harga Naik","Konfirmasi trend kuat — ikuti","#00e676"),
+          ("OBV Naik + Harga Turun","⭐ Divergensi Bullish — bandar BELI diam-diam! Entry zone.","#00e676"),
+          ("OBV Datar","Konsolidasi — tunggu konfirmasi","#5a7a9a"),
+          ("OBV Turun + Harga Naik","⚠️ Divergensi Bearish — bandar JUAL diam-diam! Waspadai.","#ff1744"),
+          ("OBV Turun + Harga Turun","Distribusi terkonfirmasi","#ff1744")],
+         "OBV adalah favorit Wyckoff analyst. Ketika OBV naik tapi harga belum naik = bandar sedang akumulasi sebelum markup."),
+
+        ("MFI","Money Flow Index (14)","#ffab00",
+         "Seperti RSI tapi memperhitungkan volume — lebih akurat untuk deteksi oversold/overbought.",
+         [("≥ 80","Overbought — jangan beli baru, siapkan exit","#ff1744"),
+          ("70 – 79","Mendekati overbought","#ff8888"),
+          ("45 – 69","Normal range","#5a7a9a"),
+          ("20 – 44","Oversold ringan — potensi reversal","#88ffbb"),
+          ("≤ 20","⭐ Oversold kuat — potensi reversal besar, cek CMF konfirmasi","#00e676")],
+         "MFI Divergence: Harga turun tapi MFI naik = bandar beli saat retail panik jual. Ini salah satu sinyal terkuat."),
+
+        ("VOL RATIO","Volume Ratio (vs MA20)","#e040fb",
+         "Volume hari ini dibagi rata-rata volume 20 hari. Mengukur seberapa 'ramai' aktivitas hari ini.",
+         [("≥ 3x","Aktivitas ekstrem — kemungkinan news/aksi korporasi","#ff1744"),
+          ("1.5x – 2.9x","Volume tinggi — sinyal pergerakan signifikan","#00e676"),
+          ("0.8x – 1.4x","Volume normal","#5a7a9a"),
+          ("≤ 0.5x","Volume sangat sepi — hindari, likuiditas rendah","#2a3d52")],
+         "Volume tinggi + harga naik + CMF positif = akumulasi valid. Volume tinggi + harga turun = distribusi atau shakeout."),
+
+        ("WYCKOFF","Wyckoff Phase Analysis","#00e5ff",
+         "Mengidentifikasi posisi saham dalam siklus akumulasi-distribusi Richard Wyckoff (1910s, masih relevan).",
+         [("Phase A — Selling Climax","Harga jatuh + volume meledak. Bandar mulai serap supply.","#00b0ff"),
+          ("Phase B — Building Cause","Sideways panjang. Bandar kumpul diam-diam. Bisa berbulan-bulan.","#ffab00"),
+          ("Phase C — Spring ⭐","FALSE BREAKDOWN — harga ditekan lalu balik. ENTRY IDEAL!","#00e676"),
+          ("Phase D — Sign of Strength","Volume + harga breakout. Konfirmasi akumulasi selesai.","#88ffbb"),
+          ("Phase E — Markup","Harga trending naik. Bandar sudah untung. Waspadai distribusi.","#ff8888")],
+         "Phase C (Spring) adalah entry paling ideal dalam Wyckoff — retail terkena stop-loss, bandar lanjut beli. Selalu konfirmasi dengan CMF dan OBV."),
+
+        ("BROKER SCORE","Broker Flow Score","#00e676",
+         "Skor 0–100 berdasarkan aktivitas broker. Mengkombinasikan banyak faktor broker flow.",
+         [("≥ 70","Akumulasi kuat — smart money beli, retail jual","#00e676"),
+          ("55 – 69","Akumulasi moderat","#88ffbb"),
+          ("45 – 54","Netral","#5a7a9a"),
+          ("35 – 44","Distribusi moderat","#ff8888"),
+          ("≤ 34","Distribusi kuat","#ff1744")],
+         "Faktor: net lot foreign smart money (bobot 30%), crossing signal (bobot 20%), institutional flow (bobot 15%), retail kontrarian (bobot 10%), goreng alert (bonus 5%)."),
+    ]
+
+    for ind_code, ind_name, ind_color, ind_desc, levels, ind_tip in indicators:
+        with st.expander(f"**{ind_code}** — {ind_name}", expanded=False):
+            st.markdown(f"""
+            <div style='background:#0b1018;border:1px solid #141e2e;border-top:2px solid {ind_color};
+                        padding:12px;border-radius:3px;margin-bottom:10px'>
+              <div style='font-size:12px;color:#cdd8e6;line-height:1.6'>{ind_desc}</div>
+            </div>""", unsafe_allow_html=True)
+
+            st.markdown('<div style="font-family:IBM Plex Mono,monospace;font-size:9px;color:#5a7a9a;letter-spacing:2px;margin-bottom:6px">CARA MEMBACA</div>', unsafe_allow_html=True)
+            for val,meaning,color in levels:
+                st.markdown(f"""
+                <div style='display:flex;gap:12px;padding:5px 10px;border-bottom:1px solid #141e2e;
+                            font-family:"IBM Plex Mono",monospace;font-size:11px'>
+                  <span style='color:{color};font-weight:700;min-width:160px'>{val}</span>
+                  <span style='color:#cdd8e6'>{meaning}</span>
+                </div>""", unsafe_allow_html=True)
+
+            st.markdown(f"""
+            <div style='margin-top:8px;padding:8px 12px;background:rgba(0,0,0,.3);
+                        border-radius:3px;font-size:11px;color:#5a7a9a;
+                        font-family:"IBM Plex Mono",monospace;border-left:2px solid {ind_color}'>
+              💡 {ind_tip}
+            </div>""", unsafe_allow_html=True)
+
     st.markdown("<br>",unsafe_allow_html=True)
     st.info("""
-    **Important** — Bandarmology is a probabilistic analytical tool, not a guarantee of profit.
-    Always apply stop-loss discipline, position sizing, and combine with fundamental analysis.
-    Data broker yang tampil adalah ESTIMASI berdasarkan net flow harian — bukan actual sub-account holdings KSEI.
+    **Important** — Bandarmology adalah probabilistic tool, bukan prediksi pasti.
+    Selalu gunakan stop-loss, position sizing yang tepat, dan kombinasikan dengan analisis fundamental.
+    Data broker = ESTIMASI berdasarkan net flow harian — bukan actual sub-account holdings KSEI.
     """)
+
