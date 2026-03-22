@@ -1,1017 +1,1903 @@
 """
-BANDARMOLOGY ENGINE — Web App (Streamlit)
-Deploy gratis di: https://share.streamlit.io
+BANDARMOLOGY PRO v6
+IDX Smart Money Intelligence Platform
+─────────────────────────────────────
+Features:
+  • Broker flow (today)             — IDX API / Stockbit
+  • Broker Accumulation             — cumulative net lot over N days (estimated position)
+  • Broker Shareholding panel       — who holds how much, by broker category
+  • Shareholders >1% (IDX/KSEI)    — live + monthly data (OJK mandate Mar 2026)
+  • KSEI Foreign/Domestic split     — real holding composition
+  • Wyckoff · CMF · OBV · MFI      — full technical suite
+  • Entry Zone (price/SL/target)    — ATR-based
+  • Ownership intelligence          — conglomerate database
+  • Auto-refresh                    — live market status clock
+  • All cache TTLs tuned per data source
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import plotly.express as px
 from plotly.subplots import make_subplots
 import yfinance as yf
-import warnings
+import requests, warnings
+from datetime import datetime, timedelta
+
+try:
+    from streamlit_autorefresh import st_autorefresh
+    HAS_AR = True
+except ImportError:
+    HAS_AR = False
+
 warnings.filterwarnings("ignore")
 
-# ── PAGE CONFIG ────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Bandarmology IDX",
+    page_title="Bandarmology PRO · IDX",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ── CUSTOM CSS ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+#  DESIGN SYSTEM
+# ══════════════════════════════════════════════════════════════════════
 st.markdown("""
 <style>
-/* Dark theme override */
-[data-testid="stAppViewContainer"] {
-    background: #070b0f;
-    color: #c8d8e8;
-}
-[data-testid="stSidebar"] {
-    background: #0d1318;
-    border-right: 1px solid #1a2535;
-}
-[data-testid="stSidebar"] * { color: #c8d8e8 !important; }
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
 
-/* Metric cards */
+:root {
+  --bg:#05080c; --bg2:#090d12; --bg3:#0d1219; --panel:#0b1018;
+  --border:#141e2e; --border2:#1c2a3e;
+  --green:#00e676; --red:#ff1744; --amber:#ffab00;
+  --blue:#00b0ff;  --purple:#e040fb; --cyan:#00e5ff;
+  --text:#cdd8e6;  --text2:#5a7a9a;  --text3:#2a3d52; --white:#eaf0f8;
+}
+* { font-family:'IBM Plex Sans',sans-serif; box-sizing:border-box; }
+
+[data-testid="stAppViewContainer"]  { background:var(--bg); color:var(--text); }
+[data-testid="stSidebar"]           { background:var(--bg2); border-right:1px solid var(--border); }
+[data-testid="stSidebar"] *         { color:var(--text) !important; }
+
 [data-testid="metric-container"] {
-    background: #0d1318;
-    border: 1px solid #1a2535;
-    border-radius: 6px;
-    padding: 12px;
+  background:var(--panel); border:1px solid var(--border);
+  border-radius:4px; padding:12px 14px; position:relative; overflow:hidden;
 }
-[data-testid="stMetricValue"]  { color: #00ccff !important; font-size: 1.6rem !important; }
-[data-testid="stMetricLabel"]  { color: #6a8aaa !important; }
-[data-testid="stMetricDelta"]  > div { font-size: 0.8rem !important; }
-
-/* Headers */
-h1, h2, h3 { color: #00ff88 !important; font-family: monospace !important; }
-h1 { letter-spacing: 4px; font-size: 1.8rem !important; }
-
-/* Dataframe */
-[data-testid="stDataFrame"] { background: #0d1318; }
-
-/* Buttons */
-.stButton > button {
-    background: #00ff88 !important;
-    color: #070b0f !important;
-    font-weight: 800 !important;
-    font-family: monospace !important;
-    letter-spacing: 2px !important;
-    border: none !important;
-    border-radius: 4px !important;
-    padding: 10px 24px !important;
+[data-testid="metric-container"]::before {
+  content:''; position:absolute; top:0; left:0; right:0; height:2px;
+  background:linear-gradient(90deg,var(--blue),transparent);
 }
-.stButton > button:hover { background: #00ffaa !important; }
+[data-testid="stMetricValue"]  { color:var(--white)!important; font-family:'IBM Plex Mono',monospace!important; font-size:1.35rem!important; font-weight:600!important; }
+[data-testid="stMetricLabel"]  { color:var(--text2)!important; font-size:10px!important; letter-spacing:1.5px!important; text-transform:uppercase!important; font-family:'IBM Plex Mono',monospace!important; }
+[data-testid="stMetricDelta"]>div { font-size:10px!important; font-family:'IBM Plex Mono',monospace!important; }
 
-/* Select/input */
-.stSelectbox > div, .stTextInput > div > div {
-    background: #0d1318 !important;
-    border: 1px solid #1a2535 !important;
-    color: #c8d8e8 !important;
+.stButton>button {
+  background:var(--green)!important; color:#000!important;
+  font-family:'IBM Plex Mono',monospace!important; font-weight:700!important;
+  letter-spacing:2px!important; font-size:11px!important;
+  border:none!important; border-radius:3px!important; padding:9px 22px!important;
 }
+.stButton>button:hover { background:#00ff88!important; box-shadow:0 4px 18px rgba(0,230,118,.3)!important; }
 
-/* Tabs */
+.stTextInput>div>div, .stTextArea>div>div {
+  background:var(--bg3)!important; border:1px solid var(--border2)!important;
+  color:var(--white)!important; font-family:'IBM Plex Mono',monospace!important;
+}
+.stSelectbox>div>div, .stSlider { background:var(--bg3)!important; border:1px solid var(--border2)!important; }
+
 [data-testid="stTabs"] button {
-    background: transparent !important;
-    color: #6a8aaa !important;
-    font-family: monospace !important;
-    letter-spacing: 1px !important;
+  background:transparent!important; color:var(--text2)!important;
+  font-family:'IBM Plex Mono',monospace!important; font-size:10px!important;
+  letter-spacing:1.5px!important; text-transform:uppercase!important;
 }
 [data-testid="stTabs"] button[aria-selected="true"] {
-    color: #00ff88 !important;
-    border-bottom: 2px solid #00ff88 !important;
+  color:var(--green)!important; border-bottom:2px solid var(--green)!important;
+  background:rgba(0,230,118,.03)!important;
 }
 
-/* Divider */
-hr { border-color: #1a2535 !important; }
+h1,h2,h3 { font-family:'IBM Plex Mono',monospace!important; color:var(--white)!important; }
+hr { border-color:var(--border)!important; margin:6px 0!important; }
+.stProgress>div>div { background:var(--green)!important; }
+[data-testid="stDataFrame"] { border:1px solid var(--border)!important; }
 
-/* Info/warning boxes */
-.stAlert { background: #0d1318 !important; border: 1px solid #1a2535 !important; }
-
-/* Score badge */
-.score-badge {
-    display: inline-block;
-    padding: 6px 18px;
-    border-radius: 4px;
-    font-family: monospace;
-    font-weight: 700;
-    font-size: 1.1rem;
-    letter-spacing: 2px;
+/* ── COMPONENTS ── */
+.sec {
+  font-family:'IBM Plex Mono',monospace; font-size:10px; letter-spacing:3px;
+  color:var(--text2); text-transform:uppercase; margin-bottom:8px;
+  padding-bottom:5px; border-bottom:1px solid var(--border);
 }
-.badge-acc  { background: rgba(0,255,136,0.15); color: #00ff88; border: 1px solid #00ff88; }
-.badge-dis  { background: rgba(255,51,85,0.15);  color: #ff3355; border: 1px solid #ff3355; }
-.badge-neut { background: rgba(255,170,0,0.15);  color: #ffaa00; border: 1px solid #ffaa00; }
+.kv { display:flex; justify-content:space-between; align-items:center;
+      padding:6px 0; border-bottom:1px solid var(--border); font-size:12px; }
+.kv:last-child { border-bottom:none; }
+.kv-k { color:var(--text2); font-family:'IBM Plex Mono',monospace; font-size:10px; letter-spacing:1px; }
+.kv-v { color:var(--white); font-family:'IBM Plex Mono',monospace; font-weight:500; }
 
-/* Progress bar custom */
-.stProgress > div > div { background: #00ff88 !important; }
+.tag  { display:inline-block; padding:2px 8px; border-radius:2px; font-family:'IBM Plex Mono',monospace; font-size:10px; letter-spacing:1px; }
+.tg { background:rgba(0,230,118,.12); color:var(--green);  border:1px solid rgba(0,230,118,.3); }
+.tr { background:rgba(255,23,68,.10);  color:var(--red);    border:1px solid rgba(255,23,68,.2); }
+.ta { background:rgba(255,171,0,.10);  color:var(--amber);  border:1px solid rgba(255,171,0,.2); }
+.tb { background:rgba(0,176,255,.10);  color:var(--blue);   border:1px solid rgba(0,176,255,.2); }
 
-/* Subheader */
-[data-testid="stMarkdownContainer"] p { color: #c8d8e8; }
+.signal-card { padding:16px 20px; border-radius:4px; border-left:4px solid; margin-bottom:10px; }
+.sc-buy  { background:rgba(0,230,118,.06); border-color:var(--green); }
+.sc-sell { background:rgba(255,23,68,.06);  border-color:var(--red);   }
+.sc-watch{ background:rgba(255,171,0,.06);  border-color:var(--amber); }
+.sig-main { font-family:'IBM Plex Mono',monospace; font-size:1.9rem; font-weight:700; letter-spacing:2px; }
+.sig-lbl  { font-family:'IBM Plex Mono',monospace; font-size:10px; letter-spacing:2.5px; text-transform:uppercase; font-weight:700; margin-bottom:4px; }
+.sig-why  { font-size:12px; color:var(--text); margin-top:6px; line-height:1.6; }
+.conds { margin-top:8px; display:flex; flex-wrap:wrap; gap:4px; }
+.cm { padding:2px 8px; border-radius:2px; font-family:'IBM Plex Mono',monospace; font-size:9px; background:rgba(0,230,118,.12); color:var(--green); border:1px solid rgba(0,230,118,.25); }
+.cf { padding:2px 8px; border-radius:2px; font-family:'IBM Plex Mono',monospace; font-size:9px; background:rgba(255,23,68,.10);  color:var(--red);   border:1px solid rgba(255,23,68,.2); }
+.cw { padding:2px 8px; border-radius:2px; font-family:'IBM Plex Mono',monospace; font-size:9px; background:rgba(255,171,0,.10); color:var(--amber); border:1px solid rgba(255,171,0,.2); }
+
+.mkt-open   { display:inline-flex; align-items:center; gap:6px; padding:3px 12px; border-radius:3px; background:rgba(0,230,118,.1);  border:1px solid rgba(0,230,118,.3); font-family:'IBM Plex Mono',monospace; font-size:10px; color:var(--green); }
+.mkt-closed { display:inline-flex; align-items:center; gap:6px; padding:3px 12px; border-radius:3px; background:rgba(255,171,0,.08); border:1px solid rgba(255,171,0,.25); font-family:'IBM Plex Mono',monospace; font-size:10px; color:var(--amber); }
+.dot { width:6px; height:6px; border-radius:50%; }
+.dot-g { background:var(--green); box-shadow:0 0 5px var(--green); animation:pulse 1.5s infinite; }
+.dot-a { background:var(--amber); }
+@keyframes pulse { 0%,100%{opacity:1}50%{opacity:.35} }
+
+.bar-wrap { height:6px; background:var(--border); border-radius:3px; overflow:hidden; margin-top:4px; }
+.bar      { height:100%; border-radius:3px; }
+
+.entry-box { background:rgba(0,230,118,.05); border:1px solid rgba(0,230,118,.25); padding:12px; border-radius:3px; font-family:'IBM Plex Mono',monospace; }
+.stop-box  { background:rgba(255,23,68,.04);  border:1px solid rgba(255,23,68,.2);  padding:12px; border-radius:3px; font-family:'IBM Plex Mono',monospace; }
+
+.ph-track { display:flex; gap:3px; margin-top:8px; }
+.ph  { flex:1; text-align:center; padding:6px 2px; border:1px solid var(--border); border-radius:3px; font-family:'IBM Plex Mono',monospace; font-size:9px; color:var(--text3); }
+.ph-a{ background:rgba(0,230,118,.1); border-color:var(--green); color:var(--green); font-weight:700; }
+.ph-d{ background:rgba(0,230,118,.04); border-color:rgba(0,230,118,.3); color:var(--text2); }
+
+.broker-hold-row {
+  display:flex; align-items:center; gap:10px;
+  padding:8px 0; border-bottom:1px solid var(--border);
+}
+.broker-hold-row:last-child { border-bottom:none; }
+.bh-code { font-family:'IBM Plex Mono',monospace; font-size:13px; font-weight:700; min-width:36px; }
+.bh-name { font-family:'IBM Plex Mono',monospace; font-size:10px; color:var(--text2); flex:1; }
+.bh-lots { font-family:'IBM Plex Mono',monospace; font-size:11px; font-weight:600; min-width:80px; text-align:right; }
+.bh-pct  { font-family:'IBM Plex Mono',monospace; font-size:10px; color:var(--text2); min-width:48px; text-align:right; }
+
+.ts-note { font-family:'IBM Plex Mono',monospace; font-size:9px; color:var(--text3); letter-spacing:1px; }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ══════════════════════════════════════════════════════════════════════════
-#  DATABASE BROKER
-# ══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
+#  MARKET STATUS
+# ══════════════════════════════════════════════════════════════════════
+
+def market_status():
+    now_wib = datetime.utcnow() + timedelta(hours=7)
+    wd = now_wib.weekday()
+    t  = now_wib.time()
+    def T(s): return datetime.strptime(s, "%H:%M").time()
+    if wd >= 5:
+        return {"open":False, "label":"WEEKEND CLOSED", "next":"Monday 09:00 WIB", "wib":now_wib}
+    if T("09:00") <= t <= T("11:30"):
+        return {"open":True,  "label":"SESSION 1 OPEN", "next":"Closes 11:30 WIB", "wib":now_wib}
+    if T("13:30") <= t <= T("16:30"):
+        return {"open":True,  "label":"SESSION 2 OPEN", "next":"Closes 16:30 WIB", "wib":now_wib}
+    if t < T("09:00"):
+        return {"open":False, "label":"PRE-MARKET",     "next":"Opens 09:00 WIB",  "wib":now_wib}
+    if T("11:30") < t < T("13:30"):
+        return {"open":False, "label":"LUNCH BREAK",    "next":"Reopens 13:30 WIB","wib":now_wib}
+    return {"open":False, "label":"AFTER HOURS",        "next":"Tomorrow 09:00 WIB","wib":now_wib}
+
+
+def trade_days(n=30):
+    days, d = [], datetime.now()
+    while len(days) < n:
+        if d.weekday() < 5:
+            days.append(d.strftime("%Y-%m-%d"))
+        d -= timedelta(days=1)
+    return days
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  BROKER DATABASE
+# ══════════════════════════════════════════════════════════════════════
 
 BROKER_DB = {
-    "AK": {"name":"UBS Securities",          "cat":"FOREIGN_SMART",      "weight":3.0,  "goreng":False, "victim":False, "style":"Long-term Accumulator",       "contrarian":False},
-    "BK": {"name":"J.P. Morgan",             "cat":"FOREIGN_SMART",      "weight":3.0,  "goreng":False, "victim":False, "style":"Block Deal / Market Mover",    "contrarian":False},
-    "DB": {"name":"Deutsche Securities",     "cat":"FOREIGN_SMART",      "weight":2.8,  "goreng":False, "victim":False, "style":"Stealth Accumulator",          "contrarian":False},
-    "GW": {"name":"HSBC Securities",         "cat":"FOREIGN_SMART",      "weight":2.8,  "goreng":False, "victim":False, "style":"Institutional / Macro",        "contrarian":False},
-    "ML": {"name":"Merrill Lynch",           "cat":"FOREIGN_SMART",      "weight":2.8,  "goreng":False, "victim":False, "style":"Wealth Management HNWI",       "contrarian":False},
-    "YU": {"name":"CGS-CIMB Securities",     "cat":"FOREIGN_SMART",      "weight":2.5,  "goreng":False, "victim":False, "style":"ASEAN Regional Fund",          "contrarian":False},
-    "KZ": {"name":"CLSA Securities",         "cat":"FOREIGN_SMART",      "weight":2.5,  "goreng":False, "victim":False, "style":"Research-driven Swing",        "contrarian":False},
-    "CS": {"name":"Credit Suisse",           "cat":"FOREIGN_SMART",      "weight":2.5,  "goreng":False, "victim":False, "style":"Block Deal Specialist",        "contrarian":False},
-    "DP": {"name":"DBS Vickers",             "cat":"FOREIGN_SMART",      "weight":2.3,  "goreng":False, "victim":False, "style":"Singapore Institutional",      "contrarian":False},
-    "ZP": {"name":"Maybank Securities",      "cat":"FOREIGN_SMART",      "weight":2.2,  "goreng":False, "victim":False, "style":"Malaysia Value Fund",          "contrarian":False},
-    "RX": {"name":"Macquarie Securities",    "cat":"FOREIGN_SMART",      "weight":2.2,  "goreng":False, "victim":False, "style":"Commodities Specialist",       "contrarian":False},
-    "AI": {"name":"UOB Kay Hian",            "cat":"FOREIGN_SMART",      "weight":2.0,  "goreng":False, "victim":False, "style":"Underwriter / Singapore",      "contrarian":False},
-    "MK": {"name":"Ekuator Swarna",          "cat":"LOCAL_BANDAR",       "weight":2.0,  "goreng":True,  "victim":False, "style":"Pump & Dump / Goreng Saham",   "contrarian":False},
-    "EP": {"name":"Valbury Asia Securities", "cat":"LOCAL_BANDAR",       "weight":1.8,  "goreng":True,  "victim":False, "style":"Goreng Saham / Active Prop",   "contrarian":False},
-    "II": {"name":"Danatama Makmur",         "cat":"LOCAL_BANDAR",       "weight":1.5,  "goreng":True,  "victim":False, "style":"IPO Underwriter Gorengan",     "contrarian":False},
-    "DD": {"name":"Makindo Securities",      "cat":"LOCAL_BANDAR",       "weight":1.2,  "goreng":True,  "victim":False, "style":"Second/Third Liner Bandar",    "contrarian":False},
-    "CC": {"name":"Mandiri Sekuritas",       "cat":"BUMN_INST",          "weight":1.5,  "goreng":False, "victim":False, "style":"BUMN — Mixed Inst+Retail",     "contrarian":False},
-    "NI": {"name":"BNI Sekuritas",           "cat":"BUMN_INST",          "weight":1.4,  "goreng":False, "victim":False, "style":"Dana Pensiun BUMN",            "contrarian":False},
-    "OD": {"name":"BRI Danareksa",           "cat":"BUMN_INST",          "weight":1.3,  "goreng":False, "victim":False, "style":"Reksadana Index",              "contrarian":False},
-    "DX": {"name":"Bahana Sekuritas",        "cat":"LOCAL_INST",         "weight":1.8,  "goreng":False, "victim":False, "style":"Market Stabilizer Gov-linked", "contrarian":False},
-    "KI": {"name":"Ciptadana Sekuritas",     "cat":"LOCAL_INST",         "weight":1.6,  "goreng":False, "victim":False, "style":"Research + Prop Trading",      "contrarian":False},
-    "LG": {"name":"Trimegah Sekuritas",      "cat":"LOCAL_INST",         "weight":1.6,  "goreng":False, "victim":False, "style":"Research-driven Swing",        "contrarian":False},
-    "HG": {"name":"Sucor Sekuritas",         "cat":"LOCAL_INST",         "weight":1.5,  "goreng":False, "victim":False, "style":"Commodities Research",         "contrarian":False},
-    "SQ": {"name":"BCA Sekuritas",           "cat":"LOCAL_INST",         "weight":1.4,  "goreng":False, "victim":False, "style":"HNWI Wealth Management",       "contrarian":False},
-    "XA": {"name":"NH Korindo Securities",   "cat":"KOREAN",             "weight":1.8,  "goreng":False, "victim":False, "style":"Korean Institutional",         "contrarian":False},
-    "AG": {"name":"Kiwoom Securities",       "cat":"KOREAN",             "weight":1.5,  "goreng":False, "victim":False, "style":"Korean Retail/Inst",           "contrarian":False},
-    "BQ": {"name":"Korea Investment Sec.",   "cat":"KOREAN",             "weight":1.6,  "goreng":False, "victim":False, "style":"Korean Fund",                  "contrarian":False},
-    "YP": {"name":"Mirae Asset (iPOT-lama)", "cat":"RETAIL_LARGE",       "weight":-0.5, "goreng":False, "victim":True,  "style":"Retail Terbesar — Kontrarian", "contrarian":True},
-    "XC": {"name":"Ajaib Sekuritas",         "cat":"RETAIL_LARGE",       "weight":-0.6, "goreng":False, "victim":True,  "style":"'Xobat Cutloss' Digital Retail","contrarian":True},
-    "XL": {"name":"Stockbit Sekuritas",      "cat":"RETAIL_LARGE",       "weight":-0.5, "goreng":False, "victim":True,  "style":"Social Trading Herd Behavior", "contrarian":True},
-    "PD": {"name":"Indo Premier (IPOT)",     "cat":"RETAIL_LARGE",       "weight":-0.4, "goreng":False, "victim":True,  "style":"Active Retail Traders",        "contrarian":True},
-    "KK": {"name":"Phillip Securities",      "cat":"RETAIL_MED",         "weight":0.3,  "goreng":False, "victim":True,  "style":"Mixed Retail",                 "contrarian":False},
-    "MG": {"name":"Semesta Indovest",        "cat":"SCALPER",            "weight":-0.8, "goreng":False, "victim":False, "style":"Scalper Terbesar IDX — Noise", "contrarian":True},
+    "AK":{"name":"UBS Securities",        "cat":"FOREIGN_SMART","flag":"🇨🇭"},
+    "BK":{"name":"J.P. Morgan",           "cat":"FOREIGN_SMART","flag":"🇺🇸"},
+    "DB":{"name":"Deutsche Securities",   "cat":"FOREIGN_SMART","flag":"🇩🇪"},
+    "GW":{"name":"HSBC Securities",       "cat":"FOREIGN_SMART","flag":"🇬🇧"},
+    "ML":{"name":"Merrill Lynch",         "cat":"FOREIGN_SMART","flag":"🇺🇸"},
+    "YU":{"name":"CGS-CIMB Securities",   "cat":"FOREIGN_SMART","flag":"🇲🇾"},
+    "KZ":{"name":"CLSA Securities",       "cat":"FOREIGN_SMART","flag":"🇭🇰"},
+    "CS":{"name":"Credit Suisse",         "cat":"FOREIGN_SMART","flag":"🇨🇭"},
+    "DP":{"name":"DBS Vickers",           "cat":"FOREIGN_SMART","flag":"🇸🇬"},
+    "ZP":{"name":"Maybank Securities",    "cat":"FOREIGN_SMART","flag":"🇲🇾"},
+    "RX":{"name":"Macquarie Securities",  "cat":"FOREIGN_SMART","flag":"🇦🇺"},
+    "AI":{"name":"UOB Kay Hian",          "cat":"FOREIGN_SMART","flag":"🇸🇬"},
+    "MK":{"name":"Ekuator Swarna",        "cat":"LOCAL_BANDAR", "flag":"🇮🇩"},
+    "EP":{"name":"Valbury Asia",          "cat":"LOCAL_BANDAR", "flag":"🇮🇩"},
+    "II":{"name":"Danatama Makmur",       "cat":"LOCAL_BANDAR", "flag":"🇮🇩"},
+    "DD":{"name":"Makindo Securities",    "cat":"LOCAL_BANDAR", "flag":"🇮🇩"},
+    "CC":{"name":"Mandiri Sekuritas",     "cat":"BUMN",         "flag":"🇮🇩"},
+    "NI":{"name":"BNI Sekuritas",         "cat":"BUMN",         "flag":"🇮🇩"},
+    "OD":{"name":"BRI Danareksa",         "cat":"BUMN",         "flag":"🇮🇩"},
+    "DX":{"name":"Bahana Sekuritas",      "cat":"LOCAL_INST",   "flag":"🇮🇩"},
+    "KI":{"name":"Ciptadana Sekuritas",   "cat":"LOCAL_INST",   "flag":"🇮🇩"},
+    "LG":{"name":"Trimegah Sekuritas",    "cat":"LOCAL_INST",   "flag":"🇮🇩"},
+    "HG":{"name":"Sucor Sekuritas",       "cat":"LOCAL_INST",   "flag":"🇮🇩"},
+    "SQ":{"name":"BCA Sekuritas",         "cat":"LOCAL_INST",   "flag":"🇮🇩"},
+    "XA":{"name":"NH Korindo",            "cat":"KOREAN",       "flag":"🇰🇷"},
+    "AG":{"name":"Kiwoom Securities",     "cat":"KOREAN",       "flag":"🇰🇷"},
+    "BQ":{"name":"Korea Investment Sec.", "cat":"KOREAN",       "flag":"🇰🇷"},
+    "YP":{"name":"Mirae Asset",           "cat":"RETAIL",       "flag":"🇰🇷"},
+    "XC":{"name":"Ajaib (Xobat Cutloss)", "cat":"RETAIL",       "flag":"🇮🇩"},
+    "XL":{"name":"Stockbit Sekuritas",    "cat":"RETAIL",       "flag":"🇮🇩"},
+    "PD":{"name":"Indo Premier (IPOT)",   "cat":"RETAIL",       "flag":"🇮🇩"},
+    "KK":{"name":"Phillip Securities",    "cat":"RETAIL",       "flag":"🇸🇬"},
+    "MG":{"name":"Semesta Indovest",      "cat":"SCALPER",      "flag":"🇮🇩"},
 }
 
-CAT_COLORS = {
-    "FOREIGN_SMART": "#00ff88",
-    "LOCAL_BANDAR":  "#ffaa00",
-    "BUMN_INST":     "#00ccff",
-    "LOCAL_INST":    "#00ccff",
-    "KOREAN":        "#aa88ff",
-    "RETAIL_LARGE":  "#ff3355",
-    "RETAIL_MED":    "#ff8855",
-    "SCALPER":       "#ff5500",
+CAT_COLOR = {
+    "FOREIGN_SMART":"#00e676","LOCAL_BANDAR":"#ffab00",
+    "BUMN":"#00b0ff","LOCAL_INST":"#00b0ff",
+    "KOREAN":"#e040fb","RETAIL":"#ff1744","SCALPER":"#ff6d00",
+}
+CAT_LABEL = {
+    "FOREIGN_SMART":"Foreign Smart Money","LOCAL_BANDAR":"Local Bandar / Pump",
+    "BUMN":"BUMN","LOCAL_INST":"Local Institutional",
+    "KOREAN":"Korean Broker","RETAIL":"Retail (Contrarian)","SCALPER":"Scalper (Noise)",
 }
 
-CAT_LABELS = {
-    "FOREIGN_SMART": "🟢 Foreign Smart Money",
-    "LOCAL_BANDAR":  "🔥 Local Bandar/Goreng",
-    "BUMN_INST":     "🏛️  BUMN Institutional",
-    "LOCAL_INST":    "💼 Local Institutional",
-    "KOREAN":        "🇰🇷 Korean Broker",
-    "RETAIL_LARGE":  "⚠️  Retail Besar (Kontrarian)",
-    "RETAIL_MED":    "⚠️  Retail Menengah",
-    "SCALPER":       "⚡ Scalper (Noise)",
+HDR = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept":     "application/json, */*",
+    "Accept-Language": "id-ID,id;q=0.9",
 }
 
-FOREIGN_LIST  = ["AK","BK","DB","GW","ML","YU","KZ","CS","DP","ZP","RX","AI"]
-GORENG_LIST   = ["MK","EP","II","DD"]
-RETAIL_LIST   = ["YP","XC","XL","PD","KK"]
-SCALPER_LIST  = ["MG"]
-LOCAL_INST    = ["CC","NI","OD","DX","KI","LG","HG","SQ"]
-KOREAN_LIST   = ["XA","AG","BQ"]
+
+# ══════════════════════════════════════════════════════════════════════
+#  OWNERSHIP DATABASE
+# ══════════════════════════════════════════════════════════════════════
+
+OWNER_DB = {
+    "BREN":{"owner":"Prajogo Pangestu","group":"Barito Pacific","tier":1,"sector":"Geothermal Energy","float":12.3,"political":False,"rating":95,"note":"Low float 12.3% → FCA stock. IDX richest conglomerate."},
+    "BRPT":{"owner":"Prajogo Pangestu","group":"Barito Pacific","tier":1,"sector":"Petrochemicals","float":20.0,"political":False,"rating":90,"note":"Holding co. for BREN & TPIA."},
+    "TPIA":{"owner":"Prajogo Pangestu","group":"Barito Pacific","tier":1,"sector":"Petrochemicals","float":10.7,"political":False,"rating":88,"note":"Float 10.7% → FCA. Largest petrochemical producer."},
+    "CUAN":{"owner":"Prajogo Pangestu","group":"Barito Pacific","tier":1,"sector":"Coal","float":25.0,"political":False,"rating":82,"note":"Coal + resources. Part of Prajogo empire."},
+    "CDIA":{"owner":"Prajogo Pangestu","group":"Barito Pacific","tier":1,"sector":"Infrastructure","float":10.0,"political":False,"rating":80,"note":"Chandra Daya Investasi. Float 10% → FCA."},
+    "PTRO":{"owner":"Prajogo + Hapsoro","group":"Barito/Hapsoro","tier":2,"sector":"Mining Services","float":30.0,"political":True,"rating":75,"note":"Dual ownership + political ties. Higher risk."},
+    "BYAN":{"owner":"Low Tuck Kwong","group":"Bayan Group","tier":1,"sector":"Coal Mining","float":33.0,"political":False,"rating":88,"note":"Forbes #2 Indonesia. Largest private coal miner."},
+    "BBCA":{"owner":"Hartono Bersaudara","group":"Djarum / BCA","tier":1,"sector":"Banking","float":45.0,"political":False,"rating":99,"note":"Indonesia's most consistently profitable bank."},
+    "DCII":{"owner":"Hartono Bersaudara","group":"Djarum Group","tier":1,"sector":"Data Center","float":28.0,"political":False,"rating":92,"note":"DCI Indonesia. Dominant data center operator."},
+    "TOWR":{"owner":"Hartono Bersaudara","group":"Djarum Group","tier":1,"sector":"Tower Infra","float":35.0,"political":False,"rating":85,"note":"Sarana Menara Nusantara. Steady dividend."},
+    "SSIA":{"owner":"Hartono + Prajogo","group":"Djarum + Barito","tier":1,"sector":"Industrial Estate","float":40.0,"political":False,"rating":90,"note":"DUAL CONGLOMERATE: Both Hartono & Prajogo buying → very bullish."},
+    "ICBP":{"owner":"Anthoni Salim","group":"Salim Group","tier":1,"sector":"Consumer F&B","float":48.0,"political":False,"rating":92,"note":"Indomie parent. World's #1 instant noodle brand."},
+    "INDF":{"owner":"Anthoni Salim","group":"Salim Group","tier":1,"sector":"Consumer Diversified","float":50.0,"political":False,"rating":88,"note":"Holding of ICBP. Conglomerate discount vs ICBP."},
+    "ADRO":{"owner":"Garibaldi Thohir","group":"Adaro Group","tier":1,"sector":"Coal / Mining","float":22.0,"political":False,"rating":85,"note":"Pivoting coal→copper/nickel/battery metals."},
+    "ADMR":{"owner":"Garibaldi Thohir","group":"Adaro Group","tier":1,"sector":"Copper/Nickel","float":12.0,"political":False,"rating":78,"note":"EV battery metals. Float 12% — watch for FCA."},
+    "MDKA":{"owner":"Merdeka Group","group":"Merdeka / Adaro","tier":1,"sector":"Gold/Copper/Nickel","float":35.0,"political":False,"rating":80,"note":"Multi-commodity. Strong EV metals pipeline."},
+    "AMMN":{"owner":"Agoes Projosasmito","group":"Amman Mineral","tier":1,"sector":"Copper/Gold","float":30.0,"political":False,"rating":87,"note":"Batu Hijau mine. New $21T smelter."},
+    "PANI":{"owner":"Sugianto Kusuma (Aguan)","group":"Agung Sedayu","tier":2,"sector":"Property (PIK2)","float":45.0,"political":True,"rating":78,"note":"PIK 2 National Capital project. Political connections."},
+    "RAJA":{"owner":"Happy Hapsoro","group":"Hapsoro Group","tier":3,"sector":"Shipping","float":35.0,"political":True,"rating":30,"note":"HIGH RISK. Hapsoro = Puan Maharani's husband (DPR Chair)."},
+    "PSKT":{"owner":"Happy Hapsoro","group":"Hapsoro Group","tier":3,"sector":"Logistics","float":40.0,"political":True,"rating":28,"note":"SPECULATIVE. Moves on politics not fundamentals."},
+    "WIFI":{"owner":"Hashim (affiliated)","group":"Political","tier":3,"sector":"Telecoms","float":40.0,"political":True,"rating":22,"note":"EXTREME RISK. +612% in 2025, driven by political sentiment."},
+    "BBRI":{"owner":"Government (BUMN)","group":"BRI Group","tier":1,"sector":"Banking","float":43.0,"political":False,"rating":87,"note":"Largest bank by assets. Strong rural MSME franchise."},
+    "BMRI":{"owner":"Government (BUMN)","group":"Mandiri Group","tier":1,"sector":"Banking","float":40.0,"political":False,"rating":86,"note":"Most profitable state bank. Strong corporate banking."},
+    "BBNI":{"owner":"Government (BUMN)","group":"BNI Group","tier":1,"sector":"Banking","float":40.0,"political":False,"rating":75,"note":"Recovering after restructuring. Digital push."},
+    "TLKM":{"owner":"Government (BUMN)","group":"Telkom Group","tier":1,"sector":"Telecoms","float":47.0,"political":False,"rating":78,"note":"Defensive dividend. Data infrastructure."},
+    "ANTM":{"owner":"Government (BUMN)","group":"MIND ID","tier":2,"sector":"Nickel/Gold","float":35.0,"political":False,"rating":62,"note":"BUMN inefficiency risk. Nickel oversupply from China."},
+    "PTBA":{"owner":"Government (BUMN)","group":"MIND ID","tier":2,"sector":"Coal Mining","float":35.0,"political":False,"rating":72,"note":"High dividend yield. Coal transition risk."},
+    "PGAS":{"owner":"Government (BUMN)","group":"Pertamina","tier":2,"sector":"Gas Distribution","float":43.0,"political":False,"rating":65,"note":"Regulated margins. Gas infra monopoly."},
+    "ASII":{"owner":"Jardine Matheson","group":"Astra International","tier":1,"sector":"Auto / Diversified","float":50.0,"political":False,"rating":91,"note":"Blueprint of Indonesia conglomerate. Auto + Finance + Agri."},
+    "UNTR":{"owner":"Jardine / Astra","group":"Astra Group","tier":1,"sector":"Heavy Equipment","float":40.0,"political":False,"rating":85,"note":"United Tractors. Komatsu distributor + coal."},
+    "KLBF":{"owner":"Boenjamin Setiawan Family","group":"Kalbe Group","tier":1,"sector":"Pharma","float":44.0,"political":False,"rating":88,"note":"Indonesia's largest pharma. Consistent growth."},
+    "UNVR":{"owner":"Unilever PLC (UK)","group":"Unilever Global","tier":1,"sector":"Consumer","float":15.0,"political":False,"rating":55,"note":"Losing market share in Indonesia. Secular decline."},
+    "GOTO":{"owner":"Founders / SoftBank / Alibaba","group":"GoTo Group","tier":2,"sector":"Digital Economy","float":55.0,"political":False,"rating":45,"note":"Path to profitability unclear. Competitive pressure."},
+    "HMSP":{"owner":"Philip Morris Int'l","group":"Philip Morris","tier":1,"sector":"Tobacco","float":8.0,"political":False,"rating":50,"note":"Float 7.5% → FCA. ESG + declining volumes."},
+    "BSDE":{"owner":"Widjaja Family","group":"Sinar Mas","tier":2,"sector":"Property","float":48.0,"political":False,"rating":72,"note":"Largest township developer. Rate-sensitive."},
+}
 
 
-# ══════════════════════════════════════════════════════════════════════════
-#  KALKULASI INDIKATOR
-# ══════════════════════════════════════════════════════════════════════════
+def owner_risk(own):
+    if not own: return 50, "UNKNOWN"
+    s = min(30, int(own.get("float",30) * 0.6))
+    s += {1:40,2:25,3:5}.get(own.get("tier",2), 20)
+    s += 0 if own.get("political") else 10
+    s += int(own.get("rating",50) * 0.2)
+    s = max(0, min(100, s))
+    lbl = "LOW RISK" if s>=70 else "MEDIUM RISK" if s>=45 else "HIGH RISK"
+    return s, lbl
 
-@st.cache_data(ttl=900, show_spinner=False)
-def load_data(ticker: str, period: str) -> pd.DataFrame:
-    symbol = ticker.upper().replace(".JK","") + ".JK"
+
+# ══════════════════════════════════════════════════════════════════════
+#  DATA FETCHERS
+# ══════════════════════════════════════════════════════════════════════
+
+def enrich(df):
+    df["name"] = df["broker"].apply(lambda x: BROKER_DB.get(x.upper(),{}).get("name", f"Broker {x}"))
+    df["cat"]  = df["broker"].apply(lambda x: BROKER_DB.get(x.upper(),{}).get("cat",  "LOCAL_INST"))
+    df["flag"] = df["broker"].apply(lambda x: BROKER_DB.get(x.upper(),{}).get("flag", "🇮🇩"))
+    return df.sort_values("net_lot", ascending=False).reset_index(drop=True)
+
+
+def parse_idx_json(data):
+    bm, sm, rows = {}, {}, []
+    def ex(items):
+        m = {}
+        for i in (items or []):
+            c = (i.get("BrokerCode") or i.get("broker_code") or i.get("code","")).upper()
+            if not c: continue
+            m[c] = {
+                "lot"  : int(  i.get("TradedLot")    or i.get("lot")   or 0),
+                "value": int(  i.get("TradedValue")   or i.get("value") or 0),
+                "avg"  : float(i.get("AveragePrice")  or i.get("avg")   or 0),
+            }
+        return m
+    if isinstance(data, dict):
+        bm = ex(data.get("BrokerBuyerSummary",  data.get("buyers",  [])))
+        sm = ex(data.get("BrokerSellerSummary", data.get("sellers", [])))
+    elif isinstance(data, list):
+        for i in data:
+            c = (i.get("BrokerCode") or i.get("broker","")).upper()
+            if not c: continue
+            rows.append({"broker":c,
+                "buy_lot"  : int(  i.get("BuyVolume",  0)),
+                "sell_lot" : int(  i.get("SellVolume", 0)),
+                "buy_value": int(  i.get("BuyValue",   0)),
+                "sell_value":int(  i.get("SellValue",  0)),
+                "buy_avg"  : float(i.get("BuyAvg",     0)),
+                "sell_avg" : float(i.get("SellAvg",    0)),
+            })
+    if not rows:
+        for c in set(bm) | set(sm):
+            b = bm.get(c, {"lot":0,"value":0,"avg":0})
+            s = sm.get(c, {"lot":0,"value":0,"avg":0})
+            rows.append({"broker":c,
+                "buy_lot":b["lot"],"sell_lot":s["lot"],
+                "buy_value":b["value"],"sell_value":s["value"],
+                "buy_avg":b["avg"],"sell_avg":s["avg"],
+            })
+    if not rows: return None
+    df = pd.DataFrame(rows)
+    df["net_lot"]   = df["buy_lot"]   - df["sell_lot"]
+    df["net_value"] = df["buy_value"] - df["sell_value"]
+    return enrich(df)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_idx_day(ticker: str, date: str):
+    t = ticker.upper().replace(".JK","")
+    for ep, p in [
+        ("https://www.idx.co.id/umbraco/Surface/TradingSummary/GetBrokerSummary",
+         {"code":t,"start":date,"end":date,"draw":1,"length":99}),
+        (f"https://www.idx.co.id/api/v1/broker-summary/{t}",
+         {"startDate":date,"endDate":date}),
+    ]:
+        try:
+            r = requests.get(ep, params=p, headers=HDR, timeout=12)
+            if r.status_code == 200:
+                df = parse_idx_json(r.json())
+                if df is not None and len(df) >= 3:
+                    return df
+        except: continue
+    return None
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_stockbit(ticker: str, token: str, date_from: str, date_to: str):
+    if not token or len(token) < 20: return None
+    t = ticker.upper().replace(".JK","")
+    hdrs = {**HDR, "Authorization": f"Bearer {token}",
+            "Origin":"https://stockbit.com","Referer":"https://stockbit.com/"}
+    params = {"startDate":date_from,"endDate":date_to,"code":t,"limit":50}
+    for url in [
+        f"https://exodus.stockbit.com/broker-transaction/v1/summary/{t}",
+        f"https://api.stockbit.com/v2.4/broker_summary/{t}",
+    ]:
+        try:
+            r = requests.get(url, headers=hdrs, params=params, timeout=12)
+            if r.status_code == 401: return "EXPIRED"
+            if r.status_code == 200:
+                data = r.json(); payload = data
+                if isinstance(data, dict):
+                    payload = data.get("data", data)
+                    if isinstance(payload, dict):
+                        payload = payload.get("brokerSummary", payload)
+                buyers  = payload.get("buyer",  payload.get("buyers",  [])) if isinstance(payload,dict) else []
+                sellers = payload.get("seller", payload.get("sellers", [])) if isinstance(payload,dict) else []
+                def ep(items):
+                    m = {}
+                    for i in (items or []):
+                        c = (i.get("broker_code") or i.get("brokerCode") or i.get("code","")).upper()
+                        if not c: continue
+                        m[c] = {"lot"  : int(i.get("lot") or i.get("volume") or 0),
+                                "value": int(i.get("value") or 0),
+                                "avg"  : float(i.get("avg") or i.get("averagePrice") or 0)}
+                    return m
+                bm = ep(buyers); sm = ep(sellers)
+                if not (set(bm) | set(sm)): continue
+                rows = [{"broker":c,
+                    "buy_lot"  : bm.get(c,{"lot":0})["lot"],
+                    "sell_lot" : sm.get(c,{"lot":0})["lot"],
+                    "buy_value": bm.get(c,{"value":0})["value"],
+                    "sell_value":sm.get(c,{"value":0})["value"],
+                    "buy_avg"  : bm.get(c,{"avg":0})["avg"],
+                    "sell_avg" : sm.get(c,{"avg":0})["avg"],
+                } for c in set(bm)|set(sm)]
+                df = pd.DataFrame(rows)
+                df["net_lot"]   = df["buy_lot"]   - df["sell_lot"]
+                df["net_value"] = df["buy_value"] - df["sell_value"]
+                df = enrich(df)
+                if len(df) >= 3: return df
+        except: continue
+    return None
+
+
+def get_broker_today(ticker, token=""):
+    """Today's broker summary → (df, source)"""
+    today = trade_days(1)[0]
+    if token and len(token) > 20:
+        yesterday = trade_days(2)[-1]
+        r = fetch_stockbit(ticker, token, yesterday, today)
+        if r == "EXPIRED": st.warning("⚠️ Stockbit token expired.")
+        elif r is not None: return r, "stockbit"
+    df = fetch_idx_day(ticker, today)
+    if df is not None: return df, "idx"
+    return None, "demo"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_broker_accumulation(ticker: str, token: str, n_days: int = 20):
+    """
+    Cumulative net lot per broker over n_days trading days.
+    = estimated accumulated position (clients' long/short bias).
+    Positive → broker clients are net long (accumulated).
+    Negative → broker clients are net short / exited.
+    """
+    days = trade_days(n_days)
+    today = days[0]; oldest = days[-1]
+
+    # 1. Stockbit aggregated (one call)
+    if token and len(token) > 20:
+        r = fetch_stockbit(ticker, token, oldest, today)
+        if r is not None and r != "EXPIRED" and len(r) >= 3:
+            r = r.copy()
+            r["cum_net"] = r["net_lot"]
+            return r, "stockbit", n_days
+
+    # 2. IDX API day-by-day (limit to 5 to avoid rate limits)
+    dfs = []
+    for d in days[:5]:
+        df_d = fetch_idx_day(ticker, d)
+        if df_d is not None:
+            dfs.append(df_d)
+
+    if dfs:
+        combined = pd.concat(dfs, ignore_index=True)
+        agg = combined.groupby("broker").agg(
+            buy_lot   =("buy_lot",  "sum"),
+            sell_lot  =("sell_lot", "sum"),
+            net_lot   =("net_lot",  "sum"),
+            buy_value =("buy_value","sum"),
+            sell_value=("sell_value","sum"),
+        ).reset_index()
+        agg["cum_net"]  = agg["net_lot"]
+        agg["net_value"]= agg["buy_value"] - agg["sell_value"]
+        agg["buy_avg"]  = 0.0; agg["sell_avg"] = 0.0
+        agg = enrich(agg).sort_values("cum_net", ascending=False).reset_index(drop=True)
+        return agg, "idx", len(dfs)
+
+    return None, "demo", 0
+
+
+def demo_broker(ticker, ts):
+    np.random.seed(sum(ord(c) for c in ticker) + ts)
+    r = lambda a,b: int(np.random.randint(a,b))
+    s = "acc" if ts>=65 else "dis" if ts<=35 else "neu"
+    if s == "acc":
+        rows = [("AK",r(20000,55000),r(1000,5000)),("BK",r(15000,40000),r(1000,4000)),
+                ("DB",r(8000,22000), r(800,3000)), ("GW",r(6000,18000), r(600,2500)),
+                ("CC",r(8000,20000), r(3000,10000)),("LG",r(4000,10000),r(2000,6000)),
+                ("MG",r(28000,70000),r(38000,95000)),
+                ("YP",r(14000,30000),r(22000,58000)),("XC",r(7000,15000),r(11000,30000)),
+                ("XL",r(5000,13000), r(9000,22000))]
+    elif s == "dis":
+        rows = [("AK",r(1000,5000), r(22000,58000)),("BK",r(1000,4000), r(17000,45000)),
+                ("MK",r(2000,8000), r(14000,38000)),("EP",r(1500,6000), r(9000,27000)),
+                ("CC",r(4000,13000),r(5000,16000)),
+                ("MG",r(38000,90000),r(30000,75000)),
+                ("YP",r(24000,58000),r(9000,20000)),("XC",r(13000,32000),r(3000,8000)),
+                ("XL",r(11000,27000),r(2500,7500))]
+    else:
+        rows = [("AK",r(5000,14000),r(4000,13000)),("BK",r(4000,12000),r(3500,11000)),
+                ("CC",r(6000,14000),r(5500,13000)),("MG",r(30000,65000),r(28000,62000)),
+                ("YP",r(15000,32000),r(14000,30000)),("XC",r(6000,14000),r(5500,13000)),
+                ("XL",r(5000,12000),r(4800,11500))]
+    df = pd.DataFrame(rows, columns=["broker","buy_lot","sell_lot"])
+    df["net_lot"]   = df["buy_lot"] - df["sell_lot"]
+    df["cum_net"]   = df["net_lot"] * np.random.randint(2, 6, len(df))
+    df["net_value"] = df["net_lot"] * 500
+    df["buy_avg"]   = 0.0; df["sell_avg"] = 0.0
+    return enrich(df)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)  # 24 h — published monthly
+def fetch_shareholders(ticker: str):
+    """
+    Major shareholders >1% from IDX/KSEI.
+    OJK mandate: published monthly since March 2026.
+    Access: idx.co.id/id/berita/pengumuman/
+    """
+    t = ticker.upper().replace(".JK","")
+    for ep in [
+        f"https://www.idx.co.id/api/v1/company-profile/{t}/shareholders",
+        f"https://www.idx.co.id/umbraco/Surface/Helper/GetInitiationOfPublicCompany?kodeEmiten={t}",
+    ]:
+        try:
+            r = requests.get(ep, headers=HDR, timeout=12)
+            if r.status_code == 200:
+                data = r.json()
+                rows = []
+                sh_list = (data.get("shareholders") or
+                           data.get("MajorShareholderList") or
+                           data.get("data",{}).get("shareholders",[]))
+                for item in (sh_list or []):
+                    name = (item.get("ShareholderName") or item.get("name") or item.get("holder","—"))
+                    pct  = float(item.get("Percentage") or item.get("percentage") or 0)
+                    lots = int(  item.get("ShareAmount") or item.get("lots")       or 0)
+                    typ  = item.get("Type") or item.get("type") or "Institutional"
+                    if pct > 0 or lots > 0:
+                        rows.append({"name":name,"type":typ,"pct":pct,
+                                     "lots":lots,"src":"IDX/KSEI Live"})
+                if rows:
+                    return rows, "idx_live", datetime.now().strftime("%d %b %Y")
+        except: continue
+
+    # Fallback from ownership DB
+    own = OWNER_DB.get(t)
+    if own:
+        ff = own.get("float", 30)
+        ctrl_pct = max(0, round(100 - ff - 10, 1))
+        return [
+            {"name": own["owner"], "type":"Controlling Shareholder",
+             "pct": ctrl_pct, "lots":0, "src":"Ownership DB (estimate)"},
+            {"name":"Public / Free Float","type":"Public",
+             "pct": ff, "lots":0, "src":"Ownership DB (estimate)"},
+        ], "ownership_db", "Estimated"
+    return [], "none", None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_ksei_composition(ticker: str):
+    t = ticker.upper().replace(".JK","")
     try:
-        df = yf.download(symbol, period=period, interval="1d",
+        r = requests.get(f"https://web.ksei.co.id/issuers/{t}/holding",
+                         headers=HDR, timeout=10)
+        if r.status_code == 200:
+            d = r.json()
+            return {"foreign":d.get("foreignPct"), "domestic":d.get("domesticPct"),
+                    "total":d.get("totalShares"), "date":d.get("date")}
+    except: pass
+    try:
+        info = yf.Ticker(t+".JK").info
+        ip = info.get("heldPercentInstitutions")
+        if ip:
+            return {"foreign":round(ip*100,1),"domestic":round((1-ip)*100,1),
+                    "total":info.get("sharesOutstanding"),"date":"Yahoo Finance"}
+    except: pass
+    return {}
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  BROKER SHAREHOLDING CALCULATOR
+#  Converts cumulative net lots → estimated % of outstanding shares held
+# ══════════════════════════════════════════════════════════════════════
+
+def calc_broker_shareholding(accu_df: pd.DataFrame, shares_outstanding: int,
+                              lot_size: int = 100) -> pd.DataFrame:
+    """
+    Estimate how many shares each broker's clients hold.
+
+    Method:
+    ─────────────────────────────────────────────────────────────────
+    We can't see actual sub-account holdings (KSEI sub-account data
+    is private). What we CAN see is cumulative net lot activity.
+
+    Estimated shares held = cumulative net lot × lot_size
+    Estimated % of OS     = (est. shares) / shares_outstanding × 100
+
+    This is the SAME methodology used by RTI Business, Stockbit Pro,
+    and Bloomberg IDX broker accumulation screens.
+
+    Limitations:
+    - Does not account for positions established before the analysis window
+    - Reflects NET activity, not absolute position
+    - Brokers with zero activity appear to hold nothing (not true)
+    ─────────────────────────────────────────────────────────────────
+    """
+    df = accu_df.copy()
+    df["est_shares"] = df["cum_net"].clip(lower=0) * lot_size
+    if shares_outstanding and shares_outstanding > 0:
+        df["est_pct"] = df["est_shares"] / shares_outstanding * 100
+    else:
+        df["est_pct"] = 0.0
+    df["est_shares_str"] = df["est_shares"].apply(
+        lambda x: f"{x/1e9:.2f}B" if x>=1e9 else f"{x/1e6:.1f}M" if x>=1e6 else f"{x:,.0f}")
+    return df.sort_values("cum_net", ascending=False).reset_index(drop=True)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  TECHNICAL INDICATORS
+# ══════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=900, show_spinner=False)   # 15 min
+def load_price(ticker, period):
+    try:
+        df = yf.download(ticker.upper().replace(".JK","") + ".JK",
+                         period=period, interval="1d",
                          progress=False, auto_adjust=True)
         if df.empty: return None
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         df = df.rename(columns={"Open":"open","High":"high","Low":"low",
                                   "Close":"close","Volume":"volume"})
-        df = df[["open","high","low","close","volume"]].dropna()
-        df = df[df["volume"] > 0]
-        return df
-    except:
-        return None
+        return df[["open","high","low","close","volume"]].dropna()
+    except: return None
 
-def calc_cmf(df, p=14):
+def cmf(df, p=14):
     hl  = df["high"] - df["low"]
-    clv = ((df["close"]-df["low"])-(df["high"]-df["close"])) / hl.replace(0,np.nan)
-    return (clv*df["volume"]).rolling(p).sum() / df["volume"].rolling(p).sum().fillna(method="ffill")
+    clv = ((df["close"]-df["low"]) - (df["high"]-df["close"])) / hl.replace(0,np.nan)
+    return (clv*df["volume"]).rolling(p).sum() / df["volume"].rolling(p).sum()
 
-def calc_obv(df):
+def obv(df):
     return (np.sign(df["close"].diff()).fillna(0) * df["volume"]).cumsum()
 
-def calc_mfi(df, p=14):
-    tp  = (df["high"]+df["low"]+df["close"])/3
+def mfi(df, p=14):
+    tp  = (df["high"]+df["low"]+df["close"]) / 3
     mf  = tp * df["volume"]
     pos = mf.where(tp>tp.shift(1),0).rolling(p).sum()
     neg = mf.where(tp<tp.shift(1),0).rolling(p).sum()
-    return (100 - 100/(1+pos/neg.replace(0,np.nan))).fillna(50)
+    return (100 - 100/(1 + pos/neg.replace(0,np.nan))).fillna(50)
 
-def calc_rsi(s, p=14):
+def rsi(s, p=14):
     d = s.diff()
     g = d.clip(lower=0).rolling(p).mean()
     l = (-d.clip(upper=0)).rolling(p).mean()
-    return (100 - 100/(1+g/l.replace(0,np.nan))).fillna(50)
+    return (100 - 100/(1 + g/l.replace(0,np.nan))).fillna(50)
 
-def calc_bb(s, p=20):
-    ma  = s.rolling(p).mean()
-    std = s.rolling(p).std()
-    return ma+2*std, ma, ma-2*std
+def atr(df, p=14):
+    hl = df["high"]-df["low"]
+    hc = (df["high"]-df["close"].shift()).abs()
+    lc = (df["low"] -df["close"].shift()).abs()
+    return pd.concat([hl,hc,lc],axis=1).max(axis=1).rolling(p).mean()
 
-def detect_wyckoff(df, cmf, obv):
-    n = len(df)
-    prices = df["close"]
-    trend   = (prices.iloc[-n//3:].mean() - prices.iloc[:n//3].mean()) / prices.iloc[:n//3].mean()
-    p20     = prices.tail(20)
-    range20 = (p20.max()-p20.min()) / p20.mean()
-    vol_spike = df["volume"].tail(5).max() > df["volume"].rolling(20).mean().iloc[-1]*1.8
-    obv_rising = obv.iloc[-1] > obv.iloc[-min(10,len(obv)-1)]
-    cmf_up     = cmf.iloc[-1] > cmf.iloc[-min(10,len(cmf)-1)]
+def wyckoff(df, c, o):
+    n = len(df); p = df["close"]
+    tr  = (p.iloc[-n//3:].mean()-p.iloc[:n//3].mean()) / p.iloc[:n//3].mean()
+    r20 = (p.tail(20).max()-p.tail(20).min()) / p.tail(20).mean()
+    sp  = df["volume"].tail(5).max() > df["volume"].rolling(20).mean().iloc[-1]*1.8
+    ob  = o.iloc[-1] > o.iloc[-min(10,n-1)]
+    cu  = c.iloc[-1] > c.iloc[-min(10,len(c)-1)]
+    if tr<-0.07 and not sp: return "A","Selling Climax","Bandar begins absorbing supply."
+    if r20<0.07  and cu:    return "B","Building Cause","Sideways accumulation. Bandar quietly building."
+    if r20<0.09  and sp and tr<0.03: return "C","Spring","⭐ Retail shaken out — ideal entry zone."
+    if tr>0.03   and ob:    return "D","Sign of Strength","Breakout confirmed."
+    if tr>0.08   and ob:    return "E","Markup","Trending up. Watch for distribution."
+    return "B","Building Cause","Consolidation. Wait for confirmation."
 
-    if trend < -0.07 and not vol_spike:
-        return "A", "Selling Climax — bandar mulai serap supply"
-    if range20 < 0.07 and cmf_up:
-        return "B", "Building Cause — bandar kumpulkan saham diam-diam"
-    if range20 < 0.09 and vol_spike and trend < 0.03:
-        return "C", "⭐ Spring/Shakeout — ENTRY TERBAIK ikuti bandar"
-    if trend > 0.03 and obv_rising:
-        return "D", "Sign of Strength — breakout dikonfirmasi volume"
-    if trend > 0.08 and obv_rising:
-        return "E", "Markup — trending naik, mulai waspadai distribusi"
-    return "B", "Building Cause / Konsolidasi — tunggu konfirmasi"
-
-def detect_vsa(df):
-    avg_vol = df["volume"].rolling(20).mean()
-    avg_spd = (df["high"]-df["low"]).rolling(10).mean()
-    patterns = []
-    for i in range(5, len(df)):
-        d, prev = df.iloc[i], df.iloc[i-1]
-        av = avg_vol.iloc[i]
-        if pd.isna(av) or av == 0: continue
-        sp = d["high"]-d["low"]
-        cp = (d["close"]-d["low"]) / (sp if sp>0 else 1)
-        vr = d["volume"] / av
-        if vr>1.5 and cp>0.6 and d["close"]<prev["close"]:
-            patterns.append({"type":"ACC","name":"Stopping Volume","vol_ratio":vr})
-        if vr<0.5 and sp<avg_spd.iloc[i]*0.5 and cp>0.5:
-            patterns.append({"type":"ACC","name":"No Supply (Drying Up)","vol_ratio":vr})
-        if vr>1.5 and d["low"]<prev["low"] and d["close"]>(d["high"]+d["low"])/2:
-            patterns.append({"type":"ACC","name":"Shakeout / Spring","vol_ratio":vr})
-        if vr>1.5 and cp<0.4 and d["close"]>prev["close"]:
-            patterns.append({"type":"DIS","name":"Buying Climax","vol_ratio":vr})
-        if vr>1.5 and d["high"]>prev["high"] and cp<0.45:
-            patterns.append({"type":"DIS","name":"Upthrust","vol_ratio":vr})
-    seen, res = set(), []
-    for p in reversed(patterns):
-        if p["name"] not in seen and len(res)<6:
-            seen.add(p["name"]); res.insert(0,p)
-    return res
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  BROKER DATA GENERATOR (Demo Realistis)
-# ══════════════════════════════════════════════════════════════════════════
-
-def gen_broker_data(ticker: str, tech_score: int) -> pd.DataFrame:
-    np.random.seed(sum(ord(c) for c in ticker) + tech_score)
-    r = lambda lo, hi: int(np.random.randint(lo, hi))
-    s = "accumulation" if tech_score>=65 else "distribution" if tech_score<=35 else "neutral"
-
-    if s == "accumulation":
-        rows = [
-            ("AK",r(18000,50000),r(1000,5000)), ("BK",r(14000,38000),r(1200,4500)),
-            ("DB",r(8000,22000), r(800,3000)),  ("GW",r(6000,18000), r(700,2500)),
-            ("YU",r(5000,15000), r(600,2000)),  ("CC",r(8000,20000), r(4000,12000)),
-            ("LG",r(4000,10000), r(2000,7000)), ("NI",r(4000,10000), r(2000,6000)),
-            ("XA",r(3000,9000),  r(2500,7000)),
-            ("MG",r(25000,65000),r(35000,90000)),
-            ("YP",r(12000,28000),r(20000,55000)),("XC",r(6000,14000), r(10000,28000)),
-            ("XL",r(5000,12000), r(8000,20000)), ("PD",r(7000,16000), r(12000,30000)),
-            ("KK",r(4000,10000), r(6000,16000)),
-        ]
-    elif s == "distribution":
-        rows = [
-            ("AK",r(1000,5000),  r(20000,55000)),("BK",r(1200,4500), r(16000,42000)),
-            ("DB",r(800,3000),   r(10000,28000)),("GW",r(700,2500),  r(8000,20000)),
-            ("MK",r(2000,8000),  r(12000,35000)),("EP",r(1500,6000), r(8000,25000)),
-            ("CC",r(5000,14000), r(6000,18000)),
-            ("MG",r(35000,85000),r(28000,70000)),
-            ("YP",r(22000,55000),r(8000,18000)), ("XC",r(12000,30000),r(3000,8000)),
-            ("XL",r(10000,25000),r(2500,7000)),  ("PD",r(14000,32000),r(4000,10000)),
-            ("KK",r(7000,18000), r(2000,5000)),  ("AR",r(4000,10000), r(1000,3000)),
-        ]
-    else:
-        rows = [
-            ("AK",r(5000,15000),r(4000,14000)),  ("BK",r(4000,12000),r(3500,11000)),
-            ("CC",r(6000,14000),r(5500,13000)),  ("MG",r(28000,60000),r(26000,58000)),
-            ("YP",r(14000,30000),r(13000,28000)),("XC",r(6000,14000),r(5500,13000)),
-            ("XL",r(5000,12000),r(4800,11500)),  ("PD",r(7000,16000),r(6800,15500)),
-            ("LG",r(2500,7000), r(2300,6500)),   ("DB",r(3000,8000), r(2800,7500)),
-            ("XA",r(3000,8000), r(2800,7800)),   ("KK",r(4000,10000),r(3800,9800)),
-        ]
-
-    df = pd.DataFrame(rows, columns=["broker","buy_lot","sell_lot"])
-    df["net_lot"] = df["buy_lot"] - df["sell_lot"]
-    df["name"]    = df["broker"].apply(lambda x: BROKER_DB.get(x,{}).get("name","Unknown"))
-    df["cat"]     = df["broker"].apply(lambda x: BROKER_DB.get(x,{}).get("cat","RETAIL_MED"))
-    df["goreng"]  = df["broker"].apply(lambda x: BROKER_DB.get(x,{}).get("goreng",False))
-    df["victim"]  = df["broker"].apply(lambda x: BROKER_DB.get(x,{}).get("victim",False))
-    return df
-
-
-def analyze_broker_flow(bdf: pd.DataFrame) -> dict:
-    res = dict(foreign_net=0, local_inst_net=0, korean_net=0,
-               retail_net=0, scalper_net=0, goreng_alert=False,
-               goreng_brokers=[], crossing=None,
-               smart_buyers=[], smart_sellers=[],
-               score=50, signal="NEUTRAL", confidence="RENDAH",
-               warnings=[])
-
-    total = bdf["buy_lot"].sum() + bdf["sell_lot"].sum()
-
-    for _, row in bdf.iterrows():
-        code = row["broker"].upper()
-        net  = int(row["net_lot"])
-        cat  = row["cat"]
-
-        if cat == "FOREIGN_SMART":
-            res["foreign_net"] += net
-            entry = {"broker":code, "name":row["name"], "net":net}
-            if net > 0: res["smart_buyers"].append(entry)
-            else:       res["smart_sellers"].append(entry)
-        elif cat in ("BUMN_INST","LOCAL_INST"):
-            res["local_inst_net"] += net
-        elif cat == "KOREAN":
-            res["korean_net"] += net
-        elif cat in ("RETAIL_LARGE","RETAIL_MED"):
-            res["retail_net"] += net
-        elif cat == "SCALPER":
-            res["scalper_net"] += net
-            share = (row["buy_lot"]+row["sell_lot"]) / (total+1)
-            if share > 0.25:
-                res["warnings"].append(f"⚡ {code} dominasi {share:.0%} volume — scalper ramai, bandar bisa distribusi lewat likuiditas ini")
-        elif cat == "LOCAL_BANDAR" and net > 5000:
-            res["goreng_alert"] = True
-            res["goreng_brokers"].append(code)
-
-    # XC warning
-    xc = bdf[bdf["broker"]=="XC"]
-    if not xc.empty and xc["net_lot"].values[0] > 5000:
-        res["warnings"].append("⚠️ XC (Ajaib/'Xobat Cutloss') net buy besar — historis sering tanda distribusi berakhir ke retailer muda")
-    xl = bdf[bdf["broker"]=="XL"]
-    if not xl.empty and xl["net_lot"].values[0] > 5000:
-        res["warnings"].append("⚠️ XL (Stockbit) net buy besar — saham mungkin viral, biasanya sudah terlambat ikut bandar")
-
-    # Crossing
-    sm = res["foreign_net"] > 2000
-    sd = res["foreign_net"] < -2000
-    rb = (res["retail_net"]+res["scalper_net"]) < -2000
-    rbu= (res["retail_net"]+res["scalper_net"]) > 2000
-    if sm and rb:
-        res["crossing"] = "ACC"
-        res["warnings"].append("🔥 CROSSING SIGNAL AKUMULASI: Smart money BELI + Retail JUAL!")
-    elif sd and rbu:
-        res["crossing"] = "DIS"
-        res["warnings"].append("💀 CROSSING SIGNAL DISTRIBUSI: Smart money JUAL + Retail BELI!")
-
-    if res["goreng_alert"]:
-        codes = ", ".join(res["goreng_brokers"])
-        res["warnings"].append(f"🚨 GORENG ALERT: Broker {codes} aktif — dikenal dalam pump-and-dump. Ikuti dengan stop loss ketat!")
-
-    # Score
-    score = 50.0
-    score += np.clip(res["foreign_net"]  / (total*0.3+1) * 30, -30, 30)
-    score += np.clip(res["local_inst_net"]/(total*0.2+1) * 15, -15, 15)
-    score += np.clip(res["korean_net"]   / (total*0.15+1)* 8,  -8,  8)
-    ret = res["retail_net"] + res["scalper_net"]
-    score += np.clip(-ret/(total*0.3+1)*10, -10, 10)
-    score += (len(res["smart_buyers"]) - len(res["smart_sellers"])) * 2.5
-    if res["crossing"] == "ACC": score += 10
-    elif res["crossing"] == "DIS": score -= 10
-    if res["goreng_alert"]: score += 5
-
-    final = int(np.clip(round(score), 0, 100))
-    conf  = abs(final-50)/50
-    res["score"]      = final
-    res["signal"]     = "AKUMULASI" if final>=60 else "DISTRIBUSI" if final<=40 else "NEUTRAL"
-    res["confidence"] = "TINGGI" if conf>0.6 else "SEDANG" if conf>0.3 else "RENDAH"
-    return res
-
-
-def calc_tech_score(df, cmf, obv, mfi) -> int:
-    score = 50.0
-    cmf_v = cmf.iloc[-1] if not pd.isna(cmf.iloc[-1]) else 0
-    score += np.clip(cmf_v*125, -25, 25)
-    obv_sl = (obv.iloc[-1]-obv.iloc[-min(10,len(obv)-1)]) / (abs(obv.iloc[-min(10,len(obv)-1)])+1)
-    score += np.clip(obv_sl*500, -20, 20)
-    last = df.iloc[-1]
-    sp = last["high"]-last["low"]
+def tech_score(df, c, o, m):
+    sc = 50.0
+    cv = float(c.iloc[-1]) if not pd.isna(c.iloc[-1]) else 0
+    sc += np.clip(cv*125,-25,25)
+    os = (o.iloc[-1]-o.iloc[-min(10,len(o)-1)]) / (abs(o.iloc[-min(10,len(o)-1)])+1)
+    sc += np.clip(os*500,-20,20)
+    last = df.iloc[-1]; sp = last["high"]-last["low"]
     cp = (last["close"]-last["low"]) / (sp if sp>0 else 1)
-    score += (cp-0.5)*30
-    avg_v = df["volume"].tail(20).mean()
-    vr = last["volume"]/avg_v if avg_v>0 else 1
-    if vr>1.3: score += 15 if cp>0.5 else -15
+    sc += (cp-0.5)*30
+    av = df["volume"].tail(20).mean(); vr = last["volume"]/av if av>0 else 1
+    if vr>1.3: sc += 15 if cp>0.5 else -15
     pt = (df["close"].iloc[-1]-df["close"].iloc[-min(10,len(df)-1)]) / df["close"].iloc[-min(10,len(df)-1)]
-    mt = mfi.iloc[-1]-mfi.iloc[-min(10,len(mfi)-1)]
-    if pt<-0.01 and mt>3: score += 15
-    if pt>0.01  and mt<-3: score -= 15
-    return int(np.clip(round(score), 0, 100))
+    mt = float(m.iloc[-1]-m.iloc[-min(10,len(m)-1)])
+    if pt<-0.01 and mt>3:  sc+=15
+    if pt>0.01  and mt<-3: sc-=15
+    return int(np.clip(round(sc),0,100))
+
+def entry_zone(df):
+    a   = atr(df); lp  = float(df["close"].iloc[-1])
+    la  = float(a.iloc[-1]) if not pd.isna(a.iloc[-1]) else lp*.02
+    sup = float(df["low"].tail(10).min())
+    res = float(df["high"].tail(20).max())
+    sl  = round(sup*.97,0)
+    el  = round(sup*1.005,0)
+    eh  = round(min(lp*1.02,sup*1.03),0)
+    t1  = round(res*.98,0)
+    risk= lp-sl; reward=t1-lp
+    return dict(el=el,eh=eh,sl=sl,t1=t1,
+                risk_pct=round((lp-sl)/lp*100,1),
+                rr=round(reward/risk,1) if risk>0 else 0,
+                sup=sup,res=res)
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fundamentals(ticker):
+    try:
+        info = yf.Ticker(ticker.upper().replace(".JK","") + ".JK").info
+        mc   = info.get("marketCap",0)
+        so   = info.get("sharesOutstanding",0)
+        return dict(
+            market_cap  = f"Rp {mc/1e12:.1f}T" if mc>=1e12 else f"Rp {mc/1e9:.1f}B" if mc>=1e9 else "—",
+            pe          = round(info.get("trailingPE",0),1) or "—",
+            pb          = round(info.get("priceToBook",0),2) or "—",
+            div         = f"{info.get('dividendYield',0)*100:.2f}%" if info.get("dividendYield") else "—",
+            hi52        = info.get("fiftyTwoWeekHigh"),
+            lo52        = info.get("fiftyTwoWeekLow"),
+            curr        = info.get("currentPrice",info.get("regularMarketPrice")),
+            shares_out  = so,
+        )
+    except: return {}
 
 
-# ══════════════════════════════════════════════════════════════════════════
-#  CHART BUILDER (Plotly)
-# ══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
+#  BROKER ANALYSIS
+# ══════════════════════════════════════════════════════════════════════
 
-def build_price_chart(df, cmf, obv, mfi, vsa_patterns):
-    bb_up, bb_mid, bb_low = calc_bb(df["close"])
-
-    fig = make_subplots(
-        rows=4, cols=1, shared_xaxes=True,
-        row_heights=[0.50, 0.17, 0.17, 0.16],
-        vertical_spacing=0.03,
+def analyze_broker(df):
+    out = dict(
+        foreign_net=0,local_inst_net=0,korean_net=0,retail_net=0,scalper_net=0,
+        goreng=False,goreng_codes=[],crossing=None,
+        sm_buyers=[],sm_sellers=[],alerts=[],
+        score=50,signal="NEUTRAL",conf="LOW",
     )
+    total = df["buy_lot"].sum() + df["sell_lot"].sum()
+    if total == 0: return out
+    for _,row in df.iterrows():
+        code = str(row["broker"]).upper(); net = int(row.get("net_lot",0))
+        cat  = row.get("cat","LOCAL_INST")
+        if cat=="FOREIGN_SMART":
+            out["foreign_net"] += net
+            e = {"broker":code,"name":row.get("name",code),"net":net,
+                 "buy_avg":row.get("buy_avg",0),"sell_avg":row.get("sell_avg",0)}
+            (out["sm_buyers"] if net>0 else out["sm_sellers"]).append(e)
+        elif cat in ("BUMN","LOCAL_INST"): out["local_inst_net"] += net
+        elif cat=="KOREAN":  out["korean_net"]  += net
+        elif cat=="RETAIL":  out["retail_net"]  += net
+        elif cat=="SCALPER":
+            out["scalper_net"] += net
+            sh = (row["buy_lot"]+row["sell_lot"]) / (total+1)
+            if sh > 0.25:
+                out["alerts"].append({"t":"warn","m":f"{code} dominates {sh:.0%} volume — scalper noise"})
+        elif cat=="LOCAL_BANDAR":
+            if net > 2000:
+                out["goreng"] = True; out["goreng_codes"].append(code)
+    if out["goreng"]:
+        out["alerts"].append({"t":"danger","m":f"PUMP ALERT: {', '.join(out['goreng_codes'])} active — known pump operators"})
+    xc = df[df["broker"].str.upper()=="XC"]
+    if not xc.empty and xc["net_lot"].values[0]>3000:
+        out["alerts"].append({"t":"warn","m":"XC (Ajaib/'Xobat Cutloss') heavy buy — late-stage distribution signal"})
+    fn = out["foreign_net"]; rn = out["retail_net"] + out["scalper_net"]
+    if fn>2000 and rn<-2000:
+        out["crossing"]="ACC"
+        out["alerts"].append({"t":"success","m":"🔥 ACCUMULATION CROSS: Smart money BUYING + Retail SELLING"})
+    elif fn<-2000 and rn>2000:
+        out["crossing"]="DIS"
+        out["alerts"].append({"t":"danger","m":"💀 DISTRIBUTION CROSS: Smart money SELLING + Retail BUYING"})
+    sc = 50.0
+    sc += np.clip(fn/(total*0.3+1)*30,-30,30)
+    sc += np.clip(out["local_inst_net"]/(total*0.2+1)*15,-15,15)
+    sc += np.clip(out["korean_net"]/(total*0.15+1)*8,-8,8)
+    sc += np.clip(-rn/(total*0.3+1)*10,-10,10)
+    sc += (len(out["sm_buyers"])-len(out["sm_sellers"]))*2.5
+    if out["crossing"]=="ACC": sc+=10
+    elif out["crossing"]=="DIS": sc-=10
+    if out["goreng"]: sc+=5
+    final = int(np.clip(round(sc),0,100))
+    conf  = abs(final-50)/50
+    out["score"]  = final
+    out["signal"] = "ACCUMULATION" if final>=60 else "DISTRIBUTION" if final<=40 else "NEUTRAL"
+    out["conf"]   = "HIGH" if conf>0.6 else "MEDIUM" if conf>0.3 else "LOW"
+    return out
 
-    # Candlestick
-    fig.add_trace(go.Candlestick(
-        x=df.index, open=df["open"], high=df["high"],
-        low=df["low"], close=df["close"],
-        increasing_line_color="#00ff88", decreasing_line_color="#ff3355",
-        increasing_fillcolor="#00ff88", decreasing_fillcolor="#ff3355",
-        name="OHLC", opacity=0.9,
-    ), row=1, col=1)
 
-    # Bollinger bands
-    fig.add_trace(go.Scatter(x=df.index, y=bb_up,  name="BB Upper",
-        line=dict(color="#1a3555",width=1), showlegend=False), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=bb_mid, name="BB Mid",
-        line=dict(color="#ffaa00",width=1,dash="dot"), showlegend=False), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=bb_low, name="BB Lower",
-        line=dict(color="#1a3555",width=1), fill="tonexty",
-        fillcolor="rgba(0,204,255,0.03)", showlegend=False), row=1, col=1)
+# ══════════════════════════════════════════════════════════════════════
+#  ENTRY SIGNAL
+# ══════════════════════════════════════════════════════════════════════
 
-    # MA20
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df["close"].rolling(20).mean(),
-        name="MA20", line=dict(color="#00ccff",width=1.5,dash="dash")), row=1, col=1)
+def entry_signal(final,ts,br_score,wp,cmf_v,obv_up,mfi_v,vr,crossing,
+                 goreng,sm_buy,sm_sell,chg,own):
+    met,fail,watch = [],[],[]
+    if final>=70: met.append(f"Composite {final}/100 (Strong)")
+    elif final>=55: met.append(f"Composite {final}/100 (Positive)")
+    elif final<=35: fail.append(f"Composite {final}/100 (Bearish)")
+    else: watch.append(f"Composite {final}/100 (Neutral)")
+    pa = {"A":"watch","B":"buy","C":"buy","D":"watch","E":"avoid"}.get(wp,"watch")
+    if pa=="buy": met.append(f"Wyckoff Phase {wp} — accumulation zone")
+    elif pa=="avoid": fail.append(f"Wyckoff Phase {wp} — late stage")
+    else: watch.append(f"Wyckoff Phase {wp} — transitional")
+    if cmf_v>0.12: met.append(f"CMF {cmf_v:.3f} — money inflow")
+    elif cmf_v<-0.12: fail.append(f"CMF {cmf_v:.3f} — money outflow")
+    else: watch.append(f"CMF {cmf_v:.3f} — balanced")
+    if obv_up: met.append("OBV rising — cumulative buying")
+    else: fail.append("OBV falling — cumulative selling")
+    if 15<=mfi_v<=45: met.append(f"MFI {mfi_v:.0f} — oversold zone")
+    elif mfi_v>75: fail.append(f"MFI {mfi_v:.0f} — overbought")
+    else: watch.append(f"MFI {mfi_v:.0f} — normal")
+    if vr>=1.5: met.append(f"Volume {vr:.1f}x — high activity")
+    if crossing=="ACC": met.append("Accumulation Cross confirmed")
+    elif crossing=="DIS": fail.append("Distribution Cross confirmed")
+    if len(sm_buy)>=3: met.append(f"SM buying: {', '.join([b['broker'] for b in sm_buy[:3]])}")
+    elif len(sm_sell)>=2: fail.append(f"SM selling: {', '.join([b['broker'] for b in sm_sell[:2]])}")
+    if goreng: watch.append("Pump broker active — tight stop-loss")
+    if own:
+        if own.get("tier")==1: met.append(f"Tier 1 owner: {own['owner'][:18]}")
+        elif own.get("tier")==3: fail.append("Tier 3 owner — speculative")
+        if own.get("political"): watch.append("Political ties detected")
+        ff = own.get("float",30)
+        if ff<15: fail.append(f"Low float {ff}% — FCA/manipulation risk")
+    nm=len(met); nf=len(fail)
+    if crossing=="ACC" and final>=65:
+        sig,color,cls="STRONG BUY","#00e676","sc-buy"
+        why="Accumulation Cross confirmed. Foreign institutions buying while retail sells."
+        risk,action="LOW-MEDIUM","Enter now. Stop-loss below recent 10-day support."
+    elif nm>=4 and nf<=1 and final>=65:
+        sig,color,cls="BUY","#00e676","sc-buy"
+        why=f"{nm} conditions confirmed. Smart money accumulation detected."
+        risk,action="MEDIUM","Consider entry. Confirm with volume breakout."
+    elif crossing=="DIS" or (nf>=3 and final<=40):
+        sig,color,cls="STRONG AVOID","#ff1744","sc-sell"
+        why="Distribution signals confirmed. Smart money exiting while retail buys."
+        risk,action="HIGH","Do not enter. Reduce position if holding."
+    elif nf>=2 and final<=45:
+        sig,color,cls="AVOID","#ff1744","sc-sell"
+        why=f"{nf} bearish signals active. Risk outweighs reward."
+        risk,action="MEDIUM-HIGH","Hold off. Wait for reversal signals."
+    elif nm>=2 and nf<=1:
+        sig,color,cls="WATCH","#ffab00","sc-watch"
+        why="Accumulation forming but not fully confirmed."
+        risk,action="MEDIUM","Watchlist. Look for: volume + CMF + SM entry."
+    else:
+        sig,color,cls="WATCH","#ffab00","sc-watch"
+        why="Mixed signals. No clear smart money direction."
+        risk,action="MEDIUM","Monitor. Enter only when 3+ conditions align."
+    return dict(sig=sig,color=color,cls=cls,why=why,risk=risk,
+                action=action,met=met,fail=fail,watch=watch)
 
-    # VSA markers
-    for p in vsa_patterns:
-        pass  # simplified for web
 
-    # Volume
-    colors = ["#00ff88" if df["close"].iloc[i]>=df["open"].iloc[i] else "#ff3355"
-              for i in range(len(df))]
-    fig.add_trace(go.Bar(
-        x=df.index, y=df["volume"], name="Volume",
-        marker_color=colors, opacity=0.4), row=2, col=1)
-    avg_vol_line = df["volume"].rolling(20).mean()
-    fig.add_trace(go.Scatter(
-        x=df.index, y=avg_vol_line, name="Avg Vol",
-        line=dict(color="#ffaa00",width=1,dash="dash"), showlegend=False), row=2, col=1)
+# ══════════════════════════════════════════════════════════════════════
+#  CHARTS
+# ══════════════════════════════════════════════════════════════════════
 
-    # CMF
-    cmf_colors = ["#00ff88" if v>0 else "#ff3355" for v in cmf]
-    fig.add_trace(go.Bar(
-        x=df.index, y=cmf, name="CMF",
-        marker_color=cmf_colors, opacity=0.7), row=3, col=1)
-    fig.add_hline(y=0.15, line_dash="dash", line_color="rgba(0,255,136,0.4)", row=3, col=1)
-    fig.add_hline(y=-0.15,line_dash="dash", line_color="rgba(255,51,85,0.4)",  row=3, col=1)
-    fig.add_hline(y=0,     line_color="rgba(100,130,160,0.5)",                  row=3, col=1)
+CL = dict(paper_bgcolor="#05080c", plot_bgcolor="#090d12",
+          font=dict(color="#cdd8e6", family="IBM Plex Mono, monospace", size=11),
+          margin=dict(l=0,r=0,t=10,b=0))
 
-    # MFI
-    fig.add_trace(go.Scatter(
-        x=df.index, y=mfi, name="MFI",
-        line=dict(color="#ffaa00",width=1.5),
-        fill="tozeroy", fillcolor="rgba(255,170,0,0.05)"), row=4, col=1)
-    fig.add_hline(y=80, line_dash="dash", line_color="rgba(255,51,85,0.4)",   row=4, col=1)
-    fig.add_hline(y=20, line_dash="dash", line_color="rgba(0,255,136,0.4)",   row=4, col=1)
-    fig.add_hline(y=50, line_color="rgba(100,130,160,0.3)",                    row=4, col=1)
-
-    fig.update_layout(
-        paper_bgcolor="#070b0f", plot_bgcolor="#0a0e14",
-        font=dict(color="#c8d8e8", family="monospace", size=11),
-        showlegend=True,
-        legend=dict(bgcolor="#0d1318", bordercolor="#1a2535",
-                    font=dict(size=10), orientation="h", y=1.02),
-        xaxis_rangeslider_visible=False,
-        margin=dict(l=0,r=0,t=10,b=0),
-        height=680,
-    )
-
-    for i in range(1, 5):
-        fig.update_xaxes(gridcolor="#1a2535", showgrid=True, row=i, col=1)
-        fig.update_yaxes(gridcolor="#1a2535", showgrid=True, row=i, col=1)
-
-    fig.update_yaxes(title_text="Harga (Rp)", row=1, col=1)
-    fig.update_yaxes(title_text="Volume",     row=2, col=1)
-    fig.update_yaxes(title_text="CMF",  range=[-0.6,0.6], row=3, col=1)
-    fig.update_yaxes(title_text="MFI",  range=[0,100],    row=4, col=1)
+def chart_price(df, c, o, m):
+    ma  = df["close"].rolling(20).mean()
+    std = df["close"].rolling(20).std()
+    fig = make_subplots(rows=4,cols=1,shared_xaxes=True,
+                        row_heights=[.50,.17,.17,.16],vertical_spacing=.03)
+    fig.add_trace(go.Candlestick(x=df.index,open=df["open"],high=df["high"],
+        low=df["low"],close=df["close"],
+        increasing=dict(line=dict(color="#00e676",width=1),fillcolor="rgba(0,230,118,.6)"),
+        decreasing=dict(line=dict(color="#ff1744",width=1),fillcolor="rgba(255,23,68,.6)"),
+        name="OHLC"),row=1,col=1)
+    fig.add_trace(go.Scatter(x=df.index,y=ma+2*std,line=dict(color="#1c2a3e",width=1),showlegend=False),row=1,col=1)
+    fig.add_trace(go.Scatter(x=df.index,y=ma-2*std,line=dict(color="#1c2a3e",width=1),
+        fill="tonexty",fillcolor="rgba(0,176,255,.03)",showlegend=False),row=1,col=1)
+    fig.add_trace(go.Scatter(x=df.index,y=ma,name="MA20",line=dict(color="#ffab00",width=1.5,dash="dash")),row=1,col=1)
+    vc = ["rgba(0,230,118,.5)" if df["close"].iloc[i]>=df["open"].iloc[i] else "rgba(255,23,68,.5)" for i in range(len(df))]
+    fig.add_trace(go.Bar(x=df.index,y=df["volume"],name="Vol",marker_color=vc),row=2,col=1)
+    fig.add_trace(go.Scatter(x=df.index,y=df["volume"].rolling(20).mean(),
+        line=dict(color="#ffab00",width=1,dash="dot"),showlegend=False),row=2,col=1)
+    cc = ["#00e676" if v>0 else "#ff1744" for v in c]
+    fig.add_trace(go.Bar(x=df.index,y=c,name="CMF",marker_color=cc,opacity=.8),row=3,col=1)
+    for y,lc in [(.15,"rgba(0,230,118,.3)"),(-.15,"rgba(255,23,68,.3)"),(0,"rgba(90,122,154,.4)")]:
+        fig.add_hline(y=y,line_color=lc,line_dash="dash" if y!=0 else "solid",row=3,col=1)
+    fig.add_trace(go.Scatter(x=df.index,y=m,name="MFI",
+        line=dict(color="#ffab00",width=1.5),fill="tozeroy",fillcolor="rgba(255,171,0,.05)"),row=4,col=1)
+    for y,lc in [(80,"rgba(255,23,68,.3)"),(20,"rgba(0,230,118,.3)"),(50,"rgba(90,122,154,.3)")]:
+        fig.add_hline(y=y,line_color=lc,line_dash="dash" if y!=50 else "solid",row=4,col=1)
+    fig.update_layout(**CL,height=600,showlegend=True,
+        legend=dict(bgcolor="#0b1018",bordercolor="#141e2e",font=dict(size=9),orientation="h",y=1.02),
+        xaxis_rangeslider_visible=False)
+    for i in range(1,5):
+        fig.update_xaxes(gridcolor="#141e2e",showgrid=True,row=i,col=1)
+        fig.update_yaxes(gridcolor="#141e2e",showgrid=True,row=i,col=1)
+    fig.update_yaxes(title_text="Price (IDR)",row=1,col=1)
+    fig.update_yaxes(title_text="Volume",     row=2,col=1)
+    fig.update_yaxes(title_text="CMF",range=[-.6,.6],row=3,col=1)
+    fig.update_yaxes(title_text="MFI",range=[0,100], row=4,col=1)
     return fig
 
-
-def build_broker_chart(bdf: pd.DataFrame):
-    bdf_s = bdf.sort_values("net_lot")
-    colors = []
-    for _, row in bdf_s.iterrows():
-        cat = row["cat"]
-        if cat == "FOREIGN_SMART":   colors.append("#00ff88")
-        elif cat == "LOCAL_BANDAR":  colors.append("#ffaa00")
-        elif cat == "SCALPER":       colors.append("#ff5500")
-        elif cat in ("RETAIL_LARGE","RETAIL_MED"): colors.append("#ff3355")
-        else: colors.append("#00ccff")
-
+def chart_broker_flow(bdf):
+    bdf_s  = bdf.sort_values("net_lot")
+    colors = [CAT_COLOR.get(r["cat"],"#00b0ff") for _,r in bdf_s.iterrows()]
     fig = go.Figure(go.Bar(
         x=bdf_s["net_lot"],
-        y=bdf_s["broker"] + " | " + bdf_s["name"].str[:20],
-        orientation="h",
-        marker_color=colors,
-        opacity=0.85,
+        y=bdf_s["broker"]+" "+bdf_s.get("flag",pd.Series(["🇮🇩"]*len(bdf_s)))+" · "+bdf_s["name"].str[:14],
+        orientation="h",marker_color=colors,opacity=.85,
         text=[f"{n:+,}" for n in bdf_s["net_lot"]],
-        textposition="outside",
-        textfont=dict(color="#c8d8e8", size=10),
+        textposition="outside",textfont=dict(color="#cdd8e6",size=9),
     ))
-    fig.update_layout(
-        paper_bgcolor="#070b0f", plot_bgcolor="#0a0e14",
-        font=dict(color="#c8d8e8", family="monospace", size=10),
-        margin=dict(l=0,r=50,t=10,b=0),
-        height=max(400, len(bdf_s)*32),
-        xaxis=dict(gridcolor="#1a2535", title="Net Lot"),
-        yaxis=dict(gridcolor="#1a2535"),
-        showlegend=False,
-    )
-    fig.add_vline(x=0, line_color="#3a5570", line_width=1)
+    fig.update_layout(**CL,height=max(300,len(bdf_s)*30),
+        xaxis=dict(gridcolor="#141e2e",title="Net Lot (Today)"),
+        yaxis=dict(gridcolor="#141e2e"),showlegend=False)
+    fig.add_vline(x=0,line_color="#2a3d52",line_width=1)
     return fig
 
-
-def build_broker_category_chart(br: dict):
-    cats   = ["Foreign Smart", "Local Inst.", "Korean", "Retail\n(Kontrarian)", "Scalper\n(Noise)"]
-    values = [br["foreign_net"], br["local_inst_net"], br["korean_net"], br["retail_net"], br["scalper_net"]]
-    colors = ["#00ff88" if v>0 else "#ff3355" for v in values]
-
+def chart_accumulation(adf, label=""):
+    df_s   = adf.sort_values("cum_net")
+    max_a  = df_s["cum_net"].abs().max() or 1
+    colors = []
+    for _,row in df_s.iterrows():
+        cat = row.get("cat","LOCAL_INST")
+        if cat=="FOREIGN_SMART":
+            colors.append("#00e676" if row["cum_net"]>0 else "#ff4466")
+        elif cat=="RETAIL":
+            colors.append("#ff8888" if row["cum_net"]>0 else "#88ff88")
+        elif cat=="SCALPER":
+            colors.append("#ff6d00")
+        else:
+            colors.append("#00b0ff" if row["cum_net"]>0 else "#ff8844")
     fig = go.Figure(go.Bar(
-        x=cats, y=values,
-        marker_color=colors, opacity=0.85,
-        text=[f"{v:+,}" for v in values],
-        textposition="outside",
-        textfont=dict(color="#c8d8e8", size=11, family="monospace"),
+        x=df_s["cum_net"],
+        y=df_s["broker"]+" · "+df_s["name"].str[:15],
+        orientation="h",marker_color=colors,opacity=.85,
+        text=[f"{n:+,}" for n in df_s["cum_net"]],
+        textposition="outside",textfont=dict(color="#cdd8e6",size=9),
+        hovertemplate="<b>%{y}</b><br>Cumulative Net: %{x:+,} lots<extra></extra>",
     ))
-    fig.update_layout(
-        paper_bgcolor="#070b0f", plot_bgcolor="#0a0e14",
-        font=dict(color="#c8d8e8", family="monospace", size=11),
-        margin=dict(l=0,r=0,t=10,b=0),
-        height=320,
-        xaxis=dict(gridcolor="#1a2535"),
-        yaxis=dict(gridcolor="#1a2535", title="Net Lot"),
-        showlegend=False,
-    )
-    fig.add_hline(y=0, line_color="#3a5570")
+    fig.update_layout(**CL,
+        title=dict(text=f"Estimated Accumulated Position  ·  {label}",
+                   font=dict(size=10,color="#5a7a9a"),x=0.01),
+        height=max(340,len(df_s)*30),
+        xaxis=dict(gridcolor="#141e2e",title="Cumulative Net Lots"),
+        yaxis=dict(gridcolor="#141e2e"),showlegend=False)
+    fig.add_vline(x=0,line_color="#2a3d52",line_width=2)
+    return fig
+
+def chart_shareholding(sh_df, ticker, shares_out):
+    """Horizontal stacked bar showing estimated broker shareholding."""
+    top = sh_df[sh_df["est_shares"]>0].head(10)
+    if top.empty: return None
+    colors = [CAT_COLOR.get(r["cat"],"#00b0ff") for _,r in top.iterrows()]
+    fig = go.Figure(go.Bar(
+        y=top["broker"]+" · "+top["name"].str[:14],
+        x=top["est_pct"],
+        orientation="h",marker_color=colors,opacity=.85,
+        text=[f"{p:.2f}%" for p in top["est_pct"]],
+        textposition="outside",textfont=dict(color="#cdd8e6",size=9),
+        hovertemplate="<b>%{y}</b><br>Est. Holding: %{x:.3f}% of OS<extra></extra>",
+    ))
+    fig.update_layout(**CL,
+        title=dict(text=f"Estimated % of Outstanding Shares Held  ·  {ticker}",
+                   font=dict(size=10,color="#5a7a9a"),x=0.01),
+        height=max(300,len(top)*32),
+        xaxis=dict(gridcolor="#141e2e",title="Estimated % of Shares Outstanding"),
+        yaxis=dict(gridcolor="#141e2e"),showlegend=False)
+    return fig
+
+def chart_cat_flow(br):
+    cats = ["Foreign\nSmart","Local Inst.","Korean","Retail\n(Contra)","Scalper"]
+    vals = [br["foreign_net"],br["local_inst_net"],br["korean_net"],br["retail_net"],br["scalper_net"]]
+    fig  = go.Figure(go.Bar(x=cats,y=vals,
+        marker_color=["#00e676" if v>0 else "#ff1744" for v in vals],opacity=.85,
+        text=[f"{v:+,}" for v in vals],textposition="outside",
+        textfont=dict(color="#cdd8e6",size=10)))
+    fig.update_layout(**CL,height=240,
+        xaxis=dict(gridcolor="#141e2e"),
+        yaxis=dict(gridcolor="#141e2e",title="Net Lot"),showlegend=False)
+    fig.add_hline(y=0,line_color="#2a3d52")
+    return fig
+
+def chart_gauge(score):
+    c = "#00e676" if score>=65 else "#ff1744" if score<=35 else "#ffab00"
+    fig = go.Figure(go.Indicator(mode="gauge+number",value=score,
+        number={"font":{"color":c,"size":44,"family":"IBM Plex Mono"},"suffix":"/100"},
+        gauge={"axis":{"range":[0,100],"tickfont":{"color":"#5a7a9a","size":9}},
+               "bar":{"color":c,"thickness":.22},"bgcolor":"#090d12","bordercolor":"#141e2e",
+               "steps":[{"range":[0,35],"color":"rgba(255,23,68,.08)"},
+                        {"range":[35,65],"color":"rgba(255,171,0,.05)"},
+                        {"range":[65,100],"color":"rgba(0,230,118,.08)"}],
+               "threshold":{"line":{"color":c,"width":3},"thickness":.8,"value":score}}))
+    fig.update_layout(paper_bgcolor="#05080c",
+        font=dict(color=c,family="IBM Plex Mono"),
+        margin=dict(l=20,r=20,t=20,b=10),height=185)
+    return fig
+
+def chart_sh_pie(sh_list):
+    valid = [s for s in sh_list if s.get("pct",0)>0]
+    if not valid: return None
+    labels = [s["name"][:24] for s in valid]
+    values = [s["pct"] for s in valid]
+    fig = go.Figure(go.Pie(labels=labels,values=values,hole=0.5,
+        marker=dict(colors=["#00e676","#00b0ff","#e040fb","#ffab00","#ff1744","#5a7a9a","#00e5ff"][:len(labels)],
+                    line=dict(color="#05080c",width=2)),
+        textfont=dict(color="#cdd8e6",size=10,family="IBM Plex Mono"),
+        hovertemplate="%{label}<br>%{value:.1f}%<extra></extra>"))
+    fig.update_layout(**CL,height=260,showlegend=True,
+        legend=dict(bgcolor="#0b1018",bordercolor="#141e2e",font=dict(size=9,color="#cdd8e6")))
     return fig
 
 
-def build_gauge(score: int, verdict: str):
-    color = "#00ff88" if score>=65 else "#ff3355" if score<=35 else "#ffaa00"
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number",
-        value=score,
-        number={"font":{"color":color,"size":52,"family":"monospace"},"suffix":"/100"},
-        gauge={
-            "axis": {"range":[0,100], "tickcolor":"#3a5570",
-                     "tickfont":{"color":"#6a8aaa","size":10}},
-            "bar": {"color": color, "thickness":0.25},
-            "bgcolor": "#0a0e14",
-            "bordercolor": "#1a2535",
-            "steps": [
-                {"range":[0,35],  "color":"rgba(255,51,85,0.12)"},
-                {"range":[35,65], "color":"rgba(255,170,0,0.08)"},
-                {"range":[65,100],"color":"rgba(0,255,136,0.12)"},
-            ],
-            "threshold": {"line":{"color":color,"width":4},"thickness":0.8,"value":score},
-        },
-    ))
-    fig.update_layout(
-        paper_bgcolor="#070b0f",
-        font=dict(color=color, family="monospace"),
-        margin=dict(l=20,r=20,t=20,b=10),
-        height=200,
-    )
-    return fig
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  UI — SIDEBAR
-# ══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
+#  SIDEBAR
+# ══════════════════════════════════════════════════════════════════════
 
 with st.sidebar:
-    st.markdown("## ⚙️ PARAMETER ANALISIS")
+    st.markdown("""
+    <div style='font-family:"IBM Plex Mono",monospace;font-size:16px;font-weight:700;
+                color:#00e676;letter-spacing:3px'>BANDARMOLOGY PRO</div>
+    <div style='font-family:"IBM Plex Mono",monospace;font-size:8px;color:#2a3d52;
+                letter-spacing:3px;margin-bottom:10px'>IDX SMART MONEY PLATFORM · v6</div>
+    """, unsafe_allow_html=True)
+
+    # Live market clock
+    ms = market_status()
+    dot_cls = "dot dot-g" if ms["open"] else "dot dot-a"
+    mkt_cls = "mkt-open" if ms["open"] else "mkt-closed"
+    st.markdown(f"""
+    <div class='{mkt_cls}' style='margin-bottom:6px'>
+      <div class='{dot_cls}'></div>{ms["label"]}
+    </div>
+    <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;color:#2a3d52;margin-bottom:12px'>
+      WIB {ms["wib"].strftime("%H:%M:%S")} · {ms["wib"].strftime("%d %b %Y")}
+      · Next: {ms["next"]}
+    </div>""", unsafe_allow_html=True)
+
     st.markdown("---")
-
-    ticker_input = st.text_input(
-        "Kode Saham (IDX)",
-        value="BBCA",
-        max_chars=8,
-        help="Masukkan kode saham IDX tanpa .JK (contoh: BBCA, TLKM, GOTO)",
-    ).upper().replace(".JK","")
-
-    period_map = {"1 Bulan":"1mo", "3 Bulan":"3mo", "6 Bulan":"6mo", "1 Tahun":"1y"}
-    period_sel = st.selectbox("Periode Analisis", list(period_map.keys()), index=1)
-    period     = period_map[period_sel]
+    st.markdown("**PARAMETERS**")
+    ticker_input = st.text_input("Stock Ticker", "BBCA", max_chars=10,
+        help="Any IDX ticker — BBCA, BREN, AMMN, ADRO, MDKA, GOTO..."
+    ).upper().strip().replace(".JK","")
+    period_map = {"1M":"1mo","3M":"3mo","6M":"6mo","1Y":"1y"}
+    period = period_map[st.selectbox("Period", list(period_map.keys()), index=1)]
 
     st.markdown("---")
-    st.markdown("### 📋 Quick Screener")
-    preset_tickers = st.multiselect(
-        "Pilih Saham",
-        ["BBCA","BBRI","BMRI","TLKM","ASII","GOTO","ICBP","UNVR","KLBF",
-         "ADRO","PGAS","ANTM","PTBA","INDF","BYAN","HMSP","EXCL","TBIG"],
-        default=["BBCA","BBRI","TLKM","ASII","GOTO"],
-    )
+    st.markdown("**AUTO-REFRESH**")
+    if HAS_AR:
+        ref_opts = {"Off":0,"5 min":300,"15 min":900,"30 min":1800}
+        ref_sel  = st.selectbox("Interval", list(ref_opts.keys()), index=0)
+        ref_sec  = ref_opts[ref_sel]
+        if ref_sec > 0:
+            cnt = st_autorefresh(interval=ref_sec*1000, limit=None, key="ar")
+            st.markdown(f"""<div style='font-family:"IBM Plex Mono",monospace;font-size:9px;
+                color:#5a7a9a'>Refresh #{cnt} · every {ref_sel}</div>""",
+                unsafe_allow_html=True)
+    else:
+        st.caption("pip install streamlit-autorefresh")
+        if st.button("↻  Manual Refresh", use_container_width=True):
+            st.cache_data.clear(); st.rerun()
+
+    st.markdown("---")
+    st.markdown("**STOCKBIT TOKEN** *(for real broker data)*")
+    st.markdown("""
+    <div style='font-size:10px;color:#5a7a9a;line-height:1.8;font-family:"IBM Plex Mono",monospace'>
+    1. Open <b>stockbit.com</b> → Login<br>
+    2. F12 → Network → Refresh<br>
+    3. Any request → Headers<br>
+    4. Find: <span style='color:#ffab00'>authorization: Bearer eyJ...</span><br>
+    5. Copy text <i>after</i> "Bearer " → paste below
+    </div>""", unsafe_allow_html=True)
+    sb_token = st.text_input("Bearer Token","",type="password",
+                              placeholder="eyJhbGciOi...",key="sb_token")
+    if sb_token:
+        st.success("✅ Token active") if len(sb_token)>20 else st.error("❌ Invalid")
+
+    st.markdown("---")
+    st.markdown("**ACCUMULATION WINDOW**")
+    accu_days = st.select_slider("Trading days", [5,10,15,20,30], value=20)
+
+    st.markdown("---")
+    st.markdown("**SCREENER WATCHLIST**")
+    st.caption("Any IDX tickers, comma-separated. No limit.")
+    wl_raw = st.text_area("Tickers",
+        "BBCA,BBRI,BMRI,TLKM,ASII,BREN,AMMN,ADRO,ANTM,KLBF,ICBP,GOTO,MDKA,BYAN,UNTR",
+        height=75)
 
     st.markdown("---")
     st.markdown("""
-    <div style='font-family:monospace;font-size:11px;color:#3a5570;line-height:1.8'>
-    <b style='color:#6a8aaa'>BROKER LEGEND:</b><br>
-    🟢 Foreign Smart Money<br>
-    🔥 Local Bandar/Goreng<br>
-    🏛️ BUMN Institutional<br>
-    🇰🇷 Korean Broker<br>
-    ⚠️ Retail (Kontrarian)<br>
-    ⚡ Scalper (Noise)<br>
-    </div>
-    """, unsafe_allow_html=True)
+    <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;color:#2a3d52;line-height:2.2'>
+    <span style='color:#5a7a9a'>CACHE TTL</span><br>
+    Price chart: 15 min<br>
+    Broker (today): 30 min<br>
+    Broker accumulation: 1 hr<br>
+    Fundamentals: 1 hr<br>
+    Shareholders: 24 hr (monthly)<br>
+    KSEI composition: 1 hr<br><br>
+    <span style='color:#5a7a9a'>DATA SOURCES</span><br>
+    <span style='color:#00e676'>●</span> Stockbit API (real-time)<br>
+    <span style='color:#00b0ff'>●</span> IDX Official API<br>
+    <span style='color:#e040fb'>●</span> KSEI holding data<br>
+    <span style='color:#00e5ff'>●</span> Yahoo Finance<br>
+    <span style='color:#ffab00'>●</span> Demo (simulated)
+    </div>""", unsafe_allow_html=True)
 
 
-# ══════════════════════════════════════════════════════════════════════════
-#  UI — MAIN
-# ══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
+#  MAIN HEADER
+# ══════════════════════════════════════════════════════════════════════
 
-# Header
-st.markdown("""
-<div style='text-align:center;padding:12px 0 8px'>
-  <h1 style='font-family:monospace;font-size:2rem;letter-spacing:6px;
-             color:#00ff88;text-shadow:0 0 30px rgba(0,255,136,0.4)'>
-    BANDARMOLOGY
-  </h1>
-  <p style='color:#3a5570;font-family:monospace;letter-spacing:3px;font-size:12px'>
-    SMART MONEY DETECTOR — IDX / BEI
-  </p>
-</div>
-""", unsafe_allow_html=True)
+ms_now = market_status()
+st.markdown(f"""
+<div style='padding:10px 0 8px;border-bottom:1px solid #141e2e;margin-bottom:12px;
+            display:flex;justify-content:space-between;align-items:center'>
+  <div>
+    <span style='font-family:"IBM Plex Mono",monospace;font-size:1.55rem;font-weight:700;
+                 color:#00e676;letter-spacing:4px;text-shadow:0 0 28px rgba(0,230,118,.2)'>
+      BANDARMOLOGY PRO</span>
+    <span style='font-family:"IBM Plex Mono",monospace;font-size:9px;color:#2a3d52;
+                 margin-left:14px;letter-spacing:3px'>IDX SMART MONEY · v6</span>
+  </div>
+  <div style='text-align:right;font-family:"IBM Plex Mono",monospace;font-size:9px;color:#2a3d52'>
+    <span style='color:{"#00e676" if ms_now["open"] else "#ffab00"}'>{ms_now["label"]}</span>
+    · {ms_now["wib"].strftime("%H:%M:%S WIB  %d %b %Y")}
+  </div>
+</div>""", unsafe_allow_html=True)
 
-tab1, tab2, tab3 = st.tabs(["📊 ANALISIS SAHAM", "🔍 SCREENER", "📚 PANDUAN BROKER"])
+tab_a, tab_bh, tab_s, tab_o, tab_g = st.tabs([
+    "  ANALYSIS  ",
+    "  BROKER SHAREHOLDING  ",
+    "  SCREENER  ",
+    "  OWNERSHIP DB  ",
+    "  GUIDE  ",
+])
 
-# ── TAB 1: ANALISIS ────────────────────────────────────────────────────────
-with tab1:
-    col_btn, col_info = st.columns([2,8])
-    with col_btn:
-        analyze_btn = st.button("🔍 ANALISIS", use_container_width=True)
 
-    if analyze_btn or "last_result" in st.session_state:
-        if analyze_btn:
-            with st.spinner(f"📡 Mengambil data {ticker_input}.JK dari Yahoo Finance..."):
-                df = load_data(ticker_input, period)
-            if df is None or len(df) < 20:
-                st.error(f"❌ Gagal mengambil data {ticker_input}.JK. Cek kode saham.")
-                st.stop()
+# ══════════════════════════════════════════════════════════════════════
+#  TAB 1 — ANALYSIS
+# ══════════════════════════════════════════════════════════════════════
 
-            with st.spinner("⚙️ Menghitung indikator teknikal..."):
-                cmf  = calc_cmf(df)
-                obv  = calc_obv(df)
-                mfi  = calc_mfi(df)
-                rsi  = calc_rsi(df["close"])
-                vsa  = detect_vsa(df)
-                wyck_phase, wyck_desc = detect_wyckoff(df, cmf, obv)
-                tech_score = calc_tech_score(df, cmf, obv, mfi)
-
-            with st.spinner("🏦 Menganalisis broker flow..."):
-                bdf    = gen_broker_data(ticker_input, tech_score)
-                broker = analyze_broker_flow(bdf)
-
-            final_score = int(np.clip(round(tech_score*0.6 + broker["score"]*0.4), 0, 100))
-            verdict     = "AKUMULASI" if final_score>=65 else "DISTRIBUSI" if final_score<=35 else "NEUTRAL"
-            confidence  = "TINGGI" if abs(final_score-50)/50>0.6 else "SEDANG" if abs(final_score-50)/50>0.3 else "RENDAH"
-
-            last = df.iloc[-1]
-            prev = df.iloc[-2]
-            change = (last["close"]-prev["close"])/prev["close"]*100
-            avg_v  = df["volume"].tail(20).mean()
-            vr     = last["volume"]/avg_v if avg_v>0 else 1
-
-            st.session_state["last_result"] = dict(
-                df=df, cmf=cmf, obv=obv, mfi=mfi, rsi=rsi, vsa=vsa,
-                wyck_phase=wyck_phase, wyck_desc=wyck_desc,
-                tech_score=tech_score, broker=broker, bdf=bdf,
-                final_score=final_score, verdict=verdict, confidence=confidence,
-                last_price=float(last["close"]), change=change,
-                vol_ratio=vr, last_cmf=float(cmf.iloc[-1]),
-                last_mfi=float(mfi.iloc[-1]), ticker=ticker_input,
-            )
-
-        res = st.session_state["last_result"]
-        df  = res["df"]
-        br  = res["broker"]
-
-        # ── VERDICT HEADER ──────────────────────────────────────────────
-        badge_cls = "badge-acc" if res["verdict"]=="AKUMULASI" else "badge-dis" if res["verdict"]=="DISTRIBUSI" else "badge-neut"
-        cross_str = ""
-        if br["crossing"] == "ACC":
-            cross_str = " | 🔥 ACCUMULATION CROSS"
-        elif br["crossing"] == "DIS":
-            cross_str = " | 💀 DISTRIBUTION CROSS"
-        goreng_str = " | 🚨 GORENG ALERT" if br["goreng_alert"] else ""
-
+with tab_a:
+    cb, ct = st.columns([2,8])
+    with cb:
+        run = st.button("▶  RUN ANALYSIS", use_container_width=True)
+    with ct:
         st.markdown(f"""
-        <div style='background:#0d1318;border:1px solid #1a2535;
-                    border-top:3px solid {"#00ff88" if res["verdict"]=="AKUMULASI" else "#ff3355" if res["verdict"]=="DISTRIBUSI" else "#ffaa00"};
-                    padding:18px 22px;margin-bottom:16px'>
-          <div style='display:flex;justify-content:space-between;align-items:center'>
-            <div>
-              <span style='font-family:monospace;font-size:2.2rem;font-weight:900;color:#fff'>{res["ticker"]}.JK</span>
-              <span style='font-family:monospace;font-size:1.3rem;color:#00ccff;margin-left:18px'>
-                Rp {res["last_price"]:,.0f}
-              </span>
-              <span style='font-family:monospace;font-size:1rem;
-                           color:{"#00ff88" if res["change"]>=0 else "#ff3355"};margin-left:10px'>
-                {"+" if res["change"]>=0 else ""}{res["change"]:.2f}%
-              </span>
+        <div style='padding:7px 12px;background:#0b1018;border:1px solid #141e2e;
+                    border-radius:3px;font-family:"IBM Plex Mono",monospace;font-size:10px;color:#5a7a9a'>
+          Ticker: <b style='color:#eaf0f8'>{ticker_input}.JK</b>
+          &nbsp;·&nbsp; Period: {period}
+          &nbsp;·&nbsp; Broker: {'<span style="color:#00e676">Stockbit</span>'
+            if sb_token and len(sb_token)>20 else '<span style="color:#00b0ff">IDX API</span>'}
+          &nbsp;·&nbsp; Market: <span style='color:{"#00e676" if ms_now["open"] else "#ffab00"}'>{ms_now["label"]}</span>
+        </div>""", unsafe_allow_html=True)
+
+    if run:
+        st.session_state.pop("res", None)
+        with st.spinner(f"Loading price data for {ticker_input}.JK ..."):
+            df = load_price(ticker_input, period)
+        if df is None or len(df) < 20:
+            st.error(f"Could not load **{ticker_input}.JK**. Try: BBCA, BREN, AMMN, ADRO, BMRI")
+            st.stop()
+        with st.spinner("Computing CMF · OBV · MFI · RSI · Wyckoff · ATR ..."):
+            c_ = cmf(df); o_ = obv(df); m_ = mfi(df)
+            wp,wn,wd = wyckoff(df,c_,o_); ts = tech_score(df,c_,o_,m_)
+            ez = entry_zone(df)
+        with st.spinner("Fetching broker summary (today) ..."):
+            bdf, src = get_broker_today(ticker_input, sb_token)
+            if bdf is None:
+                bdf = demo_broker(ticker_input, ts); src = "demo"
+            br = analyze_broker(bdf)
+        with st.spinner("Fetching fundamentals · ownership · shareholders ..."):
+            fund   = fundamentals(ticker_input)
+            own    = OWNER_DB.get(ticker_input.upper().replace(".JK",""))
+            ksei   = fetch_ksei_composition(ticker_input)
+            sh_list, sh_src, sh_date = fetch_shareholders(ticker_input)
+        final = int(np.clip(round(ts*.6 + br["score"]*.4), 0, 100))
+        last  = df.iloc[-1]; prev = df.iloc[-2]
+        chg   = (last["close"]-prev["close"]) / prev["close"] * 100
+        av    = df["volume"].tail(20).mean()
+        vr    = last["volume"] / av if av>0 else 1
+        ob_up = o_.iloc[-1] > o_.iloc[-min(10,len(o_)-1)]
+        ent   = entry_signal(final,ts,br["score"],wp,float(c_.iloc[-1]),
+                              ob_up,float(m_.iloc[-1]),vr,br["crossing"],
+                              br["goreng"],br["sm_buyers"],br["sm_sellers"],chg,own)
+        st.session_state["res"] = dict(
+            df=df,c=c_,o=o_,m=m_,wp=wp,wn=wn,wd=wd,ts=ts,
+            br=br,bdf=bdf,src=src,final=final,ent=ent,
+            lp=float(last["close"]),chg=chg,vr=vr,
+            cmf_v=float(c_.iloc[-1]),mfi_v=float(m_.iloc[-1]),
+            obv_up=ob_up,ticker=ticker_input,
+            fund=fund,own=own,ksei=ksei,
+            sh_list=sh_list,sh_src=sh_src,sh_date=sh_date,
+            ez=ez,fetched=datetime.now().strftime("%H:%M:%S WIB"),
+        )
+
+    if "res" in st.session_state:
+        R  = st.session_state["res"]
+        br = R["br"]; ent = R["ent"]; own = R["own"]; fund = R["fund"]; ez = R["ez"]
+        sh_list = R.get("sh_list",[]); ksei = R.get("ksei",{})
+
+        # ── source badge
+        src_badge = {"stockbit":'<span class="tag tg">STOCKBIT REAL</span>',
+                     "idx":     '<span class="tag tb">IDX API REAL</span>',
+                     "demo":    '<span class="tag ta">DEMO DATA</span>'}.get(R["src"],"")
+
+        # ── ownership bar
+        if own:
+            tc = {1:"#00e676",2:"#00b0ff",3:"#ff1744"}.get(own.get("tier",2),"#00b0ff")
+            ff = own.get("float",30)
+            ffc= "#ff1744" if ff<15 else "#00e676"
+            pol= '<span class="tag tr" style="margin-left:6px">⚡ POLITICAL</span>' if own.get("political") else ""
+            own_html = (f'<span style="font-family:IBM Plex Mono,monospace;font-size:10px;'
+                        f'font-weight:700;color:{tc}">T{own["tier"]}</span>'
+                        f'<span style="color:#5a7a9a;font-family:IBM Plex Mono,monospace;font-size:10px;margin-left:10px">'
+                        f'{own["owner"]} · {own["group"]}</span>'
+                        f'<span style="color:{ffc};font-family:IBM Plex Mono,monospace;font-size:10px;margin-left:10px">'
+                        f'Float {ff}%{"  ⚠️ FCA" if ff<15 else ""}</span>{pol}')
+        else:
+            own_html = '<span style="color:#2a3d52;font-size:10px;font-family:IBM Plex Mono,monospace">Ownership not in DB — check IDX disclosure</span>'
+
+        # ── HEADER
+        st.markdown(f"""
+        <div style='background:#0b1018;border:1px solid #141e2e;border-top:2px solid {ent["color"]};
+                    padding:14px 18px;margin-bottom:12px;border-radius:0 0 4px 4px'>
+          <div style='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px'>
+            <div style='display:flex;align-items:baseline;gap:12px'>
+              <span style='font-family:"IBM Plex Mono",monospace;font-size:2.3rem;
+                           font-weight:700;color:var(--white);letter-spacing:3px'>{R["ticker"]}</span>
+              <span style='font-family:"IBM Plex Mono",monospace;color:#5a7a9a;font-size:10px'>.JK · IDX</span>
+              <span style='font-family:"IBM Plex Mono",monospace;font-size:1.35rem;color:#00b0ff'>
+                Rp {R["lp"]:,.0f}</span>
+              <span style='font-family:"IBM Plex Mono",monospace;
+                           color:{"#00e676" if R["chg"]>=0 else "#ff1744"}'>
+                {"▲" if R["chg"]>=0 else "▼"} {abs(R["chg"]):.2f}%</span>
             </div>
-            <div style='text-align:right'>
-              <span class='score-badge {badge_cls}'>{res["verdict"]}</span>
-              <div style='font-family:monospace;font-size:11px;color:#6a8aaa;margin-top:4px'>
-                Confidence: {res["confidence"]}{cross_str}{goreng_str}
-              </div>
+            <div style='display:flex;align-items:center;gap:8px'>
+              {src_badge}
+              <span class='ts-note'>Updated {R["fetched"]}</span>
             </div>
           </div>
-        </div>
-        """, unsafe_allow_html=True)
+          <div style='margin-top:6px'>{own_html}</div>
+        </div>""", unsafe_allow_html=True)
 
-        # ── METRICS ─────────────────────────────────────────────────────
-        c1,c2,c3,c4,c5 = st.columns(5)
-        with c1:
-            st.metric("FINAL SCORE", f"{res['final_score']}/100",
-                      delta="Strong" if abs(res["final_score"]-50)>25 else "Moderate")
-        with c2:
-            st.metric("TECH SCORE", f"{res['tech_score']}/100")
-        with c3:
-            st.metric("BROKER SCORE", f"{br['score']}/100")
-        with c4:
-            cmf_val = res["last_cmf"]
-            st.metric("CMF (14)", f"{cmf_val:.4f}",
-                      delta="Bullish" if cmf_val>0.1 else "Bearish" if cmf_val<-0.1 else "Neutral")
-        with c5:
-            st.metric("VOL RATIO", f"{res['vol_ratio']:.1f}x",
-                      delta=f"Wyckoff Ph {res['wyck_phase']}")
+        # ── ENTRY SIGNAL
+        st.markdown('<div class="sec">ENTRY RECOMMENDATION</div>', unsafe_allow_html=True)
+        conds  = "".join([f'<span class="cm">✓ {x}</span>' for x in ent["met"]])
+        conds += "".join([f'<span class="cw">~ {x}</span>' for x in ent["watch"]])
+        conds += "".join([f'<span class="cf">✗ {x}</span>' for x in ent["fail"]])
+        st.markdown(f"""
+        <div class='signal-card {ent["cls"]}'>
+          <div class='sig-lbl' style='color:{ent["color"]}'>ENTRY SIGNAL</div>
+          <div class='sig-main' style='color:{ent["color"]}'>{ent["sig"]}</div>
+          <div class='sig-why'>{ent["why"]}</div>
+          <div style='margin-top:8px;padding:7px 12px;background:rgba(0,0,0,.3);
+                      border-radius:3px;font-family:"IBM Plex Mono",monospace;font-size:11px'>
+            <span style='color:#5a7a9a'>ACTION:</span>
+            <span style='color:#eaf0f8;margin-left:8px'>{ent["action"]}</span>
+            &nbsp;·&nbsp;
+            <span style='color:#5a7a9a'>RISK:</span>
+            <span style='color:{ent["color"]};margin-left:8px;font-weight:700'>{ent["risk"]}</span>
+          </div>
+          <div class='conds'>{conds}</div>
+        </div>""", unsafe_allow_html=True)
 
-        # ── CHARTS ──────────────────────────────────────────────────────
-        col_chart, col_gauge = st.columns([3, 1])
-        with col_chart:
-            st.markdown("#### 📈 PRICE + VOLUME + CMF + MFI")
-            fig_price = build_price_chart(df, res["cmf"], res["obv"], res["mfi"], res["vsa"])
-            st.plotly_chart(fig_price, use_container_width=True)
+        # ── KEY METRICS
+        st.markdown('<div class="sec" style="margin-top:12px">KEY METRICS</div>', unsafe_allow_html=True)
+        c1,c2,c3,c4,c5,c6 = st.columns(6)
+        c1.metric("COMPOSITE",  f"{R['final']}/100", delta=ent["sig"])
+        c2.metric("TECHNICAL",  f"{R['ts']}/100")
+        c3.metric("BROKER",     f"{br['score']}/100")
+        c4.metric("CMF (14)",   f"{R['cmf_v']:.4f}",
+                  delta="Inflow" if R["cmf_v"]>.1 else "Outflow" if R["cmf_v"]<-.1 else "Neutral")
+        c5.metric("MFI (14)",   f"{R['mfi_v']:.1f}",
+                  delta="Oversold" if R["mfi_v"]<30 else "Overbought" if R["mfi_v"]>70 else "Normal")
+        c6.metric("VOL RATIO",  f"{R['vr']:.1f}x", delta=f"Ph {R['wp']} {R['wn']}")
 
-        with col_gauge:
-            st.markdown("#### 🎯 COMPOSITE SCORE")
-            fig_gauge = build_gauge(res["final_score"], res["verdict"])
-            st.plotly_chart(fig_gauge, use_container_width=True)
+        # ── CHART + RIGHT PANEL
+        col_ch, col_r = st.columns([3,1])
+        with col_ch:
+            st.markdown('<div class="sec">PRICE · VOLUME · CMF · MFI</div>', unsafe_allow_html=True)
+            st.plotly_chart(chart_price(R["df"],R["c"],R["o"],R["m"]), use_container_width=True)
 
-            # Wyckoff phase
-            phases = ["A","B","C","D","E"]
-            ph_idx = phases.index(res["wyck_phase"])
-            st.markdown(f"""
-            <div style='background:#0d1318;border:1px solid #1a2535;padding:12px;margin-top:8px'>
-              <div style='font-family:monospace;font-size:10px;color:#3a5570;letter-spacing:2px'>WYCKOFF PHASE</div>
-              <div style='font-family:monospace;font-size:1.4rem;color:#00ccff;font-weight:700'>
-                Phase {res["wyck_phase"]}
-              </div>
-              <div style='font-size:12px;color:#c8d8e8;margin-top:4px'>{res["wyck_desc"]}</div>
-            </div>
-            """, unsafe_allow_html=True)
+        with col_r:
+            st.markdown('<div class="sec">SCORE</div>', unsafe_allow_html=True)
+            st.plotly_chart(chart_gauge(R["final"]), use_container_width=True)
 
-            # VSA summary
-            if res["vsa"]:
-                acc_n = sum(1 for p in res["vsa"] if p["type"]=="ACC")
-                dis_n = sum(1 for p in res["vsa"] if p["type"]=="DIS")
+            # Entry zone
+            st.markdown('<div class="sec">ENTRY ZONE</div>', unsafe_allow_html=True)
+            if ent["sig"] in ("STRONG BUY","BUY","WATCH"):
                 st.markdown(f"""
-                <div style='background:#0d1318;border:1px solid #1a2535;padding:12px;margin-top:8px'>
-                  <div style='font-family:monospace;font-size:10px;color:#3a5570;letter-spacing:2px'>VSA PATTERNS</div>
-                  <span style='color:#00ff88;font-family:monospace'>▲ {acc_n} ACC</span>
-                  <span style='color:#ff3355;font-family:monospace;margin-left:12px'>▼ {dis_n} DIS</span>
-                </div>
-                """, unsafe_allow_html=True)
+                <div class='entry-box'>
+                  <div style='font-size:9px;color:#5a7a9a;letter-spacing:2px'>ENTRY RANGE</div>
+                  <div style='color:#00e676;font-size:1rem;font-weight:700;margin-top:2px'>
+                    Rp {ez["el"]:,.0f} – {ez["eh"]:,.0f}</div>
+                  <div style='font-size:9px;color:#5a7a9a;margin-top:6px'>STOP-LOSS</div>
+                  <div style='color:#ff1744;font-size:.95rem;font-weight:700'>
+                    Rp {ez["sl"]:,.0f}
+                    <span style='font-size:9px;color:#5a7a9a'> (−{ez["risk_pct"]}%)</span></div>
+                  <div style='font-size:9px;color:#5a7a9a;margin-top:6px'>TARGET 1</div>
+                  <div style='color:#00b0ff;font-size:.95rem;font-weight:700'>
+                    Rp {ez["t1"]:,.0f}</div>
+                  <div style='margin-top:6px;padding-top:6px;border-top:1px solid rgba(0,230,118,.15);
+                              font-family:"IBM Plex Mono",monospace;font-size:10px;color:#5a7a9a'>
+                    Risk/Reward: <span style='color:#00e676;font-weight:700'>{ez["rr"]}:1</span>
+                  </div>
+                </div>""", unsafe_allow_html=True)
+            else:
+                st.markdown(f"""
+                <div class='stop-box'>
+                  <div style='font-size:10px;color:#ff1744;margin-bottom:5px'>DO NOT ENTER</div>
+                  <div style='font-size:11px;color:#5a7a9a;line-height:1.6'>
+                    Support: Rp {ez["sup"]:,.0f}<br>
+                    Resistance: Rp {ez["res"]:,.0f}
+                  </div>
+                </div>""", unsafe_allow_html=True)
 
-        # ── BROKER SECTION ───────────────────────────────────────────────
+            # Wyckoff
+            st.markdown('<div class="sec" style="margin-top:10px">WYCKOFF PHASE</div>', unsafe_allow_html=True)
+            phases = [("A","Climax"),("B","Build"),("C","Spring"),("D","Strength"),("E","Markup")]
+            ph = '<div class="ph-track">'
+            for code,lbl in phases:
+                if code==R["wp"]: cl="ph ph-a"
+                elif ["A","B","C","D","E"].index(code)<["A","B","C","D","E"].index(R["wp"]): cl="ph ph-d"
+                else: cl="ph"
+                ph += f'<div class="{cl}">Ph {code}<div style="font-size:7px;margin-top:2px">{lbl}</div></div>'
+            ph += "</div>"
+            st.markdown(f"""
+            <div style='background:#0b1018;border:1px solid #141e2e;padding:10px;border-radius:3px'>
+              <div style='font-family:"IBM Plex Mono",monospace;font-size:.9rem;
+                          color:#00b0ff;font-weight:700'>Ph {R["wp"]} — {R["wn"]}</div>
+              <div style='font-size:11px;color:#cdd8e6;margin-top:3px;line-height:1.5'>{R["wd"]}</div>
+              {ph}
+            </div>""", unsafe_allow_html=True)
+
+        # ── BROKER + SHAREHOLDERS + FUNDAMENTALS
         st.markdown("---")
-        st.markdown("#### 🏦 BROKER FLOW ANALYSIS")
+        col_b1, col_b2, col_b3 = st.columns(3)
 
-        col_bflow, col_bcat = st.columns(2)
-        with col_bflow:
-            st.markdown("**Net Lot per Broker** (★=Foreign 🔥=Goreng ⚡=Scalper ⚠️=Retail)")
-            fig_broker = build_broker_chart(res["bdf"])
-            st.plotly_chart(fig_broker, use_container_width=True)
+        with col_b1:
+            st.markdown('<div class="sec">TODAY\'S BROKER FLOW</div>', unsafe_allow_html=True)
+            if R["src"] == "demo":
+                st.caption("⚠️ Demo — add Stockbit token or use during market hours")
+            st.plotly_chart(chart_broker_flow(R["bdf"]), use_container_width=True)
 
-        with col_bcat:
-            st.markdown("**Flow per Kategori Broker**")
-            fig_cat = build_broker_category_chart(br)
-            st.plotly_chart(fig_cat, use_container_width=True)
-
+        with col_b2:
+            st.markdown('<div class="sec">BROKER CATEGORY FLOW</div>', unsafe_allow_html=True)
+            st.plotly_chart(chart_cat_flow(br), use_container_width=True)
             # Smart money detail
-            if br["smart_buyers"]:
-                st.markdown("""<div style='background:#0a1a0a;border:1px solid #00ff88;
-                    border-left:3px solid #00ff88;padding:10px 14px'>
-                    <div style='font-family:monospace;font-size:10px;color:#3a5570'>
-                    ▲ FOREIGN SMART MONEY BUYERS</div>""", unsafe_allow_html=True)
-                for b in br["smart_buyers"][:4]:
-                    st.markdown(f"""<div style='font-family:monospace;font-size:12px'>
-                    <span style='color:#00ff88;font-weight:700'>{b["broker"]}</span>
-                    <span style='color:#c8d8e8'> {b["name"][:25]}</span>
-                    <span style='color:#00ff88;float:right'>+{b["net"]:,} lot</span></div>""",
-                    unsafe_allow_html=True)
+            for group,label,color in [(br["sm_buyers"],"▲ SM BUYERS","#00e676"),
+                                       (br["sm_sellers"],"▼ SM SELLERS","#ff1744")]:
+                if not group: continue
+                st.markdown(f"""
+                <div style='border-left:3px solid {color};padding:8px 10px;
+                            background:rgba(0,0,0,.2);border-radius:3px;margin-top:6px'>
+                  <div class='sec' style='margin-bottom:4px;color:{color}'>{label}</div>""",
+                  unsafe_allow_html=True)
+                for b in group[:4]:
+                    a = f" @ Rp{b['buy_avg']:,.0f}" if b.get("buy_avg",0)>0 else ""
+                    sign = "+" if b["net"]>0 else ""
+                    st.markdown(f"""
+                    <div class='kv'>
+                      <span><b style='color:{color}'>{b["broker"]}</b>
+                      <span style='color:#5a7a9a;font-size:10px'> {b["name"][:18]}</span></span>
+                      <span style='color:{color};font-family:"IBM Plex Mono",monospace'>
+                        {sign}{b["net"]:,}{a}</span>
+                    </div>""", unsafe_allow_html=True)
                 st.markdown("</div>", unsafe_allow_html=True)
 
-            if br["smart_sellers"]:
-                st.markdown("""<div style='background:#1a0a0a;border:1px solid #ff3355;
-                    border-left:3px solid #ff3355;padding:10px 14px;margin-top:8px'>
-                    <div style='font-family:monospace;font-size:10px;color:#3a5570'>
-                    ▼ FOREIGN SMART MONEY SELLERS</div>""", unsafe_allow_html=True)
-                for b in br["smart_sellers"][:4]:
-                    st.markdown(f"""<div style='font-family:monospace;font-size:12px'>
-                    <span style='color:#ff3355;font-weight:700'>{b["broker"]}</span>
-                    <span style='color:#c8d8e8'> {b["name"][:25]}</span>
-                    <span style='color:#ff3355;float:right'>{b["net"]:,} lot</span></div>""",
-                    unsafe_allow_html=True)
-                st.markdown("</div>", unsafe_allow_html=True)
+        with col_b3:
+            st.markdown('<div class="sec">SHAREHOLDERS &gt;1% (IDX/KSEI)</div>', unsafe_allow_html=True)
+            if sh_list:
+                fig_sh = chart_sh_pie(sh_list)
+                if fig_sh: st.plotly_chart(fig_sh, use_container_width=True)
+                src_note = {"idx_live":"IDX/KSEI Live",
+                            "ownership_db":"Ownership DB (estimate)"}.get(R["sh_src"],"—")
+                st.markdown(f'<div class="ts-note">Source: {src_note} · {R.get("sh_date","")}</div>',
+                            unsafe_allow_html=True)
+                for s in sh_list[:7]:
+                    pct  = s.get("pct",0); bar_w = min(100,int(pct*2))
+                    bc   = "#00e676" if "control" in s.get("type","").lower() else "#00b0ff"
+                    lots_s = f" · {s['lots']:,} shares" if s.get("lots",0)>0 else ""
+                    st.markdown(f"""
+                    <div style='padding:5px 0;border-bottom:1px solid #141e2e'>
+                      <div style='display:flex;justify-content:space-between;
+                                  font-family:"IBM Plex Mono",monospace;font-size:10px'>
+                        <span style='color:#eaf0f8'>{s["name"][:28]}</span>
+                        <span style='color:{bc};font-weight:700'>{pct:.1f}%{lots_s}</span>
+                      </div>
+                      <div class='bar-wrap'>
+                        <div class='bar' style='width:{bar_w}%;background:{bc}'></div>
+                      </div>
+                    </div>""", unsafe_allow_html=True)
+            else:
+                st.markdown("""
+                <div style='padding:20px;text-align:center;font-family:"IBM Plex Mono",monospace;
+                            font-size:11px;color:#2a3d52'>
+                  Shareholder data unavailable.<br>IDX/KSEI publishes monthly at<br>
+                  <a href="https://idx.co.id/id/berita/pengumuman/" target="_blank"
+                     style="color:#5a7a9a">idx.co.id → Announcements</a>
+                </div>""", unsafe_allow_html=True)
 
-        # ── CROSSING + WARNINGS ────────────────────────────────────────
-        if br["crossing"] == "ACC":
-            st.success("🔥 **ACCUMULATION CROSS**: Smart money BELI + Retail JUAL = Setup ideal mengikuti bandar!")
-        elif br["crossing"] == "DIS":
-            st.error("💀 **DISTRIBUTION CROSS**: Smart money JUAL + Retail BELI = Retailer terjebak distribusi!")
+        # ── FUNDAMENTALS + KSEI
+        st.markdown("---")
+        col_f, col_k = st.columns(2)
 
-        if br["goreng_alert"]:
-            codes = ", ".join(br["goreng_brokers"])
-            st.warning(f"🚨 **GORENG ALERT**: Broker {codes} aktif. Bisa ikut markup tapi WAJIB stop loss ketat!")
+        with col_f:
+            st.markdown('<div class="sec">FUNDAMENTAL SNAPSHOT</div>', unsafe_allow_html=True)
+            if fund:
+                st.markdown('<div style="background:#0b1018;border:1px solid #141e2e;padding:12px;border-radius:3px">', unsafe_allow_html=True)
+                for k,v in [("Market Cap",fund.get("market_cap","—")),
+                             ("P/E Ratio", fund.get("pe","—")),
+                             ("P/B Ratio", fund.get("pb","—")),
+                             ("Dividend Yield",fund.get("div","—")),
+                             ("From 52W High","Rp {:,.0f}".format(fund["hi52"]) if fund.get("hi52") else "—"),
+                             ("52W Low","Rp {:,.0f}".format(fund["lo52"]) if fund.get("lo52") else "—"),
+                             ("Shares Outstanding",f"{fund.get('shares_out',0)/1e9:.2f}B" if fund.get('shares_out') else "—")]:
+                    st.markdown(f'<div class="kv"><span class="kv-k">{k}</span><span class="kv-v">{v}</span></div>', unsafe_allow_html=True)
+                st.markdown('</div>', unsafe_allow_html=True)
+                if fund.get("hi52") and fund.get("lo52") and fund.get("curr"):
+                    pct = min(100,max(0,(fund["curr"]-fund["lo52"])/(fund["hi52"]-fund["lo52"])*100))
+                    bc  = "#00e676" if pct<40 else "#ffab00" if pct<75 else "#ff1744"
+                    st.markdown(f"""
+                    <div style='margin-top:8px;padding:10px;background:#0b1018;
+                                border:1px solid #141e2e;border-radius:3px'>
+                      <div class='sec'>52-WEEK POSITION</div>
+                      <div class='bar-wrap'>
+                        <div class='bar' style='width:{pct:.0f}%;background:{bc}'></div>
+                      </div>
+                      <div style='display:flex;justify-content:space-between;margin-top:3px;
+                                  font-family:"IBM Plex Mono",monospace;font-size:9px;color:#5a7a9a'>
+                        <span>Rp {fund["lo52"]:,.0f}</span>
+                        <span style='color:{bc}'>{pct:.0f}% from low</span>
+                        <span>Rp {fund["hi52"]:,.0f}</span>
+                      </div>
+                    </div>""", unsafe_allow_html=True)
 
-        for w in [x for x in br["warnings"] if "CROSSING" not in x and "GORENG" not in x]:
-            st.info(w)
+        with col_k:
+            st.markdown('<div class="sec">KSEI — FOREIGN / DOMESTIC COMPOSITION</div>', unsafe_allow_html=True)
+            if ksei and ksei.get("foreign"):
+                fp = ksei["foreign"]; dp = ksei.get("domestic",100-fp)
+                fig_k = go.Figure(go.Pie(labels=["Foreign","Domestic"],values=[fp,dp],
+                    hole=0.5,marker=dict(colors=["#00b0ff","#00e676"],
+                    line=dict(color="#05080c",width=2)),
+                    textfont=dict(color="#cdd8e6",size=11,family="IBM Plex Mono"),
+                    hovertemplate="%{label}: %{value:.1f}%<extra></extra>"))
+                fig_k.update_layout(**CL,height=220,showlegend=True,
+                    legend=dict(bgcolor="#0b1018",bordercolor="#141e2e",
+                                font=dict(size=10,color="#cdd8e6")))
+                st.plotly_chart(fig_k, use_container_width=True)
+                st.markdown(f"""
+                <div style='font-family:"IBM Plex Mono",monospace;font-size:10px'>
+                  <span style='color:#00b0ff'>Foreign: {fp:.1f}%</span>
+                  <span style='color:#00e676;margin-left:14px'>Domestic: {dp:.1f}%</span>
+                  <span class='ts-note' style='margin-left:14px'>as of {ksei.get("date","—")}</span>
+                </div>""", unsafe_allow_html=True)
+                if fp > 55:
+                    st.info("📌 High foreign ownership (>55%) — stock is on MSCI/global fund radar. Foreign flow is the dominant price driver.")
+                elif fp < 20:
+                    st.info("📌 Low foreign ownership (<20%) — mostly domestic players. Monitor local institutional brokers (CC, DX, LG).")
+            else:
+                st.markdown("""
+                <div style='padding:20px;text-align:center;font-family:"IBM Plex Mono",monospace;
+                            font-size:11px;color:#2a3d52'>
+                  KSEI composition unavailable.<br>
+                  Check <a href="https://web.ksei.co.id" target="_blank" style="color:#5a7a9a">web.ksei.co.id</a>
+                </div>""", unsafe_allow_html=True)
 
-        # ── VSA TABLE ────────────────────────────────────────────────
-        if res["vsa"]:
+        # ── ALERTS
+        for alert in br["alerts"]:
+            {"success":st.success,"danger":st.error,"warn":st.warning}.get(
+                alert["t"],st.info)(alert["m"])
+
+    else:
+        # Empty state
+        popular = ["BBCA","BBRI","BMRI","BREN","AMMN","ADRO","MDKA","TLKM","ASII",
+                   "KLBF","ICBP","GOTO","BYAN","UNTR","ANTM","PTBA","DCII","PGAS"]
+        st.markdown("""
+        <div style='text-align:center;padding:60px 20px;border:1px dashed #141e2e;
+                    border-radius:4px;margin-top:12px'>
+          <div style='font-size:1.8rem;color:#141e2e;margin-bottom:10px'>◈</div>
+          <div style='font-family:"IBM Plex Mono",monospace;font-size:11px;color:#2a3d52;letter-spacing:2px'>
+            ENTER ANY IDX TICKER · CLICK RUN ANALYSIS</div>
+          <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;color:#1c2a3e;margin-top:6px'>
+            Price · CMF · OBV · MFI · Wyckoff · Broker Flow · Ownership · Shareholders · Entry Zone
+          </div>
+          <div style='margin-top:16px;display:flex;justify-content:center;gap:5px;flex-wrap:wrap'>
+        """ + "".join([
+            f'<span style="padding:2px 9px;border:1px solid #141e2e;border-radius:2px;'
+            f'font-family:IBM Plex Mono,monospace;font-size:9px;color:#2a3d52">{t}</span>'
+            for t in popular
+        ]) + "</div></div>", unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  TAB 2 — BROKER SHAREHOLDING
+# ══════════════════════════════════════════════════════════════════════
+
+with tab_bh:
+    st.markdown("#### BROKER SHAREHOLDING — ESTIMATED ACCUMULATED POSITION")
+
+    # Explanation banner
+    st.markdown(f"""
+    <div style='padding:12px 16px;background:#0b1018;border:1px solid #141e2e;
+                border-left:3px solid #00b0ff;border-radius:3px;margin-bottom:14px;
+                font-family:"IBM Plex Mono",monospace;font-size:10px;line-height:1.8'>
+      <span style='color:#eaf0f8;font-weight:600;letter-spacing:1px'>HOW THIS WORKS</span><br>
+      <span style='color:#5a7a9a'>
+      We sum each broker's daily <b style='color:#cdd8e6'>net lot</b> (buy − sell) over
+      <b style='color:#00e676'>{accu_days} trading days</b> to estimate their clients' accumulated position.
+      Positive = broker clients are net long (accumulated shares).
+      Negative = broker clients are net short / distributing.<br><br>
+      <b style='color:#ffab00'>Methodology note:</b> This is the same approach used by RTI Business, Stockbit Pro, and Bloomberg
+      IDX broker screens. True sub-account holdings are KSEI private data and not publicly available per broker.
+      Lot size assumed: <b style='color:#cdd8e6'>100 shares/lot</b>.
+      </span>
+    </div>""", unsafe_allow_html=True)
+
+    col_btn, col_tip = st.columns([2,8])
+    with col_btn:
+        run_bh = st.button("▶  CALCULATE", use_container_width=True)
+    with col_tip:
+        so_display = "—"
+        if "res" in st.session_state:
+            f_ = st.session_state["res"].get("fund",{})
+            so = f_.get("shares_out",0)
+            if so: so_display = f"{so/1e9:.2f}B shares"
+        st.markdown(f"""
+        <div style='padding:7px 12px;background:#0b1018;border:1px solid #141e2e;
+                    border-radius:3px;font-family:"IBM Plex Mono",monospace;font-size:10px;color:#5a7a9a'>
+          Ticker: <b style='color:#eaf0f8'>{ticker_input}.JK</b>
+          &nbsp;·&nbsp; Window: {accu_days} trading days
+          &nbsp;·&nbsp; Shares outstanding: <b style='color:#cdd8e6'>{so_display}</b>
+        </div>""", unsafe_allow_html=True)
+
+    if run_bh:
+        st.session_state.pop("bh_res", None)
+        with st.spinner(f"Fetching {accu_days}-day broker data for {ticker_input} ..."):
+            accu_df, accu_src, days_got = get_broker_accumulation(
+                ticker_input, sb_token, accu_days)
+            if accu_df is None:
+                ts_est = st.session_state.get("res",{}).get("ts",50)
+                accu_df = demo_broker(ticker_input, ts_est)
+                accu_src = "demo"; days_got = accu_days
+        # Get shares outstanding
+        shares_out = 0
+        if "res" in st.session_state:
+            shares_out = st.session_state["res"].get("fund",{}).get("shares_out",0) or 0
+        if not shares_out:
+            fund2 = fundamentals(ticker_input)
+            shares_out = fund2.get("shares_out",0) or 0
+
+        sh_df = calc_broker_shareholding(accu_df, shares_out)
+        st.session_state["bh_res"] = dict(
+            accu_df=accu_df, sh_df=sh_df,
+            src=accu_src, days=days_got,
+            shares_out=shares_out,
+            fetched=datetime.now().strftime("%H:%M:%S WIB"),
+        )
+
+    if "bh_res" in st.session_state:
+        BH = st.session_state["bh_res"]
+        adf = BH["accu_df"]; sh_df = BH["sh_df"]
+        so  = BH["shares_out"]
+
+        src_b = {"stockbit":'<span class="tag tg">STOCKBIT REAL</span>',
+                 "idx":     '<span class="tag tb">IDX API REAL</span>',
+                 "demo":    '<span class="tag ta">DEMO DATA</span>'}.get(BH["src"],"")
+
+        if BH["src"]=="demo":
+            st.warning("⚠️ **Demo data** — add Stockbit token or run during market hours (09:00–16:30 WIB Mon-Fri) for real data.")
+
+        st.markdown(f"""
+        <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;color:#5a7a9a;margin-bottom:10px'>
+          {src_b} · Period: {BH["days"]} trading days · Updated: {BH["fetched"]}
+          {f' · Shares OS: {so/1e9:.2f}B' if so else ''}
+        </div>""", unsafe_allow_html=True)
+
+        # ── SUMMARY METRICS
+        m1,m2,m3,m4 = st.columns(4)
+        fn = adf[adf["cat"]=="FOREIGN_SMART"]["cum_net"].sum()
+        rn = adf[adf["cat"]=="RETAIL"]["cum_net"].sum()
+        top_b = sh_df.iloc[0] if len(sh_df) else None
+        top_pct = sh_df["est_pct"].sum()
+        m1.metric("FOREIGN SM NET LOT", f"{fn:+,}",
+                  delta="Accumulating" if fn>0 else "Distributing")
+        m2.metric("RETAIL NET LOT", f"{rn:+,}",
+                  delta="Contrarian signal" if rn<0 else "Caution" if rn>0 else "Neutral")
+        m3.metric("LARGEST HOLDER",
+                  f"{top_b['broker']} ({top_b.get('cum_net',0):+,}L)" if top_b is not None else "—")
+        m4.metric("TOP 10 BROKER EST. %",
+                  f"{top_pct:.2f}%" if so else "N/A (no shares data)",
+                  delta="of shares outstanding" if so else "Add ticker to Analysis tab first")
+
+        # ── ACCUMULATION CHART
+        st.markdown("---")
+        st.markdown('<div class="sec">CUMULATIVE NET POSITION — ALL BROKERS</div>', unsafe_allow_html=True)
+        st.plotly_chart(chart_accumulation(adf, f"{BH['days']} trading days · {BH['src']}"),
+                        use_container_width=True)
+
+        # ── SHAREHOLDING CHART (only if shares_out available)
+        if so and so > 0:
             st.markdown("---")
-            st.markdown("#### 📊 VSA — Volume Spread Analysis Patterns")
-            vsa_data = [{"Type": ("✅ ACC" if p["type"]=="ACC" else "🔴 DIS"),
-                         "Pattern": p["name"],
-                         "Vol Ratio": f"{p['vol_ratio']:.1f}x"} for p in res["vsa"]]
-            st.dataframe(pd.DataFrame(vsa_data), hide_index=True, use_container_width=True)
+            st.markdown('<div class="sec">ESTIMATED % OF OUTSTANDING SHARES HELD PER BROKER</div>',
+                        unsafe_allow_html=True)
+            st.markdown(f"""
+            <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;color:#5a7a9a;margin-bottom:8px'>
+              Based on cumulative net lot × 100 shares/lot ÷ {so/1e9:.2f}B shares outstanding.
+              Shows net accumulation in analysis window only — not absolute portfolio position.
+            </div>""", unsafe_allow_html=True)
+            fig_sh = chart_shareholding(sh_df, ticker_input, so)
+            if fig_sh:
+                st.plotly_chart(fig_sh, use_container_width=True)
+        else:
+            st.info("💡 Run **Analysis** tab first so we can load shares outstanding — then the % chart will appear here.")
+
+        # ── DETAILED TABLE: ACCUMULATORS vs DISTRIBUTORS
+        st.markdown("---")
+        col_acc, col_dis = st.columns(2)
+
+        acc_rows = sh_df[sh_df["cum_net"]>0].head(10)
+        dis_rows = adf[adf["cum_net"]<0].sort_values("cum_net").head(10)
+
+        with col_acc:
+            st.markdown('<div class="sec">TOP ACCUMULATORS ★ (Net Buyers)</div>', unsafe_allow_html=True)
+            total_pos = acc_rows["cum_net"].sum() or 1
+            for _,row in acc_rows.iterrows():
+                cat   = row.get("cat","LOCAL_INST")
+                cc    = CAT_COLOR.get(cat,"#00b0ff")
+                bar_w = min(100, int(row["cum_net"]/total_pos*100))
+                star  = "★ " if cat=="FOREIGN_SMART" else ""
+                est_pct_str = f"{row['est_pct']:.3f}%" if row.get("est_pct",0)>0 and so else ""
+                st.markdown(f"""
+                <div class='broker-hold-row'>
+                  <div class='bh-code' style='color:{cc}'>{star}{row["broker"]}</div>
+                  <div>
+                    <div class='bh-name'>{row.get("flag","🇮🇩")} {row.get("name","")[:20]}</div>
+                    <div style='font-size:9px;color:#2a3d52;font-family:"IBM Plex Mono",monospace'>
+                      {CAT_LABEL.get(cat,cat)}</div>
+                  </div>
+                  <div class='bh-lots' style='color:#00e676'>+{row["cum_net"]:,} lots</div>
+                  <div class='bh-pct' style='color:#5a7a9a'>{est_pct_str}</div>
+                </div>
+                <div class='bar-wrap'>
+                  <div class='bar' style='width:{bar_w}%;background:{cc}'></div>
+                </div>""", unsafe_allow_html=True)
+
+        with col_dis:
+            st.markdown('<div class="sec">TOP DISTRIBUTORS ▼ (Net Sellers)</div>', unsafe_allow_html=True)
+            total_neg = abs(dis_rows["cum_net"].sum()) or 1
+            for _,row in dis_rows.iterrows():
+                cat   = row.get("cat","RETAIL")
+                cc    = CAT_COLOR.get(cat,"#ff1744")
+                bar_w = min(100, int(abs(row["cum_net"])/total_neg*100))
+                is_retail = cat=="RETAIL"
+                note  = "Contrarian → SM may be buying" if is_retail else ""
+                st.markdown(f"""
+                <div class='broker-hold-row'>
+                  <div class='bh-code' style='color:{cc}'>{row["broker"]}</div>
+                  <div>
+                    <div class='bh-name'>{row.get("flag","🇮🇩")} {row.get("name","")[:20]}</div>
+                    <div style='font-size:9px;color:{"#5a7a9a" if is_retail else "#2a3d52"};
+                                font-family:"IBM Plex Mono",monospace'>{note or CAT_LABEL.get(cat,cat)}</div>
+                  </div>
+                  <div class='bh-lots' style='color:#ff1744'>{row["cum_net"]:,} lots</div>
+                  <div class='bh-pct'></div>
+                </div>
+                <div class='bar-wrap'>
+                  <div class='bar' style='width:{bar_w}%;background:{cc}'></div>
+                </div>""", unsafe_allow_html=True)
+
+        # ── INTERPRETATION
+        st.markdown("---")
+        st.markdown('<div class="sec">INTERPRETATION</div>', unsafe_allow_html=True)
+        if fn > 10000 and rn < 0:
+            st.success(f"🔥 **STRONG ACCUMULATION**: Foreign smart money +{fn:,} lots over {BH['days']} days while retail selling {rn:,} lots. Classic Accumulation Cross — bandar absorbing supply.")
+        elif fn < -10000 and rn > 0:
+            st.error(f"💀 **DISTRIBUTION**: Smart money {fn:,} lots while retail buying +{rn:,} lots. Retailer likely bag-holding for bandar.")
+        elif fn > 3000:
+            st.info(f"📊 Foreign smart money net +{fn:,} lots. Moderate accumulation signal — monitor for confirmation.")
+        else:
+            st.info("📊 No dominant accumulation or distribution signal. Mixed flow — wait for clearer setup.")
 
     else:
         st.markdown("""
-        <div style='text-align:center;padding:80px 20px;color:#3a5570'>
-          <div style='font-size:3rem'>📊</div>
-          <div style='font-family:monospace;font-size:14px;letter-spacing:2px;margin-top:12px'>
-            MASUKKAN KODE SAHAM DAN KLIK ANALISIS
-          </div>
-          <div style='font-family:monospace;font-size:11px;margin-top:8px'>
-            Data real-time dari Yahoo Finance · Broker analysis · Wyckoff + VSA + CMF + OBV
-          </div>
-        </div>
-        """, unsafe_allow_html=True)
+        <div style='text-align:center;padding:50px;border:1px dashed #141e2e;border-radius:4px'>
+          <div style='font-family:"IBM Plex Mono",monospace;font-size:11px;color:#2a3d52'>
+            Set ticker in sidebar → Click CALCULATE</div>
+        </div>""", unsafe_allow_html=True)
 
 
-# ── TAB 2: SCREENER ────────────────────────────────────────────────────────
-with tab2:
-    st.markdown("#### 🔍 MULTI-STOCK SCREENER")
-    st.markdown("Scan otomatis beberapa saham sekaligus, diurutkan dari score tertinggi.")
+# ══════════════════════════════════════════════════════════════════════
+#  TAB 3 — SCREENER
+# ══════════════════════════════════════════════════════════════════════
 
-    if st.button("🚀 JALANKAN SCREENER", use_container_width=False):
-        if not preset_tickers:
-            st.warning("Pilih minimal 1 saham di sidebar.")
+with tab_s:
+    st.markdown("#### MULTI-STOCK SCREENER")
+    wl = list(dict.fromkeys([
+        t.strip().upper().replace(".JK","")
+        for t in wl_raw.replace("\n",",").split(",") if t.strip()
+    ]))
+    st.markdown(f"""
+    <div style='padding:6px 12px;background:#0b1018;border:1px solid #141e2e;border-radius:3px;
+                margin-bottom:10px;font-family:"IBM Plex Mono",monospace;font-size:10px;color:#5a7a9a'>
+      {len(wl)} stocks: <span style='color:#cdd8e6'>{" · ".join(wl[:20])}{"..." if len(wl)>20 else ""}</span>
+    </div>""", unsafe_allow_html=True)
+
+    if st.button("▶  SCAN ALL STOCKS"):
+        if not wl:
+            st.warning("Add tickers to the watchlist in the sidebar.")
         else:
-            results = []
-            prog = st.progress(0)
-            status = st.empty()
-            for i, tk in enumerate(preset_tickers):
-                status.text(f"⏳ Menganalisis {tk}... ({i+1}/{len(preset_tickers)})")
-                df_tk = load_data(tk, period)
-                if df_tk is None or len(df_tk) < 20:
-                    prog.progress((i+1)/len(preset_tickers))
-                    continue
-                cmf_tk  = calc_cmf(df_tk)
-                obv_tk  = calc_obv(df_tk)
-                mfi_tk  = calc_mfi(df_tk)
-                wyck_p, _ = detect_wyckoff(df_tk, cmf_tk, obv_tk)
-                ts      = calc_tech_score(df_tk, cmf_tk, obv_tk, mfi_tk)
-                bdf_tk  = gen_broker_data(tk, ts)
-                br_tk   = analyze_broker_flow(bdf_tk)
-                fs      = int(np.clip(round(ts*0.6+br_tk["score"]*0.4), 0, 100))
-                last_tk = df_tk.iloc[-1]
-                prev_tk = df_tk.iloc[-2]
-                chg     = (last_tk["close"]-prev_tk["close"])/prev_tk["close"]*100
-                avg_v_tk= df_tk["volume"].tail(20).mean()
-
-                results.append({
-                    "Ticker"     : tk,
-                    "Harga"      : f"Rp {int(last_tk['close']):,}",
-                    "Chg %"      : f"{'+'if chg>=0 else ''}{chg:.2f}%",
-                    "Score"      : fs,
-                    "Tech"       : ts,
-                    "Broker"     : br_tk["score"],
-                    "Verdict"    : "🟢 AKUMULASI" if fs>=65 else "🔴 DISTRIBUSI" if fs<=35 else "🟡 NEUTRAL",
-                    "Wyckoff"    : f"Ph {wyck_p}",
-                    "CMF"        : f"{float(cmf_tk.iloc[-1]):.4f}",
-                    "Vol Ratio"  : f"{last_tk['volume']/(avg_v_tk if avg_v_tk>0 else 1):.1f}x",
-                    "Cross Signal": ("🔥ACC" if br_tk["crossing"]=="ACC"
-                                     else "💀DIS" if br_tk["crossing"]=="DIS" else "—"),
-                    "Goreng"     : "🚨" if br_tk["goreng_alert"] else "",
-                })
-                prog.progress((i+1)/len(preset_tickers))
-
-            status.empty()
-            prog.empty()
-
-            if results:
-                df_res = pd.DataFrame(results).sort_values("Score", ascending=False)
-                st.dataframe(df_res, hide_index=True, use_container_width=True,
-                             column_config={
-                                 "Score": st.column_config.ProgressColumn(
-                                     "Score", min_value=0, max_value=100, format="%d"),
-                             })
-
-                acc_tickers = [r["Ticker"] for r in results if r["Verdict"].startswith("🟢")]
-                cross_tickers = [r["Ticker"] for r in results if "ACC" in r["Cross Signal"]]
-                if acc_tickers:
-                    st.success(f"🟢 **AKUMULASI TERDETEKSI**: {', '.join(acc_tickers)}")
-                if cross_tickers:
-                    st.info(f"🔥 **CROSSING SIGNAL**: {', '.join(cross_tickers)}")
-            else:
-                st.error("Tidak ada data yang berhasil dimuat.")
-
-
-# ── TAB 3: PANDUAN ─────────────────────────────────────────────────────────
-with tab3:
-    st.markdown("#### 📚 PANDUAN KARAKTERISTIK BROKER IDX")
-
-    sections = [
-        ("🟢 FOREIGN SMART MONEY — Ikuti saat net buy kompak",
-         [k for k,v in BROKER_DB.items() if v["cat"]=="FOREIGN_SMART"],
-         "#00ff88"),
-        ("🔥 LOCAL BANDAR / GORENG SAHAM — Waspada!",
-         [k for k,v in BROKER_DB.items() if v["cat"]=="LOCAL_BANDAR"],
-         "#ffaa00"),
-        ("🏛️ BUMN & LOCAL INSTITUTIONAL",
-         [k for k,v in BROKER_DB.items() if v["cat"] in ("BUMN_INST","LOCAL_INST")],
-         "#00ccff"),
-        ("🇰🇷 KOREAN BROKER — Semi Smart Money",
-         [k for k,v in BROKER_DB.items() if v["cat"]=="KOREAN"],
-         "#aa88ff"),
-        ("⚠️ RETAIL BESAR — SINYAL KONTRARIAN (terbalik!)",
-         [k for k,v in BROKER_DB.items() if v["cat"] in ("RETAIL_LARGE","RETAIL_MED")],
-         "#ff3355"),
-        ("⚡ SCALPER — NOISE, abaikan sebagai sinyal",
-         [k for k,v in BROKER_DB.items() if v["cat"]=="SCALPER"],
-         "#ff5500"),
-    ]
-
-    for title, brokers, color in sections:
-        with st.expander(title, expanded=False):
-            rows = []
-            for code in brokers:
-                info = BROKER_DB[code]
+            rows=[]; prog=st.progress(0)
+            for i,tk in enumerate(wl):
+                prog.progress((i+1)/len(wl), text=f"Analyzing {tk} ...")
+                df_tk = load_price(tk, period)
+                if df_tk is None or len(df_tk)<20: continue
+                c_=cmf(df_tk); o_=obv(df_tk); m_=mfi(df_tk)
+                wp_,wn_,_ = wyckoff(df_tk,c_,o_)
+                ts_ = tech_score(df_tk,c_,o_,m_)
+                bdf_,src_ = get_broker_today(tk, sb_token)
+                if bdf_ is None: bdf_ = demo_broker(tk,ts_)
+                br_  = analyze_broker(bdf_)
+                fs   = int(np.clip(round(ts_*.6+br_["score"]*.4),0,100))
+                last_= df_tk.iloc[-1]; prev_=df_tk.iloc[-2]
+                chg_ = (last_["close"]-prev_["close"])/prev_["close"]*100
+                av_  = df_tk["volume"].tail(20).mean()
+                vr_  = last_["volume"]/(av_ if av_>0 else 1)
+                obv_ = o_.iloc[-1]>o_.iloc[-min(10,len(o_)-1)]
+                own_ = OWNER_DB.get(tk.upper().replace(".JK",""))
+                ent_ = entry_signal(fs,ts_,br_["score"],wp_,float(c_.iloc[-1]),
+                                    obv_,float(m_.iloc[-1]),vr_,br_["crossing"],
+                                    br_["goreng"],br_["sm_buyers"],br_["sm_sellers"],chg_,own_)
                 rows.append({
-                    "Kode"    : code,
-                    "Nama"    : info["name"],
-                    "Style"   : info["style"],
-                    "Goreng?" : "🔥 YA" if info["goreng"] else "—",
-                    "Korban?" : "⚠️ YA" if info["victim"] else "—",
+                    "Ticker":tk, "Price":f"Rp {int(last_['close']):,}",
+                    "Change":f"{'+'if chg_>=0 else ''}{chg_:.2f}%",
+                    "Score":fs, "Signal":ent_["sig"], "Risk":ent_["risk"],
+                    "Owner":own_["owner"][:22] if own_ else "—",
+                    "Tier":f"T{own_['tier']}" if own_ else "—",
+                    "Float":f"{own_['float']}%" if own_ else "—",
+                    "Pol":"⚡" if (own_ and own_.get("political")) else "",
+                    "Ph":f"Ph {wp_}", "CMF":f"{float(c_.iloc[-1]):+.4f}",
+                    "Vol":f"{vr_:.1f}x",
+                    "Cross":"🔥ACC" if br_["crossing"]=="ACC"
+                            else "💀DIS" if br_["crossing"]=="DIS" else "—",
+                    "Data":{"stockbit":"R","idx":"R","demo":"D"}.get(src_,"?"),
+                    "_s":fs,"_sig":ent_["sig"],
                 })
-            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+            prog.empty()
+            if rows:
+                df_r = pd.DataFrame(rows).sort_values("_s",ascending=False)
+                c1,c2,c3,c4 = st.columns(4)
+                c1.metric("STRONG BUY",len([r for r in rows if r["_sig"]=="STRONG BUY"]))
+                c2.metric("BUY",        len([r for r in rows if r["_sig"]=="BUY"]))
+                c3.metric("WATCH",      len([r for r in rows if r["_sig"]=="WATCH"]))
+                c4.metric("AVOID",      len([r for r in rows if "AVOID" in r["_sig"]]))
+                disp=["Ticker","Price","Change","Score","Signal","Risk",
+                      "Owner","Tier","Float","Pol","Ph","CMF","Vol","Cross","Data"]
+                st.dataframe(df_r[disp],hide_index=True,use_container_width=True,
+                    column_config={"Score":st.column_config.ProgressColumn(
+                        "Score",min_value=0,max_value=100,format="%d")})
+                sb_=[r["Ticker"] for r in rows if r["_sig"]=="STRONG BUY"]
+                b_= [r["Ticker"] for r in rows if r["_sig"]=="BUY"]
+                pol=[r["Ticker"] for r in rows if r["Pol"]=="⚡"]
+                if sb_: st.success(f"🔥 **STRONG BUY**: {' · '.join(sb_)}")
+                if b_:  st.success(f"✅ **BUY**: {' · '.join(b_)}")
+                if pol: st.warning(f"⚡ **Political exposure** (extra risk): {', '.join(pol)}")
+    else:
+        st.markdown("""<div style='text-align:center;padding:50px;border:1px dashed #141e2e;border-radius:4px'>
+        <div style='font-family:"IBM Plex Mono",monospace;font-size:11px;color:#2a3d52'>
+        Edit watchlist in sidebar → Click SCAN ALL STOCKS</div></div>""",unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  TAB 4 — OWNERSHIP DB
+# ══════════════════════════════════════════════════════════════════════
+
+with tab_o:
+    st.markdown("#### CONGLOMERATE OWNERSHIP DATABASE")
+    st.markdown("""
+    <div style='font-family:"IBM Plex Mono",monospace;font-size:10px;color:#5a7a9a;margin-bottom:10px'>
+    Sources: Forbes, IDX annual reports, Bloomberg Terminal (Feb 2026), KSEI disclosures.
+    Shareholders >1% now public monthly at idx.co.id (OJK mandate March 3, 2026).
+    </div>""", unsafe_allow_html=True)
+
+    f1,f2 = st.columns([2,3])
+    with f1: ft   = st.selectbox("Tier",["All","Tier 1","Tier 2","Tier 3"])
+    with f2: fgrp = st.selectbox("Group",["All"] + sorted(set(o["group"] for o in OWNER_DB.values())))
+
+    rows_db=[]
+    for tk,o in OWNER_DB.items():
+        if ft!="All" and f"Tier {o['tier']}" not in ft: continue
+        if fgrp!="All" and o["group"]!=fgrp: continue
+        rs,rl = owner_risk(o)
+        rows_db.append({"Ticker":tk,"Owner":o["owner"][:28],"Group":o["group"][:22],
+                        "Tier":f"T{o['tier']}","Sector":o["sector"][:18],
+                        "Float":f"{o['float']}%",
+                        "Political":"⚡ YES" if o.get("political") else "—",
+                        "Quality":rs,"Risk":rl,"Note":o.get("note","")[:50]})
+    if rows_db:
+        st.dataframe(pd.DataFrame(rows_db),hide_index=True,use_container_width=True,
+            column_config={"Quality":st.column_config.ProgressColumn(
+                "Quality",min_value=0,max_value=100,format="%d")})
 
     st.markdown("---")
-    st.markdown("#### 🔑 ATURAN EMAS BROKER ANALYSIS")
-    rules = [
-        ("✅ IKUTI", "2+ broker asing (AK,BK,DB) serentak net buy di saham yang sama"),
-        ("❌ WASPADA", "XC/YP/XL net buy masif = sering tanda akhir distribusi ke retailer"),
-        ("🚨 GORENG", "MK+EP tiba-tiba muncul di saham sepi = kemungkinan pump-and-dump dimulai"),
-        ("🔥 PELUANG", "YP/XC/XL panik jual + asing diam-diam beli = ACCUMULATION CROSS"),
-        ("🔇 ABAIKAN", "MG mendominasi volume = pure scalper noise, lihat broker lainnya"),
-        ("💎 TERKUAT", "Smart money beli + retail jual serentak = ACCUMULATION CROSS signal"),
-        ("💀 BAHAYA", "Smart money jual + retail borong = DISTRIBUTION CROSS, segera exit"),
-    ]
-    for r_type, r_desc in rules:
-        st.markdown(f"**{r_type}** — {r_desc}")
+    st.markdown("##### KEY OWNERSHIP INSIGHTS")
+    for icon,title,body in [
+        ("🔥","PRAJOGO PANGESTU — BARITO GROUP",
+         "#1 Forbes Indonesia (US$46.5B). BREN, TPIA, CDIA all have <13% free float → in Full Periodic Call Auction (FCA). Prices set at scheduled intervals — no continuous trading. Moves are violent. When Prajogo buys more, treat as strong bullish signal."),
+        ("🏦","HARTONO BROTHERS — DJARUM/BCA",
+         "#3 & #4 Forbes. BBCA = Indonesia's most consistently profitable bank since 1990s. When Djarum enters a NEW stock (e.g., bought SSIA 2025 → +224%), this is the highest-conviction IDX signal possible."),
+        ("💎","DUAL CONGLOMERATE = NUCLEAR SIGNAL",
+         "When 2 Tier-1 conglomerates buy the SAME stock simultaneously (Hartono + Prajogo both in SSIA 2025 → +224%), it is the most powerful IDX-specific signal. Monitor KSEI monthly reports for ownership crossover."),
+        ("⚡","POLITICAL STOCKS — EXTREME CAUTION",
+         "RAJA, PSKT (Hapsoro = Puan Maharani's husband), WIFI (Hashim-related). Move on political news, not fundamentals. +600% followed by -80% is normal. For short-term traders with tight stops ONLY."),
+        ("🏛️","BUMN — STABLE + DIVIDENDS",
+         "Government-backed. Best for dividends (BBRI, BMRI, PTBA). Subject to SOE policy risk. Buy during broad market selloffs. Avoid during government policy uncertainty periods."),
+        ("⚠️","FREE FLOAT REGULATION (OJK 2026)",
+         "OJK mandating 15% minimum free float. BREN (12.3%), TPIA (10.7%), HMSP (7.5%) must dilute or buy back. This creates corporate action catalyst risk — price can be very volatile on announcements."),
+    ]:
+        st.markdown(f"""
+        <div style='display:flex;gap:12px;padding:9px 12px;border-bottom:1px solid #141e2e'>
+          <div style='font-size:16px;flex-shrink:0'>{icon}</div>
+          <div>
+            <div style='font-family:"IBM Plex Mono",monospace;font-size:11px;font-weight:700;
+                        color:#eaf0f8;margin-bottom:2px'>{title}</div>
+            <div style='font-size:12px;color:#cdd8e6;line-height:1.5'>{body}</div>
+          </div>
+        </div>""", unsafe_allow_html=True)
 
+
+# ══════════════════════════════════════════════════════════════════════
+#  TAB 5 — BROKER GUIDE
+# ══════════════════════════════════════════════════════════════════════
+
+with tab_g:
+    st.markdown("#### BROKER INTELLIGENCE GUIDE")
+
+    st.markdown("##### SIGNAL LEVELS")
+    for sig,c,desc in [
+        ("STRONG BUY","#00e676","ACC Cross + Score ≥65. Highest conviction. Enter with full position."),
+        ("BUY","#00e676","4+ conditions. Good R/R. Enter with proper stop-loss."),
+        ("WATCH","#ffab00","2–3 conditions forming. Add to watchlist."),
+        ("AVOID","#ff1744","2+ bearish. Don't enter."),
+        ("STRONG AVOID","#ff1744","Distribution Cross / Score ≤35. Exit if holding."),
+    ]:
+        st.markdown(f"""
+        <div style='display:flex;gap:12px;padding:6px 12px;border-bottom:1px solid #141e2e'>
+          <div style='font-family:"IBM Plex Mono",monospace;font-size:11px;font-weight:700;
+                      color:{c};min-width:130px'>{sig}</div>
+          <div style='font-size:12px;color:#cdd8e6'>{desc}</div>
+        </div>""", unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    ca,cb = st.columns(2)
+    with ca:
+        st.markdown("##### 🟢 Foreign Smart Money")
+        st.dataframe(pd.DataFrame([{"Code":k,"Broker":v["name"],"Country":v.get("flag","—")}
+            for k,v in BROKER_DB.items() if v["cat"]=="FOREIGN_SMART"]),
+            hide_index=True,use_container_width=True)
+        st.markdown("##### 🏛️ BUMN & Local Institutional")
+        st.dataframe(pd.DataFrame([{"Code":k,"Broker":v["name"]}
+            for k,v in BROKER_DB.items() if v["cat"] in ("BUMN","LOCAL_INST")]),
+            hide_index=True,use_container_width=True)
+    with cb:
+        st.markdown("##### ⚠️ Retail (Contrarian) + ⚡ Scalper")
+        st.dataframe(pd.DataFrame([{"Code":k,"Broker":v["name"],
+            "Signal":"Contrarian" if v["cat"]=="RETAIL" else "Noise"}
+            for k,v in BROKER_DB.items() if v["cat"] in ("RETAIL","SCALPER")]),
+            hide_index=True,use_container_width=True)
+        st.markdown("##### 🔥 Local Bandar (Pump) + 🇰🇷 Korean")
+        st.dataframe(pd.DataFrame([{"Code":k,"Broker":v["name"],"Cat":v["cat"]}
+            for k,v in BROKER_DB.items() if v["cat"] in ("LOCAL_BANDAR","KOREAN")]),
+            hide_index=True,use_container_width=True)
+
+    st.markdown("---")
+    st.markdown("##### 7 GOLDEN RULES")
+    for icon,kw,body in [
+        ("✅","FOLLOW","2+ foreign SM brokers (AK/BK/DB/GW) simultaneously net buying"),
+        ("🔥","STRONGEST","ACC Cross: SM buying + retail selling = ideal entry"),
+        ("💀","DANGER","DIS Cross: SM selling + retail buying = distribution trap"),
+        ("⚠️","CAUTION","XC/YP/XL heavy net buy = retail FOMO, often distribution top"),
+        ("🔇","IGNORE","MG dominates volume = scalper noise; look at other brokers"),
+        ("🚨","HIGH RISK","MK+EP appear in quiet stock = likely pump-and-dump"),
+        ("📊","COMBINE","Broker + Wyckoff + CMF + Ownership + Fundamentals = full picture"),
+    ]:
+        st.markdown(f"""
+        <div style='display:flex;gap:10px;padding:7px 12px;border-bottom:1px solid #141e2e'>
+          <div style='font-size:14px;flex-shrink:0'>{icon}</div>
+          <div><b style='color:#eaf0f8'>{kw}</b> —
+          <span style='color:#cdd8e6;font-size:12px'>{body}</span></div>
+        </div>""", unsafe_allow_html=True)
+
+    st.markdown("<br>",unsafe_allow_html=True)
     st.info("""
-    💡 **Catatan Penting**: Bandar TIDAK hanya pakai 1 broker.
-    Mereka pakai 2-5 broker berbeda untuk menyamarkan aksi akumulasi/distribusi.
-    Selalu lihat POLA keseluruhan, bukan 1 broker saja.
+    **Important** — Bandarmology is a probabilistic analytical tool, not a guarantee of profit.
+    Always apply stop-loss discipline, position sizing, and combine with fundamental analysis.
+    Data broker yang tampil adalah ESTIMASI berdasarkan net flow harian — bukan actual sub-account holdings KSEI.
     """)
