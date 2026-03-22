@@ -83,6 +83,26 @@ st.markdown("""
   background:var(--bg3)!important; border:1px solid var(--border2)!important;
   color:var(--white)!important; font-family:'IBM Plex Mono',monospace!important;
 }
+/* Fix: textarea inner element text color */
+textarea {
+  color:var(--white)!important;
+  background:var(--bg3)!important;
+  font-family:'IBM Plex Mono',monospace!important;
+  font-size:11px!important;
+  line-height:1.6!important;
+}
+textarea::placeholder { color:var(--text3)!important; }
+textarea:focus { 
+  border-color:var(--green)!important;
+  box-shadow:0 0 0 1px rgba(0,230,118,.2)!important;
+  outline:none!important;
+}
+/* Fix: stTextArea label */
+.stTextArea label, .stTextInput label {
+  color:var(--text2)!important;
+  font-family:'IBM Plex Mono',monospace!important;
+  font-size:11px!important;
+}
 .stSelectbox>div>div, .stSlider { background:var(--bg3)!important; border:1px solid var(--border2)!important; }
 
 [data-testid="stTabs"] button {
@@ -699,6 +719,359 @@ def tech_score(df, c, o, m):
     if pt>0.01  and mt<-3: sc-=15
     return int(np.clip(round(sc),0,100))
 
+def tech_score(df, c, o, m):
+    sc = 50.0
+    cv = float(c.iloc[-1]) if not pd.isna(c.iloc[-1]) else 0
+    sc += np.clip(cv*125,-25,25)
+    os = (o.iloc[-1]-o.iloc[-min(10,len(o)-1)]) / (abs(o.iloc[-min(10,len(o)-1)])+1)
+    sc += np.clip(os*500,-20,20)
+    last = df.iloc[-1]; sp = last["high"]-last["low"]
+    cp = (last["close"]-last["low"]) / (sp if sp>0 else 1)
+    sc += (cp-0.5)*30
+    av = df["volume"].tail(20).mean(); vr = last["volume"]/av if av>0 else 1
+    if vr>1.3: sc += 15 if cp>0.5 else -15
+    pt = (df["close"].iloc[-1]-df["close"].iloc[-min(10,len(df)-1)]) / df["close"].iloc[-min(10,len(df)-1)]
+    mt = float(m.iloc[-1]-m.iloc[-min(10,len(m)-1)])
+    if pt<-0.01 and mt>3:  sc+=15
+    if pt>0.01  and mt<-3: sc-=15
+    return int(np.clip(round(sc),0,100))
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  VCP — VOLATILITY CONTRACTION PATTERN ENGINE
+#  Based on Mark Minervini's methodology
+#  Detects: shrinking price swings + declining volume = supply exhaustion
+# ══════════════════════════════════════════════════════════════════════
+
+def detect_vcp(df: pd.DataFrame) -> dict:
+    """
+    Detect Volatility Contraction Pattern (VCP) in historical OHLCV data.
+
+    A valid VCP requires:
+    1. At least 2–4 progressively smaller price contractions (pivot swings)
+    2. Each contraction shallower than the previous (% depth shrinking)
+    3. Volume contracting during each consolidation phase
+    4. Stock in a prior uptrend (above key moving averages)
+    5. Last contraction tight (<3%) = pivot point = potential buy zone
+
+    VCP Grade:
+    ─────────────────────────────────────────────────────────
+    A  = 3-4 contractions, each < 50% prior, tight pivot (<3%),
+         volume dry-up confirmed, above all MAs = IDEAL SETUP
+    B  = 2-3 contractions, good volume tightening, near pivot
+    C  = Early contraction, setup incomplete but forming
+    NONE = No VCP detected or stock in downtrend
+
+    Returns dict with grade, contractions list, pivot level, score, chart data.
+    """
+    if len(df) < 60:
+        return {"grade": "NONE", "score": 0, "contractions": [],
+                "pivot": None, "available": False}
+
+    close  = df["close"]
+    high   = df["high"]
+    low    = df["low"]
+    vol    = df["volume"]
+    n      = len(df)
+
+    # ── 1. Trend filter: Must be in uptrend
+    ma50  = close.rolling(50).mean()
+    ma150 = close.rolling(150).mean() if n >= 150 else close.rolling(min(n,100)).mean()
+    ma200 = close.rolling(200).mean() if n >= 200 else close.rolling(min(n,120)).mean()
+
+    last_price = float(close.iloc[-1])
+    ma50_v  = float(ma50.iloc[-1])  if not pd.isna(ma50.iloc[-1])  else last_price
+    ma150_v = float(ma150.iloc[-1]) if not pd.isna(ma150.iloc[-1]) else last_price
+    ma200_v = float(ma200.iloc[-1]) if not pd.isna(ma200.iloc[-1]) else last_price
+
+    above_ma50  = last_price > ma50_v
+    above_ma150 = last_price > ma150_v
+    above_ma200 = last_price > ma200_v
+    ma50_slope  = (float(ma50.iloc[-1]) - float(ma50.iloc[-min(20,n-1)])) > 0
+    trend_score = sum([above_ma50, above_ma150, above_ma200, ma50_slope])
+    in_uptrend  = trend_score >= 2  # at least 2/4 trend conditions
+
+    # ── 2. Find price swings (peaks and troughs) using rolling extremes
+    def find_pivots(series, window=10):
+        """Find local pivot highs and lows."""
+        highs, lows = [], []
+        for i in range(window, len(series) - window):
+            if series.iloc[i] == series.iloc[i-window:i+window+1].max():
+                highs.append((i, float(series.iloc[i])))
+            if series.iloc[i] == series.iloc[i-window:i+window+1].min():
+                lows.append((i, float(series.iloc[i])))
+        return highs, lows
+
+    # Use last 120 trading days (≈6 months) for VCP detection
+    lookback = min(120, n)
+    df_vcp   = df.iloc[-lookback:]
+    c_vcp    = close.iloc[-lookback:]
+    v_vcp    = vol.iloc[-lookback:]
+
+    highs, lows = find_pivots(c_vcp, window=8)
+
+    # ── 3. Identify contraction sequences
+    contractions = []
+    for i in range(1, min(len(highs), len(lows)+1)):
+        if i > len(lows): break
+        peak  = highs[i-1] if i-1 < len(highs) else None
+        trough = lows[i-1] if i-1 < len(lows)  else None
+        if peak is None or trough is None: continue
+
+        # Contraction = swing from peak to nearest lower trough
+        if trough[0] > peak[0]:  # trough after peak
+            depth_pct = (peak[1] - trough[1]) / peak[1] * 100
+            # Volume during this contraction
+            t_start = peak[0]; t_end = trough[0]
+            if t_end > t_start:
+                avg_vol_contract = float(v_vcp.iloc[t_start:t_end].mean())
+                avg_vol_prior    = float(v_vcp.iloc[max(0,t_start-20):t_start].mean())
+                vol_ratio_contract = (avg_vol_contract / avg_vol_prior
+                                      if avg_vol_prior > 0 else 1.0)
+                contractions.append({
+                    "idx"        : len(contractions) + 1,
+                    "peak_price" : round(peak[1], 0),
+                    "trough_price": round(trough[1], 0),
+                    "depth_pct"  : round(depth_pct, 1),
+                    "vol_ratio"  : round(vol_ratio_contract, 2),
+                    "vol_dry_up" : vol_ratio_contract < 0.8,  # volume contracted
+                    "peak_idx"   : peak[0],
+                    "trough_idx" : trough[0],
+                })
+
+    # Keep only the most recent and meaningful contractions
+    contractions = [c for c in contractions if 1.0 <= c["depth_pct"] <= 50]
+    contractions = sorted(contractions, key=lambda x: x["trough_idx"])[-5:]
+
+    # ── 4. Check for progressively shrinking contractions
+    is_contracting   = False
+    contraction_good = 0
+    vol_drying_up    = 0
+
+    if len(contractions) >= 2:
+        depths = [c["depth_pct"] for c in contractions]
+        # Check each pair: should be getting shallower
+        shrinking = sum(1 for i in range(1, len(depths)) if depths[i] < depths[i-1])
+        is_contracting = shrinking >= len(depths) - 1  # all or all-but-one shrinking
+        contraction_good = shrinking
+        vol_drying_up = sum(1 for c in contractions if c["vol_dry_up"])
+
+    # ── 5. Current tightness (last few bars)
+    recent_window = min(20, n)
+    recent_high   = float(high.iloc[-recent_window:].max())
+    recent_low    = float(low.iloc[-recent_window:].min())
+    current_tight = (recent_high - recent_low) / recent_high * 100 if recent_high > 0 else 99
+    pivot_price   = recent_high  # breakout above recent high = pivot point
+
+    # Volume in last 10 days vs prior 20 days
+    avg_vol_recent = float(vol.tail(10).mean())
+    avg_vol_prior  = float(vol.iloc[-30:-10].mean()) if n >= 30 else float(vol.mean())
+    vol_dry_recent = (avg_vol_recent / avg_vol_prior) if avg_vol_prior > 0 else 1.0
+    vol_is_dry     = vol_dry_recent < 0.75
+
+    # ── 6. VCP Grade Assignment
+    n_contractions = len(contractions)
+    last_depth     = contractions[-1]["depth_pct"] if contractions else 99.0
+
+    if (in_uptrend and n_contractions >= 3 and is_contracting and
+            contraction_good >= 2 and vol_drying_up >= 2 and
+            current_tight <= 6 and vol_is_dry):
+        grade = "A"
+        grade_color = "#00e676"
+        grade_desc  = "IDEAL VCP — Multiple tight contractions + volume dry-up + uptrend confirmed"
+        vcp_score   = 90
+
+    elif (in_uptrend and n_contractions >= 2 and is_contracting and
+              vol_drying_up >= 1 and current_tight <= 12):
+        grade = "B"
+        grade_color = "#88ffbb"
+        grade_desc  = "GOOD VCP — 2–3 contractions, volume contracting, setup forming"
+        vcp_score   = 70
+
+    elif (in_uptrend and n_contractions >= 2 and current_tight <= 20):
+        grade = "C"
+        grade_color = "#ffab00"
+        grade_desc  = "DEVELOPING VCP — Early contraction, not yet complete"
+        vcp_score   = 45
+
+    elif n_contractions >= 1 and not in_uptrend:
+        grade = "C-"
+        grade_color = "#ff8888"
+        grade_desc  = "CAUTION — Contraction pattern but stock in downtrend/below MAs"
+        vcp_score   = 25
+
+    else:
+        grade = "NONE"
+        grade_color = "#5a7a9a"
+        grade_desc  = "No clear VCP detected"
+        vcp_score   = 0
+
+    # ── 7. Breakout conditions check
+    last_vol    = float(vol.iloc[-1])
+    avg_vol_20  = float(vol.tail(20).mean())
+    vol_on_last = last_vol / avg_vol_20 if avg_vol_20 > 0 else 1.0
+    is_breaking = (last_price >= pivot_price * 0.995 and vol_on_last >= 1.5)
+    near_pivot  = (last_price >= pivot_price * 0.97)
+
+    # ── 8. Premium setup detection (VCP + Wyckoff + Broker)
+    premium_setup = grade in ("A","B") and in_uptrend and near_pivot
+
+    return {
+        "available"     : True,
+        "grade"         : grade,
+        "grade_color"   : grade_color,
+        "grade_desc"    : grade_desc,
+        "score"         : vcp_score,
+        "contractions"  : contractions,
+        "n_contractions": n_contractions,
+        "is_contracting": is_contracting,
+        "current_tight" : round(current_tight, 1),
+        "pivot_price"   : round(pivot_price, 0),
+        "last_price"    : round(last_price, 0),
+        "near_pivot"    : near_pivot,
+        "is_breaking"   : is_breaking,
+        "vol_dry_recent": round(vol_dry_recent, 2),
+        "vol_is_dry"    : vol_is_dry,
+        "vol_drying_up" : vol_drying_up,
+        "in_uptrend"    : in_uptrend,
+        "trend_score"   : trend_score,
+        "above_ma50"    : above_ma50,
+        "above_ma150"   : above_ma150,
+        "above_ma200"   : above_ma200,
+        "ma50_v"        : round(ma50_v, 0),
+        "ma150_v"       : round(ma150_v, 0),
+        "ma200_v"       : round(ma200_v, 0),
+        "premium_setup" : premium_setup,
+    }
+
+
+def chart_vcp(df: pd.DataFrame, vcp: dict) -> go.Figure:
+    """
+    VCP visualization chart:
+    - Candlestick with MA50/150/200
+    - Volume with contraction highlighting
+    - Pivot level marked
+    - Contraction arcs annotated
+    """
+    ma50  = df["close"].rolling(50).mean()
+    ma150 = df["close"].rolling(150).mean() if len(df)>=150 else df["close"].rolling(min(len(df),100)).mean()
+    ma200 = df["close"].rolling(200).mean() if len(df)>=200 else df["close"].rolling(min(len(df),120)).mean()
+
+    # Use last 120 days for clarity
+    lookback = min(120, len(df))
+    df_v   = df.iloc[-lookback:]
+    ma50_v = ma50.iloc[-lookback:]
+    ma150_v= ma150.iloc[-lookback:]
+    ma200_v= ma200.iloc[-lookback:]
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        row_heights=[0.68, 0.32], vertical_spacing=0.04)
+
+    # Candlestick
+    fig.add_trace(go.Candlestick(
+        x=df_v.index, open=df_v["open"], high=df_v["high"],
+        low=df_v["low"], close=df_v["close"],
+        increasing=dict(line=dict(color="#00e676",width=1),fillcolor="rgba(0,230,118,.55)"),
+        decreasing=dict(line=dict(color="#ff1744",width=1),fillcolor="rgba(255,23,68,.55)"),
+        name="Price",
+    ), row=1, col=1)
+
+    # Moving averages
+    for ma, name, color, dash in [
+        (ma50_v, "MA50","#00b0ff","solid"),
+        (ma150_v,"MA150","#ffab00","dash"),
+        (ma200_v,"MA200","#e040fb","dot"),
+    ]:
+        fig.add_trace(go.Scatter(
+            x=df_v.index, y=ma, name=name,
+            line=dict(color=color, width=1.2, dash=dash),
+        ), row=1, col=1)
+
+    # Pivot level
+    pivot = vcp.get("pivot_price")
+    if pivot:
+        grade_color = vcp.get("grade_color","#ffab00")
+        fig.add_hline(y=pivot, line_color=grade_color, line_dash="dash",
+                      line_width=1.5,
+                      annotation_text=f"  PIVOT Rp {pivot:,.0f}",
+                      annotation_font_color=grade_color,
+                      annotation_font_size=10, row=1, col=1)
+
+    # Annotate contraction troughs
+    contractions = vcp.get("contractions", [])
+    for i, ct in enumerate(contractions):
+        trough_idx = ct.get("trough_idx", 0)
+        if 0 <= trough_idx < len(df_v):
+            trough_date = df_v.index[trough_idx]
+            fig.add_annotation(
+                x=trough_date, y=ct["trough_price"],
+                text=f"C{i+1}<br>-{ct['depth_pct']:.0f}%",
+                showarrow=True, arrowhead=2, arrowsize=0.8,
+                arrowcolor="#ffab00", arrowwidth=1.5,
+                font=dict(size=9, color="#ffab00",
+                          family="IBM Plex Mono, monospace"),
+                bgcolor="rgba(11,16,24,0.8)",
+                bordercolor="#ffab00", borderwidth=1,
+                ay=-35, row=1, col=1,
+            )
+
+    # Volume bars with recent dry-up highlighted
+    avg_vol_20 = df_v["volume"].tail(20).mean()
+    vol_colors = []
+    for i, row in df_v.iterrows():
+        vol_ratio = row["volume"] / avg_vol_20 if avg_vol_20 > 0 else 1
+        if vol_ratio < 0.6:
+            vol_colors.append("rgba(0,230,118,0.4)")   # dry-up = green tint
+        elif df_v["close"].loc[i] >= df_v["open"].loc[i]:
+            vol_colors.append("rgba(0,230,118,0.35)")
+        else:
+            vol_colors.append("rgba(255,23,68,0.35)")
+
+    fig.add_trace(go.Bar(
+        x=df_v.index, y=df_v["volume"],
+        name="Volume", marker_color=vol_colors,
+    ), row=2, col=1)
+
+    # Volume MA20
+    fig.add_trace(go.Scatter(
+        x=df_v.index, y=df_v["volume"].rolling(20).mean(),
+        name="Vol MA20", line=dict(color="#ffab00", width=1, dash="dot"),
+        showlegend=False,
+    ), row=2, col=1)
+
+    # 75% volume reference line (dry-up threshold)
+    if avg_vol_20 > 0:
+        fig.add_hline(y=avg_vol_20 * 0.75,
+                      line_color="rgba(0,230,118,0.3)",
+                      line_dash="dot", line_width=1,
+                      annotation_text="  75% vol (dry-up)",
+                      annotation_font_color="rgba(0,230,118,0.6)",
+                      annotation_font_size=9, row=2, col=1)
+
+    grade = vcp.get("grade","NONE")
+    grade_color = vcp.get("grade_color","#5a7a9a")
+    fig.update_layout(
+        paper_bgcolor="#05080c", plot_bgcolor="#090d12",
+        font=dict(color="#cdd8e6", family="IBM Plex Mono, monospace", size=11),
+        title=dict(
+            text=f"VCP Analysis  ·  Grade <b>{grade}</b>  ·  {vcp.get('grade_desc','')}",
+            font=dict(size=11, color=grade_color), x=0.01,
+        ),
+        legend=dict(bgcolor="#0b1018", bordercolor="#141e2e",
+                    font=dict(size=9), orientation="h", y=1.02),
+        margin=dict(l=0, r=0, t=36, b=0),
+        height=520,
+        xaxis_rangeslider_visible=False,
+        hovermode="x unified",
+    )
+    for i in [1,2]:
+        fig.update_xaxes(gridcolor="#141e2e", showgrid=True, row=i, col=1)
+        fig.update_yaxes(gridcolor="#141e2e", showgrid=True, row=i, col=1)
+    fig.update_yaxes(title_text="Price (IDR)", row=1, col=1)
+    fig.update_yaxes(title_text="Volume",      row=2, col=1)
+    return fig
+
+
 def entry_zone(df):
     a   = atr(df); lp  = float(df["close"].iloc[-1])
     la  = float(a.iloc[-1]) if not pd.isna(a.iloc[-1]) else lp*.02
@@ -1291,7 +1664,7 @@ def chart_signal_scatter(df_signals: pd.DataFrame, hold: int = 10) -> go.Figure:
 # ══════════════════════════════════════════════════════════════════════
 
 def entry_signal(final,ts,br_score,wp,cmf_v,obv_up,mfi_v,vr,crossing,
-                 goreng,sm_buy,sm_sell,chg,own,rs_data=None):
+                 goreng,sm_buy,sm_sell,chg,own,rs_data=None,vcp=None):
     met,fail,watch = [],[],[]
     if final>=70: met.append(f"Composite {final}/100 (Strong)")
     elif final>=55: met.append(f"Composite {final}/100 (Positive)")
@@ -1322,7 +1695,31 @@ def entry_signal(final,ts,br_score,wp,cmf_v,obv_up,mfi_v,vr,crossing,
         ff = own.get("float",30)
         if ff<15: fail.append(f"Low float {ff}% — FCA/manipulation risk")
 
-    # ── RS vs IHSG factor (important context)
+    # ── VCP factor
+    vcp_bonus = 0
+    premium_setup = False
+    if vcp and vcp.get("available"):
+        vcp_grade = vcp.get("grade","NONE")
+        near_piv  = vcp.get("near_pivot", False)
+        breaking  = vcp.get("is_breaking", False)
+        if vcp_grade == "A":
+            met.append(f"VCP Grade A — Ideal contraction pattern, pivot at Rp{vcp.get('pivot_price',0):,.0f}")
+            vcp_bonus = 12
+            premium_setup = (pa in ("buy","watch") and cmf_v > 0)
+        elif vcp_grade == "B":
+            met.append(f"VCP Grade B — Good contraction, setup forming near Rp{vcp.get('pivot_price',0):,.0f}")
+            vcp_bonus = 7
+        elif vcp_grade in ("C","C-"):
+            watch.append(f"VCP Grade {vcp_grade} — Early stage contraction, not yet complete")
+            vcp_bonus = 2 if vcp_grade == "C" else -2
+        if near_piv and vcp_grade in ("A","B"):
+            met.append("Near VCP pivot — potential breakout imminent")
+            vcp_bonus += 5
+        if breaking:
+            met.append("⚡ VCP BREAKOUT — Price breaking pivot with volume!")
+            vcp_bonus += 8
+
+    # ── RS vs IHSG factor
     rs_bonus = 0
     if rs_data and rs_data.get("available"):
         rs_interp = rs_data.get("interp","")
@@ -1343,17 +1740,23 @@ def entry_signal(final,ts,br_score,wp,cmf_v,obv_up,mfi_v,vr,crossing,
         else:
             watch.append(f"RS vs IHSG: In Line ({rs20:.1f}) — moving with market")
 
-    # Adjust final with RS (max ±8 points)
-    final_adj = int(np.clip(final + rs_bonus, 0, 100))
+    # Adjust final with RS + VCP bonuses (max ±15 combined)
+    final_adj = int(np.clip(final + np.clip(rs_bonus + vcp_bonus, -15, 15), 0, 100))
 
     nm=len(met); nf=len(fail)
-    if crossing=="ACC" and final_adj>=65:
+
+    # PREMIUM SETUP: VCP-A/B + Accumulation Cross = highest possible conviction
+    if premium_setup and crossing=="ACC" and final_adj>=60:
+        sig,color,cls="STRONG BUY","#00e676","sc-buy"
+        why="🔥 PREMIUM SETUP: VCP + Accumulation Cross + RS positive. Triple confirmation — highest conviction entry."
+        risk,action="LOW","Enter now at/near VCP pivot. Stop-loss below last contraction low."
+    elif crossing=="ACC" and final_adj>=65:
         sig,color,cls="STRONG BUY","#00e676","sc-buy"
         why="Accumulation Cross confirmed. Foreign institutions buying while retail sells."
         risk,action="LOW-MEDIUM","Enter now. Stop-loss below recent 10-day support."
     elif nm>=4 and nf<=1 and final_adj>=65:
         sig,color,cls="BUY","#00e676","sc-buy"
-        why=f"{nm} conditions confirmed. Smart money accumulation + RS positive."
+        why=f"{nm} conditions confirmed. Smart money accumulation + RS + VCP aligned."
         risk,action="MEDIUM","Consider entry. Confirm with volume breakout."
     elif crossing=="DIS" or (nf>=3 and final_adj<=40):
         sig,color,cls="STRONG AVOID","#ff1744","sc-sell"
@@ -1365,15 +1768,16 @@ def entry_signal(final,ts,br_score,wp,cmf_v,obv_up,mfi_v,vr,crossing,
         risk,action="MEDIUM-HIGH","Hold off. Wait for reversal signals."
     elif nm>=2 and nf<=1:
         sig,color,cls="WATCH","#ffab00","sc-watch"
-        why="Accumulation forming but not fully confirmed."
-        risk,action="MEDIUM","Watchlist. Look for: volume + CMF + SM entry."
+        why="Setup building — accumulation + VCP forming but needs confirmation."
+        risk,action="MEDIUM","Add to watchlist. Trigger: volume breakout above VCP pivot."
     else:
         sig,color,cls="WATCH","#ffab00","sc-watch"
         why="Mixed signals. No clear smart money direction."
         risk,action="MEDIUM","Monitor. Enter only when 3+ conditions align."
     return dict(sig=sig,color=color,cls=cls,why=why,risk=risk,
                 action=action,met=met,fail=fail,watch=watch,
-                final_adj=final_adj,rs_bonus=rs_bonus)
+                final_adj=final_adj,rs_bonus=rs_bonus,
+                vcp_bonus=vcp_bonus,premium_setup=premium_setup)
 
 
 
@@ -1798,10 +2202,11 @@ with tab_a:
         if df is None or len(df) < 20:
             st.error(f"Could not load **{ticker_input}.JK**. Try: BBCA, BREN, AMMN, ADRO, BMRI")
             st.stop()
-        with st.spinner("Computing CMF · OBV · MFI · RSI · Wyckoff · ATR ..."):
+        with st.spinner("Computing CMF · OBV · MFI · RSI · Wyckoff · ATR · VCP ..."):
             c_ = cmf(df); o_ = obv(df); m_ = mfi(df)
             wp,wn,wd = wyckoff(df,c_,o_); ts = tech_score(df,c_,o_,m_)
             ez = entry_zone(df)
+            vcp = detect_vcp(df)        # VCP detection
         with st.spinner("Fetching broker summary (today) ..."):
             bdf, src = get_broker_today(ticker_input, sb_token)
             if bdf is None:
@@ -1816,7 +2221,9 @@ with tab_a:
             ihsg_df = load_ihsg(period)
             rs_data = calc_rs(df, ihsg_df) if ihsg_df is not None else {"available": False}
 
-        final = int(np.clip(round(ts*.6 + br["score"]*.4), 0, 100))
+        # ── COMPOSITE SCORE: Technical 55% + Broker 35% + VCP 10%
+        vcp_score  = vcp.get("score", 0)
+        final = int(np.clip(round(ts*.55 + br["score"]*.35 + vcp_score*.10), 0, 100))
         last  = df.iloc[-1]; prev = df.iloc[-2]
         chg   = (last["close"]-prev["close"]) / prev["close"] * 100
         av    = df["volume"].tail(20).mean()
@@ -1825,7 +2232,7 @@ with tab_a:
         ent   = entry_signal(final,ts,br["score"],wp,float(c_.iloc[-1]),
                               ob_up,float(m_.iloc[-1]),vr,br["crossing"],
                               br["goreng"],br["sm_buyers"],br["sm_sellers"],chg,own,
-                              rs_data=rs_data)
+                              rs_data=rs_data, vcp=vcp)
         st.session_state["res"] = dict(
             df=df,c=c_,o=o_,m=m_,wp=wp,wn=wn,wd=wd,ts=ts,
             br=br,bdf=bdf,src=src,final=final,ent=ent,
@@ -1834,7 +2241,7 @@ with tab_a:
             obv_up=ob_up,ticker=ticker_input,
             fund=fund,own=own,ksei=ksei,
             sh_list=sh_list,sh_src=sh_src,sh_date=sh_date,
-            ez=ez,rs_data=rs_data,
+            ez=ez,rs_data=rs_data,vcp=vcp,
             fetched=datetime.now().strftime("%H:%M:%S WIB"),
         )
 
@@ -1907,105 +2314,214 @@ with tab_a:
           <div class='conds'>{conds}</div>
         </div>""", unsafe_allow_html=True)
 
-        # ── KEY METRICS
-        st.markdown('<div class="sec" style="margin-top:12px">KEY METRICS</div>', unsafe_allow_html=True)
-        c1,c2,c3,c4,c5,c6 = st.columns(6)
-        c1.metric("COMPOSITE",  f"{R['final']}/100", delta=ent["sig"],
-                  help="Skor akhir = Technical 60% + Broker Flow 40%. ≥65 = Akumulasi, ≤35 = Distribusi.")
-        c2.metric("TECHNICAL",  f"{R['ts']}/100",
-                  help="Skor teknikal: CMF + OBV + MFI divergence + candlestick position + volume ratio.")
-        c3.metric("BROKER",     f"{br['score']}/100",
-                  help="Skor broker flow: net lot asing, crossing signal, kategori broker, goreng alert.")
-        c4.metric("CMF (14)",   f"{R['cmf_v']:.4f}",
-                  delta="Inflow" if R["cmf_v"]>.1 else "Outflow" if R["cmf_v"]<-.1 else "Neutral",
-                  help="Chaikin Money Flow. >+0.15 = uang masuk kuat (akumulasi). <-0.15 = uang keluar (distribusi). Dihitung 14 hari.")
-        c5.metric("MFI (14)",   f"{R['mfi_v']:.1f}",
-                  delta="Oversold" if R["mfi_v"]<30 else "Overbought" if R["mfi_v"]>70 else "Normal",
-                  help="Money Flow Index. <30 = oversold (potensi reversal naik). >70 = overbought (potensi koreksi). Seperti RSI tapi memperhitungkan volume.")
-        c6.metric("VOL RATIO",  f"{R['vr']:.1f}x", delta=f"Ph {R['wp']} {R['wn']}",
-                  help="Volume hari ini ÷ rata-rata 20 hari. >1.5x = aktivitas signifikan. >2x = potensi pergerakan besar.")
-
-        # ── INDICATOR LEGEND
+        # ── KEY METRICS — compute live statuses
         obv_status = "Rising ▲" if R["obv_up"] else "Falling ▼"
         obv_color  = "#00e676" if R["obv_up"] else "#ff1744"
-        cmf_interp = ("Strong accumulation" if R["cmf_v"]>0.15
-                      else "Mild accumulation" if R["cmf_v"]>0.05
-                      else "Strong distribution" if R["cmf_v"]<-0.15
-                      else "Mild distribution" if R["cmf_v"]<-0.05
-                      else "Neutral / balanced")
-        mfi_interp = ("🔴 Overbought — potensi koreksi" if R["mfi_v"]>70
-                      else "🟢 Oversold — potensi reversal" if R["mfi_v"]<30
-                      else "🟡 Normal range")
-        wyck_emoji = {"A":"🔵","B":"🟡","C":"⭐","D":"🟠","E":"🔴"}.get(R["wp"],"🔵")
+        vr_now     = R["vr"]
+        vr_color   = "#00e676" if vr_now>=1.5 else "#ffab00" if vr_now>=0.8 else "#5a7a9a"
+        vr_label   = "Tinggi" if vr_now>=1.5 else "Normal" if vr_now>=0.8 else "Sepi"
+        cmf_color  = "#00e676" if R["cmf_v"]>0.05 else "#ff1744" if R["cmf_v"]<-0.05 else "#ffab00"
+        cmf_label  = ("Akumulasi kuat"  if R["cmf_v"]>0.15 else
+                      "Akumulasi ringan" if R["cmf_v"]>0.05 else
+                      "Distribusi kuat"  if R["cmf_v"]<-0.15 else
+                      "Distribusi ringan" if R["cmf_v"]<-0.05 else "Netral")
+        mfi_color  = "#ff1744" if R["mfi_v"]>70 else "#00e676" if R["mfi_v"]<30 else "#5a7a9a"
+        mfi_label  = "Overbought ⚠️" if R["mfi_v"]>70 else "Oversold ✅" if R["mfi_v"]<30 else "Normal"
+        wyck_color = {"A":"#00b0ff","B":"#ffab00","C":"#00e676","D":"#ffab00","E":"#ff8888"}.get(R["wp"],"#5a7a9a")
+        comp_color = "#00e676" if R["final"]>=65 else "#ff1744" if R["final"]<=35 else "#ffab00"
+        comp_label = "Akumulasi" if R["final"]>=65 else "Distribusi" if R["final"]<=35 else "Neutral"
+        ts_color   = "#00e676" if R["ts"]>=65 else "#ff1744" if R["ts"]<=35 else "#ffab00"
+        br_color   = "#00e676" if br["score"]>=65 else "#ff1744" if br["score"]<=35 else "#ffab00"
 
+        st.markdown('<div class="sec" style="margin-top:12px">KEY METRICS & INDICATOR LEGEND</div>',
+                    unsafe_allow_html=True)
+
+        # ── Top score row (3 big numbers)
         st.markdown(f"""
-        <div style='display:grid;grid-template-columns:repeat(6,1fr);gap:6px;margin-bottom:12px'>
+        <div style='display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:10px'>
 
-          <div style='background:#0b1018;border:1px solid #141e2e;border-top:2px solid #5a7a9a;
-                      padding:10px;border-radius:3px'>
-            <div style='font-family:"IBM Plex Mono",monospace;font-size:8px;color:#5a7a9a;
-                        letter-spacing:1px;margin-bottom:4px'>COMPOSITE SCORE</div>
-            <div style='font-size:10px;color:#cdd8e6;line-height:1.5'>
-              Skor gabungan 0–100.<br>
-              <b style='color:#00e676'>≥ 65</b> = Akumulasi<br>
-              <b style='color:#ffab00'>35–64</b> = Neutral<br>
-              <b style='color:#ff1744'>≤ 35</b> = Distribusi
+          <div style='background:#0b1018;border:1px solid #141e2e;border-radius:4px;
+                      padding:14px 16px;display:flex;justify-content:space-between;align-items:center'>
+            <div>
+              <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;color:#5a7a9a;
+                          letter-spacing:1.5px;margin-bottom:4px'>COMPOSITE SCORE</div>
+              <div style='font-family:"IBM Plex Mono",monospace;font-size:2rem;
+                          font-weight:700;color:{comp_color};line-height:1'>{R["final"]}/100</div>
+              <div style='font-size:10px;color:{comp_color};margin-top:4px'>{comp_label}</div>
+            </div>
+            <div style='text-align:right;font-size:10px;color:#5a7a9a;line-height:2'>
+              <span style='color:#00e676'>≥ 65</span> Akumulasi<br>
+              <span style='color:#ffab00'>35–64</span> Neutral<br>
+              <span style='color:#ff1744'>≤ 35</span> Distribusi
             </div>
           </div>
 
-          <div style='background:#0b1018;border:1px solid #141e2e;border-top:2px solid #00b0ff;
-                      padding:10px;border-radius:3px'>
-            <div style='font-family:"IBM Plex Mono",monospace;font-size:8px;color:#5a7a9a;
-                        letter-spacing:1px;margin-bottom:4px'>OBV (On Balance Volume)</div>
-            <div style='font-size:10px;color:#cdd8e6;line-height:1.5'>
-              Kumulasi volume. Sekarang:<br>
-              <b style='color:{obv_color}'>{obv_status}</b><br>
-              Rising + harga turun = bandar diam-diam beli.
+          <div style='background:#0b1018;border:1px solid #141e2e;border-radius:4px;
+                      padding:14px 16px;display:flex;justify-content:space-between;align-items:center'>
+            <div>
+              <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;color:#5a7a9a;
+                          letter-spacing:1.5px;margin-bottom:4px'>TECHNICAL SCORE</div>
+              <div style='font-family:"IBM Plex Mono",monospace;font-size:2rem;
+                          font-weight:700;color:{ts_color};line-height:1'>{R["ts"]}/100</div>
+              <div style='font-size:10px;color:#5a7a9a;margin-top:4px'>
+                CMF · OBV · MFI · Wyckoff · Volume</div>
+            </div>
+            <div style='text-align:right;font-size:10px;color:#5a7a9a;line-height:2'>
+              Bobot 55%<br>dari skor akhir
             </div>
           </div>
 
-          <div style='background:#0b1018;border:1px solid #141e2e;border-top:2px solid #00e676;
-                      padding:10px;border-radius:3px'>
-            <div style='font-family:"IBM Plex Mono",monospace;font-size:8px;color:#5a7a9a;
-                        letter-spacing:1px;margin-bottom:4px'>CMF (14) — Chaikin Money Flow</div>
-            <div style='font-size:10px;color:#cdd8e6;line-height:1.5'>
-              {cmf_interp}<br>
-              <b style='color:#00e676'>&gt;+0.15</b> = Akumulasi kuat<br>
-              <b style='color:#ff1744'>&lt;−0.15</b> = Distribusi kuat
+          <div style='background:#0b1018;border:1px solid #141e2e;border-radius:4px;
+                      padding:14px 16px;display:flex;justify-content:space-between;align-items:center'>
+            <div>
+              <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;color:#5a7a9a;
+                          letter-spacing:1.5px;margin-bottom:4px'>BROKER SCORE</div>
+              <div style='font-family:"IBM Plex Mono",monospace;font-size:2rem;
+                          font-weight:700;color:{br_color};line-height:1'>{br["score"]}/100</div>
+              <div style='font-size:10px;color:#5a7a9a;margin-top:4px'>
+                Net lot asing · Crossing · Kategori</div>
+            </div>
+            <div style='text-align:right;font-size:10px;color:#5a7a9a;line-height:2'>
+              Bobot 35%<br>dari skor akhir
             </div>
           </div>
 
-          <div style='background:#0b1018;border:1px solid #141e2e;border-top:2px solid #ffab00;
-                      padding:10px;border-radius:3px'>
-            <div style='font-family:"IBM Plex Mono",monospace;font-size:8px;color:#5a7a9a;
-                        letter-spacing:1px;margin-bottom:4px'>MFI (14) — Money Flow Index</div>
-            <div style='font-size:10px;color:#cdd8e6;line-height:1.5'>
-              {mfi_interp}<br>
-              RSI + Volume = lebih akurat.<br>
-              Divergence harga↓ + MFI↑ = bandar beli diam-diam.
+        </div>""", unsafe_allow_html=True)
+
+        # ── Indicator table (clean rows, easy to scan)
+        st.markdown(f"""
+        <div style='background:#0b1018;border:1px solid #141e2e;border-radius:4px;
+                    overflow:hidden;margin-bottom:14px'>
+
+          <!-- Header row -->
+          <div style='display:grid;grid-template-columns:140px 160px 1fr 220px;
+                      background:#0d1420;padding:8px 14px;border-bottom:2px solid #141e2e;
+                      font-family:"IBM Plex Mono",monospace;font-size:9px;
+                      color:#5a7a9a;letter-spacing:1.5px;gap:12px'>
+            <span>INDIKATOR</span>
+            <span>NILAI SEKARANG</span>
+            <span>CARA MEMBACA</span>
+            <span>THRESHOLD</span>
+          </div>
+
+          <!-- OBV -->
+          <div style='display:grid;grid-template-columns:140px 160px 1fr 220px;
+                      padding:10px 14px;border-bottom:1px solid #141e2e;
+                      align-items:center;gap:12px'>
+            <div>
+              <div style='font-family:"IBM Plex Mono",monospace;font-size:11px;
+                          font-weight:700;color:#eaf0f8'>OBV</div>
+              <div style='font-size:9px;color:#5a7a9a'>On Balance Volume</div>
+            </div>
+            <div style='font-family:"IBM Plex Mono",monospace;font-size:13px;
+                        font-weight:700;color:{obv_color}'>{obv_status}</div>
+            <div style='font-size:11px;color:#cdd8e6;line-height:1.6'>
+              Kumulasi volume beli vs jual.<br>
+              <span style='color:#00e676'>Naik + harga turun</span> = bandar diam-diam beli (sinyal terkuat)
+            </div>
+            <div style='font-size:10px;line-height:1.9'>
+              <span style='color:#00e676'>▲ Naik</span> → Tekanan beli dominan<br>
+              <span style='color:#ff1744'>▼ Turun</span> → Tekanan jual dominan
             </div>
           </div>
 
-          <div style='background:#0b1018;border:1px solid #141e2e;border-top:2px solid #e040fb;
-                      padding:10px;border-radius:3px'>
-            <div style='font-family:"IBM Plex Mono",monospace;font-size:8px;color:#5a7a9a;
-                        letter-spacing:1px;margin-bottom:4px'>VOL RATIO — Rasio Volume</div>
-            <div style='font-size:10px;color:#cdd8e6;line-height:1.5'>
-              Vol hari ini ÷ MA20 vol.<br>
-              <b style='color:#00e676'>&gt;1.5x</b> = aktivitas tinggi<br>
-              <b style='color:#5a7a9a'>&lt;0.5x</b> = sepi/konsolidasi
+          <!-- CMF -->
+          <div style='display:grid;grid-template-columns:140px 160px 1fr 220px;
+                      padding:10px 14px;border-bottom:1px solid #141e2e;
+                      align-items:center;gap:12px'>
+            <div>
+              <div style='font-family:"IBM Plex Mono",monospace;font-size:11px;
+                          font-weight:700;color:#eaf0f8'>CMF (14)</div>
+              <div style='font-size:9px;color:#5a7a9a'>Chaikin Money Flow</div>
+            </div>
+            <div>
+              <div style='font-family:"IBM Plex Mono",monospace;font-size:13px;
+                          font-weight:700;color:{cmf_color}'>{R["cmf_v"]:+.4f}</div>
+              <div style='font-size:10px;color:{cmf_color}'>{cmf_label}</div>
+            </div>
+            <div style='font-size:11px;color:#cdd8e6;line-height:1.6'>
+              Arah aliran uang 14 hari terakhir.<br>
+              Positif = uang masuk · Negatif = uang keluar
+            </div>
+            <div style='font-size:10px;line-height:1.9'>
+              <span style='color:#00e676'>&gt; +0.15</span> Akumulasi kuat<br>
+              <span style='color:#ffab00'>−0.05 ~ +0.05</span> Netral<br>
+              <span style='color:#ff1744'>&lt; −0.15</span> Distribusi kuat
             </div>
           </div>
 
-          <div style='background:#0b1018;border:1px solid #141e2e;border-top:2px solid #00e5ff;
-                      padding:10px;border-radius:3px'>
-            <div style='font-family:"IBM Plex Mono",monospace;font-size:8px;color:#5a7a9a;
-                        letter-spacing:1px;margin-bottom:4px'>{wyck_emoji} WYCKOFF PHASE</div>
-            <div style='font-size:10px;color:#cdd8e6;line-height:1.5'>
-              <b>Ph A</b>: Selling Climax<br>
-              <b>Ph B</b>: Building Cause<br>
-              <b style='color:#00e676'>Ph C</b>: Spring ← Entry ideal<br>
-              <b>Ph D</b>: Breakout · <b>Ph E</b>: Markup
+          <!-- MFI -->
+          <div style='display:grid;grid-template-columns:140px 160px 1fr 220px;
+                      padding:10px 14px;border-bottom:1px solid #141e2e;
+                      align-items:center;gap:12px'>
+            <div>
+              <div style='font-family:"IBM Plex Mono",monospace;font-size:11px;
+                          font-weight:700;color:#eaf0f8'>MFI (14)</div>
+              <div style='font-size:9px;color:#5a7a9a'>Money Flow Index</div>
+            </div>
+            <div>
+              <div style='font-family:"IBM Plex Mono",monospace;font-size:13px;
+                          font-weight:700;color:{mfi_color}'>{R["mfi_v"]:.1f}</div>
+              <div style='font-size:10px;color:{mfi_color}'>{mfi_label}</div>
+            </div>
+            <div style='font-size:11px;color:#cdd8e6;line-height:1.6'>
+              RSI yang memperhitungkan volume — lebih akurat.<br>
+              <span style='color:#00e676'>Harga ↓ + MFI ↑</span> = bandar beli saat retail panik jual
+            </div>
+            <div style='font-size:10px;line-height:1.9'>
+              <span style='color:#ff1744'>&gt; 70</span> Overbought (hati-hati)<br>
+              <span style='color:#5a7a9a'>30 ~ 70</span> Normal range<br>
+              <span style='color:#00e676'>&lt; 30</span> Oversold (potensi naik)
+            </div>
+          </div>
+
+          <!-- VOL RATIO -->
+          <div style='display:grid;grid-template-columns:140px 160px 1fr 220px;
+                      padding:10px 14px;border-bottom:1px solid #141e2e;
+                      align-items:center;gap:12px'>
+            <div>
+              <div style='font-family:"IBM Plex Mono",monospace;font-size:11px;
+                          font-weight:700;color:#eaf0f8'>VOL RATIO</div>
+              <div style='font-size:9px;color:#5a7a9a'>Volume vs MA20</div>
+            </div>
+            <div>
+              <div style='font-family:"IBM Plex Mono",monospace;font-size:13px;
+                          font-weight:700;color:{vr_color}'>{vr_now:.1f}x</div>
+              <div style='font-size:10px;color:{vr_color}'>{vr_label}</div>
+            </div>
+            <div style='font-size:11px;color:#cdd8e6;line-height:1.6'>
+              Volume hari ini ÷ rata-rata 20 hari.<br>
+              Volume tinggi + harga naik = breakout valid
+            </div>
+            <div style='font-size:10px;line-height:1.9'>
+              <span style='color:#00e676'>&gt; 1.5x</span> Aktivitas tinggi<br>
+              <span style='color:#ffab00'>0.8 ~ 1.5x</span> Normal<br>
+              <span style='color:#5a7a9a'>&lt; 0.5x</span> Sepi / konsolidasi
+            </div>
+          </div>
+
+          <!-- WYCKOFF -->
+          <div style='display:grid;grid-template-columns:140px 160px 1fr 220px;
+                      padding:10px 14px;align-items:center;gap:12px'>
+            <div>
+              <div style='font-family:"IBM Plex Mono",monospace;font-size:11px;
+                          font-weight:700;color:#eaf0f8'>WYCKOFF</div>
+              <div style='font-size:9px;color:#5a7a9a'>Accumulation Cycle</div>
+            </div>
+            <div>
+              <div style='font-family:"IBM Plex Mono",monospace;font-size:13px;
+                          font-weight:700;color:{wyck_color}'>Phase {R["wp"]}</div>
+              <div style='font-size:10px;color:{wyck_color}'>{R["wn"]}</div>
+            </div>
+            <div style='font-size:11px;color:#cdd8e6;line-height:1.6'>
+              {R["wd"]}
+            </div>
+            <div style='font-size:10px;line-height:1.9'>
+              <span style='color:#00b0ff'>A</span> Selling Climax&nbsp;&nbsp;
+              <span style='color:#ffab00'>B</span> Building Cause<br>
+              <span style='color:#00e676'><b>C</b></span><b style='color:#00e676'> Spring ← Entry ideal</b><br>
+              <span style='color:#ffab00'>D</span> Breakout&nbsp;&nbsp;
+              <span style='color:#ff8888'>E</span> Markup
             </div>
           </div>
 
@@ -2069,6 +2585,161 @@ with tab_a:
               <div style='font-size:11px;color:#cdd8e6;margin-top:3px;line-height:1.5'>{R["wd"]}</div>
               {ph}
             </div>""", unsafe_allow_html=True)
+
+            # ── VCP mini-panel in right column
+            vcp = R.get("vcp",{})
+            if vcp and vcp.get("available"):
+                vcp_grade  = vcp.get("grade","NONE")
+                vcp_gc     = vcp.get("grade_color","#5a7a9a")
+                vcp_pivot  = vcp.get("pivot_price",0)
+                vcp_tight  = vcp.get("current_tight",0)
+                vcp_n_ct   = vcp.get("n_contractions",0)
+                vcp_dry    = vcp.get("vol_is_dry",False)
+                vcp_trend  = vcp.get("in_uptrend",False)
+                premium    = ent.get("premium_setup",False)
+                breaking   = vcp.get("is_breaking",False)
+                near_piv   = vcp.get("near_pivot",False)
+
+                # Grade badges string
+                vcp_grade_labels = ["NONE","C-","C","B","A"]
+                grade_track_html = '<div style="display:flex;gap:3px;margin-top:7px">'
+                for g in vcp_grade_labels:
+                    active = (g == vcp_grade)
+                    bc = vcp_gc if active else "#141e2e"
+                    fc = vcp_gc if active else "#2a3d52"
+                    fw = "700" if active else "400"
+                    grade_track_html += (f'<div style="flex:1;text-align:center;padding:4px 2px;'
+                                         f'border:1px solid {bc};border-radius:2px;'
+                                         f'font-family:IBM Plex Mono,monospace;font-size:9px;'
+                                         f'color:{fc};font-weight:{fw}">{g}</div>')
+                grade_track_html += "</div>"
+
+                premium_banner = ""
+                if premium:
+                    premium_banner = """<div style='margin-top:7px;padding:5px 8px;
+                        background:rgba(0,230,118,.12);border:1px solid rgba(0,230,118,.4);
+                        border-radius:3px;font-family:"IBM Plex Mono",monospace;
+                        font-size:9px;color:#00e676;letter-spacing:1px'>
+                        🔥 PREMIUM SETUP: VCP + ACC CROSS</div>"""
+                if breaking:
+                    premium_banner = """<div style='margin-top:7px;padding:5px 8px;
+                        background:rgba(255,171,0,.12);border:1px solid rgba(255,171,0,.4);
+                        border-radius:3px;font-family:"IBM Plex Mono",monospace;
+                        font-size:9px;color:#ffab00;letter-spacing:1px'>
+                        ⚡ VCP BREAKOUT IN PROGRESS</div>"""
+
+                st.markdown(f"""
+                <div style='background:#0b1018;border:1px solid #141e2e;
+                            border-top:2px solid {vcp_gc};
+                            padding:10px;border-radius:3px;margin-top:8px'>
+                  <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;
+                              color:#5a7a9a;letter-spacing:2px;margin-bottom:4px'>
+                    VCP — VOLATILITY CONTRACTION</div>
+                  <div style='font-family:"IBM Plex Mono",monospace;font-size:1.2rem;
+                              font-weight:700;color:{vcp_gc}'>Grade {vcp_grade}</div>
+                  {grade_track_html}
+                  <div style='margin-top:8px;font-size:10px;color:#cdd8e6;
+                              font-family:"IBM Plex Mono",monospace;line-height:1.8'>
+                    Contractions: <b style='color:{vcp_gc}'>{vcp_n_ct}</b><br>
+                    Tightness: <b style='color:{"#00e676" if vcp_tight<=6 else "#ffab00" if vcp_tight<=15 else "#5a7a9a"}'>{vcp_tight:.1f}%</b>
+                    {"✅ TIGHT" if vcp_tight<=6 else "🟡 OK" if vcp_tight<=15 else ""}<br>
+                    Vol Dry-Up: <b style='color:{"#00e676" if vcp_dry else "#5a7a9a"}'>
+                    {"✅ YES" if vcp_dry else "Not yet"}</b><br>
+                    Uptrend: <b style='color:{"#00e676" if vcp_trend else "#ff8888"}'>
+                    {"✅ YES" if vcp_trend else "❌ Below MAs"}</b><br>
+                    Pivot: <b style='color:#ffab00'>Rp {vcp_pivot:,.0f}</b>
+                    {"  <span style='color:#00e676'>← NEAR!</span>" if near_piv else ""}
+                  </div>
+                  {premium_banner}
+                </div>""", unsafe_allow_html=True)
+
+        # ── VCP FULL CHART (wide section below chart+panel)
+        vcp = R.get("vcp",{})
+        if vcp and vcp.get("available") and vcp.get("grade","NONE") != "NONE":
+            st.markdown("---")
+            st.markdown('<div class="sec">VCP CHART — VOLATILITY CONTRACTION PATTERN</div>',
+                        unsafe_allow_html=True)
+            vcp_grade = vcp.get("grade","NONE")
+            vcp_gc    = vcp.get("grade_color","#5a7a9a")
+            vcp_desc  = vcp.get("grade_desc","")
+
+            # Contraction table
+            contractions = vcp.get("contractions",[])
+            if contractions:
+                col_vt, col_vc = st.columns([3,2])
+                with col_vt:
+                    st.plotly_chart(chart_vcp(R["df"], vcp), use_container_width=True)
+                with col_vc:
+                    st.markdown(f"""
+                    <div style='background:#0b1018;border:1px solid {vcp_gc};
+                                padding:14px;border-radius:3px;margin-bottom:10px'>
+                      <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;
+                                  color:#5a7a9a;letter-spacing:2px;margin-bottom:8px'>
+                        VCP GRADE {vcp_grade} — DETAIL</div>
+                      <div style='font-size:11px;color:#cdd8e6;margin-bottom:10px'>{vcp_desc}</div>
+                    """, unsafe_allow_html=True)
+
+                    # Contraction table
+                    st.markdown('<div class="sec">CONTRACTION SEQUENCE</div>', unsafe_allow_html=True)
+                    for ct in contractions:
+                        depth  = ct["depth_pct"]
+                        is_ok  = depth <= 15
+                        dry    = ct.get("vol_dry_up",False)
+                        d_col  = "#00e676" if is_ok else "#ffab00" if depth<=25 else "#ff8888"
+                        prev_depth = contractions[contractions.index(ct)-1]["depth_pct"] if contractions.index(ct)>0 else 999
+                        shrinking  = depth < prev_depth
+                        st.markdown(f"""
+                        <div style='display:flex;justify-content:space-between;
+                                    padding:5px 0;border-bottom:1px solid #141e2e;
+                                    font-family:"IBM Plex Mono",monospace;font-size:11px'>
+                          <span style='color:#5a7a9a'>Contraction {ct["idx"]}</span>
+                          <span style='color:{d_col}'>{depth:.1f}% depth
+                            {"▼ Shrinking ✓" if shrinking and contractions.index(ct)>0 else ""}</span>
+                          <span style='color:{"#00e676" if dry else "#5a7a9a"}'>
+                            {"📉 Vol ↓" if dry else "Vol ~"}</span>
+                        </div>""", unsafe_allow_html=True)
+
+                    # MA status
+                    st.markdown("""<div style="margin-top:10px">""", unsafe_allow_html=True)
+                    st.markdown('<div class="sec">TREND FILTER (MAs)</div>', unsafe_allow_html=True)
+                    for ma_name, ma_val, is_above in [
+                        ("MA 50",  vcp.get("ma50_v",0),  vcp.get("above_ma50",False)),
+                        ("MA 150", vcp.get("ma150_v",0), vcp.get("above_ma150",False)),
+                        ("MA 200", vcp.get("ma200_v",0), vcp.get("above_ma200",False)),
+                    ]:
+                        mc = "#00e676" if is_above else "#ff8888"
+                        ic = "✅" if is_above else "❌"
+                        st.markdown(f"""
+                        <div class='kv'>
+                          <span class='kv-k'>{ma_name}</span>
+                          <span style='color:#cdd8e6;font-family:"IBM Plex Mono",monospace;font-size:10px'>
+                            Rp {ma_val:,.0f}</span>
+                          <span style='color:{mc};font-size:10px'>{ic} {"Above" if is_above else "Below"}</span>
+                        </div>""", unsafe_allow_html=True)
+
+                    # Entry guidance for VCP
+                    pivot_p = vcp.get("pivot_price",0)
+                    last_p  = vcp.get("last_price",0)
+                    vcp_dry_v = vcp.get("vol_dry_recent",1.0)
+                    st.markdown(f"""
+                    <div style='margin-top:10px;padding:10px;background:rgba(0,0,0,.3);
+                                border-radius:3px;border-left:2px solid {vcp_gc}'>
+                      <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;
+                                  color:#5a7a9a;letter-spacing:1px;margin-bottom:5px'>VCP ENTRY GUIDANCE</div>
+                      <div style='font-size:11px;color:#cdd8e6;line-height:1.7'>
+                        Pivot (buy above): <b style='color:#ffab00'>Rp {pivot_p:,.0f}</b><br>
+                        Current: <b>Rp {last_p:,.0f}</b>
+                        ({((last_p/pivot_p-1)*100):+.1f}% from pivot)<br>
+                        Vol dry-up: <b style='color:{"#00e676" if vcp_dry_v<0.75 else "#5a7a9a"}'>
+                        {vcp_dry_v:.2f}x avg {"✅" if vcp_dry_v<0.75 else ""}</b><br><br>
+                        <b style='color:#eaf0f8'>Entry:</b> Buy breakout above pivot
+                        with volume <b>≥ 1.5x average</b><br>
+                        <b style='color:#ff1744'>Stop-loss:</b> Below last contraction low
+                      </div>
+                    </div>""", unsafe_allow_html=True)
+                    st.markdown("</div>", unsafe_allow_html=True)
+            else:
+                st.plotly_chart(chart_vcp(R["df"], vcp), use_container_width=True)
 
         # ── BROKER + SHAREHOLDERS + FUNDAMENTALS
         st.markdown("---")
@@ -2942,10 +3613,12 @@ with tab_s:
                 c_=cmf(df_tk); o_=obv(df_tk); m_=mfi(df_tk)
                 wp_,wn_,_ = wyckoff(df_tk,c_,o_)
                 ts_ = tech_score(df_tk,c_,o_,m_)
+                vcp_ = detect_vcp(df_tk)        # VCP for each screener stock
                 bdf_,src_ = get_broker_today(tk, sb_token)
                 if bdf_ is None: bdf_ = demo_broker(tk,ts_)
                 br_  = analyze_broker(bdf_)
-                fs   = int(np.clip(round(ts_*.6+br_["score"]*.4),0,100))
+                vcp_s_ = vcp_.get("score",0)
+                fs   = int(np.clip(round(ts_*.55+br_["score"]*.35+vcp_s_*.10),0,100))
                 last_= df_tk.iloc[-1]; prev_=df_tk.iloc[-2]
                 chg_ = (last_["close"]-prev_["close"])/prev_["close"]*100
                 av_  = df_tk["volume"].tail(20).mean()
@@ -2954,12 +3627,16 @@ with tab_s:
                 own_ = OWNER_DB.get(tk.upper().replace(".JK",""))
                 ent_ = entry_signal(fs,ts_,br_["score"],wp_,float(c_.iloc[-1]),
                                     obv_,float(m_.iloc[-1]),vr_,br_["crossing"],
-                                    br_["goreng"],br_["sm_buyers"],br_["sm_sellers"],chg_,own_)
+                                    br_["goreng"],br_["sm_buyers"],br_["sm_sellers"],
+                                    chg_,own_,vcp=vcp_)
+                vcp_grade_ = vcp_.get("grade","NONE")
                 rows.append({
                     "Ticker":tk, "Price":f"Rp {int(last_['close']):,}",
                     "Change":f"{'+'if chg_>=0 else ''}{chg_:.2f}%",
                     "Score":fs, "Signal":ent_["sig"], "Risk":ent_["risk"],
-                    "Owner":own_["owner"][:22] if own_ else "—",
+                    "VCP":vcp_grade_,
+                    "Premium":"🔥" if ent_.get("premium_setup") else "",
+                    "Owner":own_["owner"][:20] if own_ else "—",
                     "Tier":f"T{own_['tier']}" if own_ else "—",
                     "Float":f"{own_['float']}%" if own_ else "—",
                     "Pol":"⚡" if (own_ and own_.get("political")) else "",
@@ -2979,15 +3656,19 @@ with tab_s:
                 c3.metric("WATCH",      len([r for r in rows if r["_sig"]=="WATCH"]))
                 c4.metric("AVOID",      len([r for r in rows if "AVOID" in r["_sig"]]))
                 disp=["Ticker","Price","Change","Score","Signal","Risk",
-                      "Owner","Tier","Float","Pol","Ph","CMF","Vol","Cross","Data"]
+                      "VCP","Premium","Owner","Tier","Float","Pol","Ph","CMF","Vol","Cross","Data"]
                 st.dataframe(df_r[disp],hide_index=True,use_container_width=True,
                     column_config={"Score":st.column_config.ProgressColumn(
                         "Score",min_value=0,max_value=100,format="%d")})
                 sb_=[r["Ticker"] for r in rows if r["_sig"]=="STRONG BUY"]
                 b_= [r["Ticker"] for r in rows if r["_sig"]=="BUY"]
                 pol=[r["Ticker"] for r in rows if r["Pol"]=="⚡"]
+                vcp_a=[r["Ticker"] for r in rows if r["VCP"]=="A"]
+                prem=[r["Ticker"] for r in rows if r["Premium"]=="🔥"]
                 if sb_: st.success(f"🔥 **STRONG BUY**: {' · '.join(sb_)}")
                 if b_:  st.success(f"✅ **BUY**: {' · '.join(b_)}")
+                if vcp_a: st.success(f"⭐ **VCP Grade A** (ideal contraction): {' · '.join(vcp_a)}")
+                if prem:  st.success(f"💎 **PREMIUM SETUP** (VCP + ACC Cross): {' · '.join(prem)}")
                 if pol: st.warning(f"⚡ **Political exposure** (extra risk): {', '.join(pol)}")
     else:
         st.markdown("""<div style='text-align:center;padding:50px;border:1px dashed #141e2e;border-radius:4px'>
