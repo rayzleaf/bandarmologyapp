@@ -79,6 +79,23 @@ st.markdown("""
 }
 .stButton>button:hover { background:#00ff88!important; box-shadow:0 4px 18px rgba(0,230,118,.3)!important; }
 
+/* Sidebar preset buttons — smaller, outlined style */
+[data-testid="stSidebar"] .stButton>button {
+  background:transparent!important;
+  color:var(--green)!important;
+  border:1px solid var(--green)!important;
+  font-size:10px!important;
+  font-weight:600!important;
+  letter-spacing:1px!important;
+  padding:5px 8px!important;
+  border-radius:3px!important;
+  box-shadow:none!important;
+}
+[data-testid="stSidebar"] .stButton>button:hover {
+  background:rgba(0,230,118,.12)!important;
+  box-shadow:none!important;
+}
+
 .stTextInput>div>div, .stTextArea>div>div {
   background:var(--bg3)!important; border:1px solid var(--border2)!important;
   color:var(--white)!important; font-family:'IBM Plex Mono',monospace!important;
@@ -2050,21 +2067,14 @@ with st.sidebar:
     accu_days = st.select_slider("Trading days", [5,10,15,20,30,45,60,90], value=20)
 
     st.markdown("---")
-    st.markdown("**SCREENER WATCHLIST**")
     st.markdown("""
-    <div style='font-size:10px;color:#5a7a9a;font-family:"IBM Plex Mono",monospace;margin-bottom:6px'>
-    Ketik kode saham IDX apa saja, pisahkan koma.<br>
-    <b style='color:#00e676'>Tidak ada batasan jumlah</b> — bisa 5 sampai 100+ saham.
+    <div style='font-family:"IBM Plex Mono",monospace;font-size:11px;font-weight:600;
+                color:#cdd8e6;letter-spacing:1px;margin-bottom:6px'>SCREENER WATCHLIST</div>
+    <div style='font-size:10px;color:#5a7a9a;font-family:"IBM Plex Mono",monospace;
+                margin-bottom:10px;line-height:1.6'>
+    Tulis kode saham IDX, pisahkan koma.<br>
+    Tidak ada batasan — bisa 5 sampai 100+ saham.
     </div>""", unsafe_allow_html=True)
-
-    # Preset watchlist buttons
-    col_p1, col_p2, col_p3 = st.columns(3)
-    with col_p1:
-        load_lq45   = st.button("LQ45",      use_container_width=True, key="btn_lq45")
-    with col_p2:
-        load_idx30  = st.button("IDX30",     use_container_width=True, key="btn_idx30")
-    with col_p3:
-        load_growth = st.button("GROWTH",    use_container_width=True, key="btn_growth")
 
     # Default / preset values
     DEFAULT_WL = (
@@ -2112,6 +2122,29 @@ with st.sidebar:
         "ICBP,MYOR"
     )
 
+    # Preset buttons — small inline style, not full-width
+    st.markdown("""
+    <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;color:#5a7a9a;
+                letter-spacing:1px;margin-bottom:5px'>LOAD PRESET:</div>""",
+    unsafe_allow_html=True)
+
+    col_p1, col_p2, col_p3 = st.columns(3)
+    with col_p1:
+        load_lq45 = st.button(
+            "LQ45", use_container_width=True, key="btn_lq45",
+            help="Load 45 saham LQ45 IDX"
+        )
+    with col_p2:
+        load_idx30 = st.button(
+            "IDX30", use_container_width=True, key="btn_idx30",
+            help="Load 30 saham IDX30"
+        )
+    with col_p3:
+        load_growth = st.button(
+            "Growth", use_container_width=True, key="btn_growth",
+            help="Load saham pertumbuhan pilihan"
+        )
+
     if load_lq45:
         st.session_state["wl_val"] = LQ45_WL
     elif load_idx30:
@@ -2122,9 +2155,18 @@ with st.sidebar:
     wl_raw = st.text_area(
         "Tickers (comma-separated)",
         value=st.session_state.get("wl_val", DEFAULT_WL),
-        height=130,
+        height=110,
         key="wl_area",
+        help="Contoh: BBCA,BREN,AMMN,GOTO — pisahkan dengan koma",
+        label_visibility="collapsed",
     )
+    # Show count of tickers entered
+    _wl_count = len([t for t in wl_raw.replace("\n",",").split(",") if t.strip()])
+    st.markdown(f"""
+    <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;color:#5a7a9a;
+                margin-top:3px;margin-bottom:2px'>
+    {_wl_count} saham terdaftar · Edit langsung di atas
+    </div>""", unsafe_allow_html=True)
 
     st.markdown("---")
     st.markdown("""
@@ -2206,7 +2248,14 @@ with tab_a:
             c_ = cmf(df); o_ = obv(df); m_ = mfi(df)
             wp,wn,wd = wyckoff(df,c_,o_); ts = tech_score(df,c_,o_,m_)
             ez = entry_zone(df)
-            vcp = detect_vcp(df)        # VCP detection
+            # VCP needs min 120 days — load 6M if current period is too short
+            if len(df) < 120:
+                df_vcp = load_price(ticker_input, "6mo")
+                if df_vcp is None or len(df_vcp) < 60:
+                    df_vcp = df
+            else:
+                df_vcp = df
+            vcp = detect_vcp(df_vcp)
         with st.spinner("Fetching broker summary (today) ..."):
             bdf, src = get_broker_today(ticker_input, sb_token)
             if bdf is None:
@@ -3601,6 +3650,19 @@ with tab_s:
         est_min = round(n_wl * 3 / 60, 1)
         st.info(f"⏱️ {n_wl} stocks — estimated **{est_min} min** to scan. Cached after first run.")
 
+    # VCP data requirement warning
+    if period in ("1mo","1M"):
+        st.warning(
+            "⚠️ **Period 1M terlalu pendek untuk VCP** — VCP butuh minimal 120 hari data (6M). "
+            "VCP akan otomatis di-fetch dari data 6M terpisah. "
+            "Ganti ke 3M/6M untuk hasil terbaik."
+        )
+    elif period in ("3mo","3M"):
+        st.info(
+            "💡 **Tip VCP**: Period 3M cukup untuk basic detection. "
+            "Gunakan 6M atau 1Y untuk deteksi kontraksi yang lebih akurat."
+        )
+
     if st.button("▶  SCAN ALL STOCKS", use_container_width=False):
         if not wl:
             st.warning("Add tickers to the watchlist in the sidebar.")
@@ -3608,12 +3670,23 @@ with tab_s:
             rows=[]; prog=st.progress(0)
             for i,tk in enumerate(wl):
                 prog.progress((i+1)/len(wl), text=f"Analyzing {tk} ... ({i+1}/{len(wl)})")
+
+                # Load price for selected period (for indicators + chart)
                 df_tk = load_price(tk, period)
                 if df_tk is None or len(df_tk)<20: continue
+
+                # VCP needs min 120 days — always load 6M regardless of period
+                if len(df_tk) < 120:
+                    df_vcp_ = load_price(tk, "6mo")
+                    if df_vcp_ is None or len(df_vcp_) < 60:
+                        df_vcp_ = df_tk
+                else:
+                    df_vcp_ = df_tk
+
                 c_=cmf(df_tk); o_=obv(df_tk); m_=mfi(df_tk)
                 wp_,wn_,_ = wyckoff(df_tk,c_,o_)
                 ts_ = tech_score(df_tk,c_,o_,m_)
-                vcp_ = detect_vcp(df_tk)        # VCP for each screener stock
+                vcp_ = detect_vcp(df_vcp_)      # VCP always uses 6M+ data
                 bdf_,src_ = get_broker_today(tk, sb_token)
                 if bdf_ is None: bdf_ = demo_broker(tk,ts_)
                 br_  = analyze_broker(bdf_)
