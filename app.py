@@ -736,23 +736,6 @@ def tech_score(df, c, o, m):
     if pt>0.01  and mt<-3: sc-=15
     return int(np.clip(round(sc),0,100))
 
-def tech_score(df, c, o, m):
-    sc = 50.0
-    cv = float(c.iloc[-1]) if not pd.isna(c.iloc[-1]) else 0
-    sc += np.clip(cv*125,-25,25)
-    os = (o.iloc[-1]-o.iloc[-min(10,len(o)-1)]) / (abs(o.iloc[-min(10,len(o)-1)])+1)
-    sc += np.clip(os*500,-20,20)
-    last = df.iloc[-1]; sp = last["high"]-last["low"]
-    cp = (last["close"]-last["low"]) / (sp if sp>0 else 1)
-    sc += (cp-0.5)*30
-    av = df["volume"].tail(20).mean(); vr = last["volume"]/av if av>0 else 1
-    if vr>1.3: sc += 15 if cp>0.5 else -15
-    pt = (df["close"].iloc[-1]-df["close"].iloc[-min(10,len(df)-1)]) / df["close"].iloc[-min(10,len(df)-1)]
-    mt = float(m.iloc[-1]-m.iloc[-min(10,len(m)-1)])
-    if pt<-0.01 and mt>3:  sc+=15
-    if pt>0.01  and mt<-3: sc-=15
-    return int(np.clip(round(sc),0,100))
-
 
 # ══════════════════════════════════════════════════════════════════════
 #  VCP — VOLATILITY CONTRACTION PATTERN ENGINE
@@ -1090,19 +1073,504 @@ def chart_vcp(df: pd.DataFrame, vcp: dict) -> go.Figure:
 
 
 def entry_zone(df):
-    a   = atr(df); lp  = float(df["close"].iloc[-1])
-    la  = float(a.iloc[-1]) if not pd.isna(a.iloc[-1]) else lp*.02
-    sup = float(df["low"].tail(10).min())
-    res = float(df["high"].tail(20).max())
-    sl  = round(sup*.97,0)
-    el  = round(sup*1.005,0)
-    eh  = round(min(lp*1.02,sup*1.03),0)
-    t1  = round(res*.98,0)
-    risk= lp-sl; reward=t1-lp
-    return dict(el=el,eh=eh,sl=sl,t1=t1,
-                risk_pct=round((lp-sl)/lp*100,1),
-                rr=round(reward/risk,1) if risk>0 else 0,
-                sup=sup,res=res)
+    """
+    Entry zone with ATR-based stop-loss (quant standard).
+    Stop = Entry - (1.5 × ATR14) — adapts to each stock's own volatility.
+    BREN with ATR=800 gets SL 1,200 below entry.
+    BBCA with ATR=30  gets SL 45 below entry.
+    """
+    a_ser = atr(df)
+    lp    = float(df["close"].iloc[-1])
+    la    = float(a_ser.iloc[-1]) if not pd.isna(a_ser.iloc[-1]) else lp * .02
+    sup   = float(df["low"].tail(10).min())
+    res   = float(df["high"].tail(20).max())
+
+    # ATR-based stop-loss (primary) vs support-based (fallback)
+    sl_atr     = round(lp - 1.5 * la, 0)
+    sl_support = round(sup * .97, 0)
+    sl         = max(sl_atr, sl_support)   # tighter of the two
+
+    # Entry: at/near VCP pivot or current price
+    el = round(lp,0)
+    eh = round(lp * 1.015, 0)
+
+    # Targets: R:R 1.5, 2.5, 4.0
+    risk   = lp - sl
+    t1     = round(lp + 1.5 * risk, 0)
+    t2     = round(lp + 2.5 * risk, 0)
+    t3     = round(lp + 4.0 * risk, 0)
+    return dict(
+        el=el, eh=eh, sl=sl, t1=t1, t2=t2, t3=t3,
+        atr=round(la, 0),
+        risk_pct=round((lp - sl) / lp * 100, 1),
+        rr1=1.5, rr2=2.5, rr3=4.0,
+        sup=sup, res=res,
+        sl_method="ATR" if sl == sl_atr else "Support",
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  MODULE: MARKET REGIME FILTER + SECTOR INTELLIGENCE
+#
+#  Philosophy: Not a binary ON/OFF signal filter.
+#  Instead, a CONTEXT LAYER that:
+#    1. Detects the macro regime (Bull / Rotation / Risk-Off / Crash)
+#    2. Identifies WHAT IS CAUSING the regime (rates, commodity, political)
+#    3. Measures which sectors are receiving inflows vs outflows
+#    4. Adjusts signal conviction based on sector alignment
+#
+#  IDX-specific sectors tracked:
+#  Banking, Consumer, Mining, Energy, Property, Tech, Telecoms,
+#  Industrial, Healthcare, Infrastructure
+# ══════════════════════════════════════════════════════════════════════
+
+# Sector ETF proxies for IDX (using available Yahoo Finance tickers)
+SECTOR_TICKERS = {
+    "Banking"     : ["BBCA.JK","BBRI.JK","BMRI.JK"],
+    "Mining"      : ["ADRO.JK","MDKA.JK","BYAN.JK"],
+    "Energy"      : ["AMMN.JK","MEDC.JK","PGAS.JK"],
+    "Consumer"    : ["ICBP.JK","INDF.JK","UNVR.JK"],
+    "Telecoms"    : ["TLKM.JK","EXCL.JK","ISAT.JK"],
+    "Property"    : ["BSDE.JK","CTRA.JK","PWON.JK"],
+    "Healthcare"  : ["KLBF.JK","SIDO.JK","MIKA.JK"],
+    "Tech/Digital": ["GOTO.JK","BUKA.JK","EMTK.JK"],
+    "Industrial"  : ["ASII.JK","UNTR.JK","INCO.JK"],
+}
+
+# Sector sensitivity to macro factors
+# (which regime each sector benefits from)
+SECTOR_REGIME_MAP = {
+    "Mining"      : ["commodity_up", "global_growth"],
+    "Energy"      : ["commodity_up", "geopolitical_risk"],
+    "Banking"     : ["bull_market",  "rate_stable"],
+    "Consumer"    : ["bull_market",  "risk_off_defensive"],
+    "Telecoms"    : ["risk_off_defensive", "bull_market"],
+    "Healthcare"  : ["risk_off_defensive"],
+    "Property"    : ["bull_market",  "rate_stable"],
+    "Tech/Digital": ["bull_market",  "global_growth"],
+    "Industrial"  : ["bull_market",  "global_growth"],
+}
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def detect_market_regime(ihsg_period: str = "1y") -> dict:
+    """
+    Detect current IDX market regime using IHSG technical analysis.
+
+    Returns:
+        regime: BULL / SECTOR_ROTATION / RISK_OFF / CRASH
+        cause:  List of suspected drivers
+        conviction_multiplier: How to adjust signal scores
+        description: Human-readable explanation
+    """
+    ihsg = load_ihsg(ihsg_period)
+    if ihsg is None or len(ihsg) < 50:
+        return {"regime": "UNKNOWN", "available": False,
+                "multiplier": 1.0, "description": "IHSG data unavailable"}
+
+    p  = ihsg["close"]
+    n  = len(p)
+
+    ma20  = p.rolling(20).mean()
+    ma50  = p.rolling(50).mean()
+    ma200 = p.rolling(200).mean() if n >= 200 else p.rolling(min(n,120)).mean()
+
+    lp    = float(p.iloc[-1])
+    ma20v = float(ma20.iloc[-1])
+    ma50v = float(ma50.iloc[-1])
+    ma200v= float(ma200.iloc[-1])
+
+    # 20-day and 60-day IHSG return
+    ret20  = (lp - float(p.iloc[-min(20,n-1)])) / float(p.iloc[-min(20,n-1)])  * 100
+    ret60  = (lp - float(p.iloc[-min(60,n-1)])) / float(p.iloc[-min(60,n-1)]) * 100
+    ret5   = (lp - float(p.iloc[-min(5, n-1)])) / float(p.iloc[-min(5, n-1)]) * 100
+
+    # Peak drawdown (from 52-week high)
+    peak   = float(p.tail(252).max()) if n >= 252 else float(p.max())
+    dd_pct = (lp - peak) / peak * 100
+
+    # Volatility (20-day realized)
+    daily_ret  = p.pct_change().dropna()
+    vol_20     = float(daily_ret.tail(20).std() * np.sqrt(252) * 100)
+
+    # ── Regime Classification
+    above_ma50  = lp > ma50v
+    above_ma200 = lp > ma200v
+    ma50_rising = float(ma50.iloc[-1]) > float(ma50.iloc[-min(20,n-1)])
+
+    causes = []
+
+    # Check commodity signals (proxy: check if we can detect from IHSG vs global)
+    # In practice: IHSG flat/down while commodity stocks (ADRO/BYAN) are up = commodity rotation
+
+    if dd_pct < -25 or ret60 < -20:
+        regime = "CRASH"
+        multiplier = 0.5
+        description = (f"IHSG is in systemic decline ({dd_pct:.1f}% from peak, "
+                       f"{ret60:.1f}% over 60d). Most signals are unreliable. "
+                       "Only defensive/commodity plays with specific catalysts.")
+        causes = ["systematic_selloff"]
+        regime_color = "#ff1744"
+
+    elif dd_pct < -12 or ret60 < -8:
+        regime = "RISK_OFF"
+        multiplier = 0.75
+        description = (f"IHSG under pressure ({dd_pct:.1f}% from peak). Risk-off environment. "
+                       "Raise entry thresholds — only Grade A VCP + ACC Cross qualify. "
+                       "Sector rotation to defensives/commodities likely.")
+        if not above_ma50: causes.append("below_ma50")
+        if vol_20 > 20:    causes.append("elevated_volatility")
+        regime_color = "#ff8844"
+
+    elif abs(ret20) < 3 and ret60 < 5 and above_ma200:
+        regime = "SECTOR_ROTATION"
+        multiplier = 1.0
+        description = (f"IHSG sideways ({ret20:.1f}% / 20d, {ret60:.1f}% / 60d). "
+                       "Capital is rotating between sectors — not leaving the market. "
+                       "Best environment for stock picking. Focus on sectors with rising RS.")
+        causes = ["sector_rotation"]
+        regime_color = "#ffab00"
+
+    elif above_ma50 and above_ma200 and ma50_rising:
+        regime = "BULL"
+        multiplier = 1.15
+        description = (f"IHSG in uptrend (above MA50 & MA200, MA50 rising). "
+                       f"Recent: {ret20:.1f}% / 20d, {ret60:.1f}% / 60d. "
+                       "Broad market tailwind. All sectors eligible, focus on highest RS.")
+        causes = ["broad_uptrend"]
+        regime_color = "#00e676"
+
+    else:
+        regime = "MIXED"
+        multiplier = 0.90
+        description = (f"IHSG in mixed/uncertain state. {ret20:.1f}% / 20d. "
+                       "Exercise caution, increase confirmation requirements.")
+        regime_color = "#5a7a9a"
+
+    return {
+        "available"   : True,
+        "regime"      : regime,
+        "color"       : regime_color,
+        "multiplier"  : multiplier,
+        "description" : description,
+        "causes"      : causes,
+        "ihsg_last"   : round(lp, 2),
+        "ret20"       : round(ret20, 2),
+        "ret60"       : round(ret60, 2),
+        "ret5"        : round(ret5, 2),
+        "dd_pct"      : round(dd_pct, 2),
+        "vol_20"      : round(vol_20, 1),
+        "above_ma50"  : above_ma50,
+        "above_ma200" : above_ma200,
+        "ma50_rising" : ma50_rising,
+        "ma50v"       : round(ma50v, 0),
+        "ma200v"      : round(ma200v, 0),
+    }
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def detect_sector_rotation() -> dict:
+    """
+    Measure RS of each IDX sector vs IHSG over 20d and 60d.
+    Identifies which sectors are receiving / losing inflows.
+    """
+    ihsg = load_ihsg("6mo")
+    if ihsg is None: return {"available": False}
+
+    sector_rs = {}
+    for sector, tickers in SECTOR_TICKERS.items():
+        sector_rets_20, sector_rets_60 = [], []
+        for tk in tickers[:2]:  # use top 2 per sector
+            try:
+                df = yf.download(tk, period="6mo", interval="1d",
+                                  progress=False, auto_adjust=True)
+                if df.empty: continue
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                p = df["Close"].dropna()
+                if len(p) < 25: continue
+                r20 = (float(p.iloc[-1]) - float(p.iloc[-min(20,len(p)-1)])) / float(p.iloc[-min(20,len(p)-1)]) * 100
+                r60 = (float(p.iloc[-1]) - float(p.iloc[-min(60,len(p)-1)])) / float(p.iloc[-min(60,len(p)-1)]) * 100
+                sector_rets_20.append(r20)
+                sector_rets_60.append(r60)
+            except: continue
+        if not sector_rets_20: continue
+
+        ihsg_r20 = (float(ihsg["close"].iloc[-1]) - float(ihsg["close"].iloc[-min(20,len(ihsg)-1)])) / float(ihsg["close"].iloc[-min(20,len(ihsg)-1)]) * 100
+        ihsg_r60 = (float(ihsg["close"].iloc[-1]) - float(ihsg["close"].iloc[-min(60,len(ihsg)-1)])) / float(ihsg["close"].iloc[-min(60,len(ihsg)-1)]) * 100
+
+        avg20 = np.mean(sector_rets_20)
+        avg60 = np.mean(sector_rets_60)
+        rs20  = avg20 - ihsg_r20  # excess return vs IHSG
+        rs60  = avg60 - ihsg_r60
+
+        sector_rs[sector] = {
+            "ret20"   : round(avg20, 2),
+            "ret60"   : round(avg60, 2),
+            "rs20"    : round(rs20, 2),
+            "rs60"    : round(rs60, 2),
+            "inflow"  : rs20 > 1.0 and rs60 > 0,
+            "outflow" : rs20 < -1.0,
+            "status"  : ("INFLOW ▲" if rs20 > 1.0 else
+                         "OUTFLOW ▼" if rs20 < -1.0 else "NEUTRAL →"),
+            "color"   : ("#00e676" if rs20 > 1.0 else
+                         "#ff1744" if rs20 < -1.0 else "#5a7a9a"),
+        }
+
+    return {"available": True, "sectors": sector_rs}
+
+
+def get_stock_sector(ticker: str) -> str:
+    """Map a ticker to its IDX sector."""
+    t = ticker.upper().replace(".JK","")
+    sector_map = {
+        "Banking"     : {"BBCA","BBRI","BMRI","BBNI","BBTN","BJTM","NISP","ARTO","BTPS"},
+        "Mining"      : {"ADRO","ADMR","MDKA","BYAN","PTBA","ANTM","INCO","TINS","MBMA"},
+        "Energy"      : {"AMMN","MEDC","PGAS","ELSA","RUIS","CUAN","BREN"},
+        "Consumer"    : {"ICBP","INDF","UNVR","MYOR","ROTI","SIDO","DLTA","HMSP","GGRM"},
+        "Telecoms"    : {"TLKM","EXCL","ISAT","TBIG","TOWR","DCII"},
+        "Property"    : {"BSDE","CTRA","PWON","ASRI","LPKR","PANI","CBDK","SMRA"},
+        "Healthcare"  : {"KLBF","KAEF","MIKA","HEAL","SIDO","PRDA"},
+        "Tech/Digital": {"GOTO","BUKA","EMTK","DMMX","ARTO","META"},
+        "Industrial"  : {"ASII","UNTR","INCO","SSIA","ACST","WTON"},
+        "Petrochemical":{"BRPT","TPIA","CHANDRA"},
+    }
+    for sector, tickers in sector_map.items():
+        if t in tickers:
+            return sector
+    return "Other"
+
+
+def regime_signal_adjustment(regime: dict, sector: str,
+                               sector_data: dict) -> dict:
+    """
+    Adjust signal conviction based on:
+    1. Overall market regime (multiplier)
+    2. Whether this stock's sector is receiving inflows
+    3. Regime-sector alignment (e.g., Mining in commodity_up = no penalty)
+
+    Returns adjustment dict with score_adj, note, allowed.
+    """
+    if not regime.get("available"):
+        return {"score_adj": 0, "note": "", "allowed": True, "regime_ok": True}
+
+    base_mult  = regime["multiplier"]
+    reg_name   = regime["regime"]
+    causes     = regime.get("causes", [])
+    score_adj  = 0
+    notes      = []
+    allowed    = True
+
+    # Sector inflow/outflow check
+    sectors_data = sector_data.get("sectors", {}) if sector_data.get("available") else {}
+    sect_info    = sectors_data.get(sector, {})
+    sect_inflow  = sect_info.get("inflow",  False)
+    sect_outflow = sect_info.get("outflow", False)
+
+    # Core regime adjustment
+    if reg_name == "CRASH":
+        score_adj = -20
+        notes.append("Market in systematic decline — reduce all position sizes")
+        # Exception: commodity sectors might still work
+        if sector in ("Mining","Energy") and "systematic_selloff" in causes:
+            score_adj = -10
+            notes.append("Commodity sector — partial exception to crash filter")
+
+    elif reg_name == "RISK_OFF":
+        score_adj = -10
+        notes.append("Risk-off environment — raise entry bar")
+        # Defensives and commodities get less penalty
+        if sector in ("Healthcare","Consumer","Telecoms"):
+            score_adj = -3
+            notes.append(f"{sector} is a defensive sector — less impacted by risk-off")
+        elif sector in ("Mining","Energy") and sect_inflow:
+            score_adj = 0
+            notes.append(f"{sector} receiving inflows — commodity rotation may be active")
+
+    elif reg_name == "SECTOR_ROTATION":
+        # Bonus for sectors receiving inflows, penalty for outflows
+        if sect_inflow:
+            score_adj = +8
+            notes.append(f"{sector} sector receiving inflows — rotation tailwind")
+        elif sect_outflow:
+            score_adj = -8
+            notes.append(f"{sector} sector losing capital — rotation headwind")
+        else:
+            notes.append("Sector rotation active — check sector RS")
+
+    elif reg_name == "BULL":
+        if sect_inflow:
+            score_adj = +5
+            notes.append(f"Bull market + {sector} inflow = double tailwind")
+        else:
+            score_adj = 0
+
+    # Final: apply multiplier to adjustment magnitude
+    score_adj = int(round(score_adj * base_mult))
+
+    return {
+        "score_adj"  : score_adj,
+        "notes"      : notes,
+        "allowed"    : allowed,
+        "regime_ok"  : reg_name in ("BULL","SECTOR_ROTATION","MIXED"),
+        "sect_inflow": sect_inflow,
+        "sect_outflow":sect_outflow,
+    }
+
+
+def chart_sector_heatmap(sector_data: dict) -> go.Figure:
+    """Sector RS heatmap — shows which sectors are in/out of favor."""
+    if not sector_data.get("available"):
+        return go.Figure()
+    sectors = sector_data["sectors"]
+    if not sectors:
+        return go.Figure()
+
+    names  = list(sectors.keys())
+    rs20   = [sectors[s]["rs20"]  for s in names]
+    rs60   = [sectors[s]["rs60"]  for s in names]
+    colors = [sectors[s]["color"] for s in names]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        name="RS 20d (vs IHSG)",
+        x=names, y=rs20,
+        marker_color=["rgba(0,230,118,.7)" if v>0 else "rgba(255,23,68,.7)" for v in rs20],
+        text=[f"{v:+.1f}%" for v in rs20],
+        textposition="outside", textfont=dict(size=10),
+    ))
+    fig.add_trace(go.Bar(
+        name="RS 60d (vs IHSG)",
+        x=names, y=rs60,
+        marker_color=["rgba(0,230,118,.35)" if v>0 else "rgba(255,23,68,.35)" for v in rs60],
+        text=[f"{v:+.1f}%" for v in rs60],
+        textposition="inside", textfont=dict(size=9),
+    ))
+    fig.add_hline(y=0, line_color="#5a7a9a", line_width=1)
+    fig.update_layout(
+        paper_bgcolor="#05080c", plot_bgcolor="#090d12",
+        font=dict(color="#cdd8e6", family="IBM Plex Mono, monospace", size=11),
+        barmode="group", bargap=0.25,
+        legend=dict(bgcolor="#0b1018", bordercolor="#141e2e", font=dict(size=10)),
+        margin=dict(l=0, r=0, t=10, b=0), height=300,
+        xaxis=dict(gridcolor="#141e2e"),
+        yaxis=dict(gridcolor="#141e2e", title="Excess Return vs IHSG (%)"),
+    )
+    return fig
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  MODULE: POSITION SIZING CALCULATOR
+#  Standard quant method: Fixed % Risk
+#  Position Size = (Capital × Risk%) / (Entry − Stop-Loss)
+#  No guessing. No oversize. Bankrupt-proof.
+# ══════════════════════════════════════════════════════════════════════
+
+def calc_position_size(capital: float, risk_pct: float,
+                       entry: float, stop_loss: float,
+                       lot_size: int = 100) -> dict:
+    """
+    Calculate optimal position size based on fixed % risk.
+
+    Args:
+        capital:   Total trading capital (Rp)
+        risk_pct:  Max % of capital willing to lose on this trade (e.g. 2.0)
+        entry:     Entry price (Rp)
+        stop_loss: Stop-loss price (Rp)
+        lot_size:  Shares per lot (IDX default: 100)
+
+    Returns:
+        lots:       Number of lots to buy
+        shares:     Number of shares (lots × lot_size)
+        total_cost: Total investment (Rp)
+        max_loss:   Maximum loss if stop triggered (Rp)
+        risk_amount:Capital at risk (Rp) = capital × risk_pct%
+    """
+    if entry <= stop_loss or capital <= 0 or entry <= 0:
+        return {"valid": False, "error": "Invalid inputs: entry must be above stop-loss"}
+
+    risk_amount    = capital * (risk_pct / 100)
+    risk_per_share = entry - stop_loss
+    optimal_shares = risk_amount / risk_per_share
+
+    # Round DOWN to nearest lot
+    lots           = max(1, int(optimal_shares // lot_size))
+    shares         = lots * lot_size
+    total_cost     = shares * entry
+    max_loss       = shares * risk_per_share
+    actual_risk_pct= max_loss / capital * 100
+    pct_of_capital = total_cost / capital * 100
+
+    # Kelly fraction (optional reference)
+    # Kelly is typically too aggressive; we show it as a ceiling only
+
+    return {
+        "valid"          : True,
+        "lots"           : lots,
+        "shares"         : shares,
+        "total_cost"     : round(total_cost, 0),
+        "max_loss"       : round(max_loss, 0),
+        "risk_amount"    : round(risk_amount, 0),
+        "actual_risk_pct": round(actual_risk_pct, 2),
+        "pct_of_capital" : round(pct_of_capital, 1),
+        "risk_per_share" : round(risk_per_share, 0),
+        "risk_pct_input" : risk_pct,
+        "capital"        : capital,
+        "entry"          : entry,
+        "stop_loss"      : stop_loss,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  MODULE: SCORE NORMALIZATION
+#  Raw scores 0-100 lose meaning when the whole market is bullish.
+#  Percentile rank tells you: "This stock is top X% of all stocks
+#  scanned TODAY under CURRENT market conditions."
+#  Score 88 in bull market ≠ Score 88 in bear market.
+# ══════════════════════════════════════════════════════════════════════
+
+def normalize_scores(scores: list) -> list:
+    """
+    Convert raw composite scores to percentile ranks within the scanned universe.
+    Score of 75 → "this stock scored better than 75% of all stocks scanned today"
+
+    Also applies regime adjustment:
+    - Bull market: full scores, no adjustment needed
+    - Bear/Risk-off: compress scores toward median (less false positives)
+    """
+    if not scores or len(scores) < 2:
+        return scores
+
+    arr = np.array(scores, dtype=float)
+    percentiles = []
+    for s in arr:
+        pct = float(np.sum(arr < s)) / len(arr) * 100
+        percentiles.append(round(pct, 1))
+    return percentiles
+
+
+def score_grade(raw: int, percentile: float) -> tuple:
+    """
+    Combine raw score and percentile into a final grade and label.
+
+    Grade system:
+    S  = raw ≥75 AND percentile ≥85  → Exceptional
+    A  = raw ≥65 AND percentile ≥70  → Strong
+    B  = raw ≥55 AND percentile ≥50  → Above average
+    C  = raw ≥45                     → Average
+    D  = raw <45                     → Below average
+    """
+    if raw >= 75 and percentile >= 85:
+        return "S", "#00e676", "Exceptional — top tier"
+    elif raw >= 65 and percentile >= 70:
+        return "A", "#88ffbb", "Strong — above most"
+    elif raw >= 55 and percentile >= 50:
+        return "B", "#ffab00", "Above average"
+    elif raw >= 45:
+        return "C", "#ff8888", "Average"
+    else:
+        return "D", "#ff1744", "Below average"
+
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fundamentals(ticker):
@@ -2063,7 +2531,7 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("**ACCUMULATION WINDOW**")
     st.markdown("""<div style='font-size:10px;color:#5a7a9a;font-family:"IBM Plex Mono",monospace;margin-bottom:4px'>
-    Berapa hari trading untuk hitung posisi kumulatif broker</div>""", unsafe_allow_html=True)
+    Number of trading days for cumulative broker position calculation</div>""", unsafe_allow_html=True)
     accu_days = st.select_slider("Trading days", [5,10,15,20,30,45,60,90], value=20)
 
     st.markdown("---")
@@ -2072,8 +2540,8 @@ with st.sidebar:
                 color:#cdd8e6;letter-spacing:1px;margin-bottom:6px'>SCREENER WATCHLIST</div>
     <div style='font-size:10px;color:#5a7a9a;font-family:"IBM Plex Mono",monospace;
                 margin-bottom:10px;line-height:1.6'>
-    Tulis kode saham IDX, pisahkan koma.<br>
-    Tidak ada batasan — bisa 5 sampai 100+ saham.
+    Enter any IDX tickers, separated by commas.<br>
+    No limit — from 5 up to 100+ stocks.
     </div>""", unsafe_allow_html=True)
 
     # Default / preset values
@@ -2132,40 +2600,42 @@ with st.sidebar:
     with col_p1:
         load_lq45 = st.button(
             "LQ45", use_container_width=True, key="btn_lq45",
-            help="Load 45 saham LQ45 IDX"
+            help="Load LQ45 index — 45 stocks"
         )
     with col_p2:
         load_idx30 = st.button(
             "IDX30", use_container_width=True, key="btn_idx30",
-            help="Load 30 saham IDX30"
+            help="Load IDX30 index — 30 stocks"
         )
     with col_p3:
         load_growth = st.button(
             "Growth", use_container_width=True, key="btn_growth",
-            help="Load saham pertumbuhan pilihan"
+            help="Load curated growth stocks"
         )
 
     if load_lq45:
-        st.session_state["wl_val"] = LQ45_WL
+        st.session_state["wl_area"] = LQ45_WL
+        st.rerun()
     elif load_idx30:
-        st.session_state["wl_val"] = IDX30_WL
+        st.session_state["wl_area"] = IDX30_WL
+        st.rerun()
     elif load_growth:
-        st.session_state["wl_val"] = GROWTH_WL
+        st.session_state["wl_area"] = GROWTH_WL
+        st.rerun()
 
     wl_raw = st.text_area(
-        "Tickers (comma-separated)",
-        value=st.session_state.get("wl_val", DEFAULT_WL),
+        "Tickers",
+        value=st.session_state.get("wl_area", DEFAULT_WL),
         height=110,
         key="wl_area",
-        help="Contoh: BBCA,BREN,AMMN,GOTO — pisahkan dengan koma",
+        help="e.g. BBCA,BREN,AMMN,GOTO — comma separated",
         label_visibility="collapsed",
     )
-    # Show count of tickers entered
     _wl_count = len([t for t in wl_raw.replace("\n",",").split(",") if t.strip()])
     st.markdown(f"""
     <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;color:#5a7a9a;
                 margin-top:3px;margin-bottom:2px'>
-    {_wl_count} saham terdaftar · Edit langsung di atas
+    {_wl_count} stocks in watchlist
     </div>""", unsafe_allow_html=True)
 
     st.markdown("---")
@@ -2266,13 +2736,20 @@ with tab_a:
             own    = OWNER_DB.get(ticker_input.upper().replace(".JK",""))
             ksei   = fetch_ksei_composition(ticker_input)
             sh_list, sh_src, sh_date = fetch_shareholders(ticker_input)
-        with st.spinner("Computing Relative Strength vs IHSG (^JKSE) ..."):
-            ihsg_df = load_ihsg(period)
-            rs_data = calc_rs(df, ihsg_df) if ihsg_df is not None else {"available": False}
+        with st.spinner("Computing RS vs IHSG · Market Regime · Sector Rotation ..."):
+            ihsg_df    = load_ihsg(period)
+            rs_data    = calc_rs(df, ihsg_df) if ihsg_df is not None else {"available": False}
+            regime     = detect_market_regime(period)
+            sector     = get_stock_sector(ticker_input)
+            sector_data= detect_sector_rotation()
+            reg_adj    = regime_signal_adjustment(regime, sector, sector_data)
 
-        # ── COMPOSITE SCORE: Technical 55% + Broker 35% + VCP 10%
+        # ── COMPOSITE SCORE: Technical 55% + Broker 35% + VCP 10% + Regime adj
         vcp_score  = vcp.get("score", 0)
-        final = int(np.clip(round(ts*.55 + br["score"]*.35 + vcp_score*.10), 0, 100))
+        raw_final  = int(np.clip(round(ts*.55 + br["score"]*.35 + vcp_score*.10), 0, 100))
+        # Apply regime & sector adjustment (max ±15)
+        final = int(np.clip(raw_final + np.clip(reg_adj["score_adj"],-15,15), 0, 100))
+
         last  = df.iloc[-1]; prev = df.iloc[-2]
         chg   = (last["close"]-prev["close"]) / prev["close"] * 100
         av    = df["volume"].tail(20).mean()
@@ -2282,15 +2759,22 @@ with tab_a:
                               ob_up,float(m_.iloc[-1]),vr,br["crossing"],
                               br["goreng"],br["sm_buyers"],br["sm_sellers"],chg,own,
                               rs_data=rs_data, vcp=vcp)
+
+        # ── ATR-based position sizing default params
+        ez_new = entry_zone(df)   # already ATR-based now
+
         st.session_state["res"] = dict(
             df=df,c=c_,o=o_,m=m_,wp=wp,wn=wn,wd=wd,ts=ts,
-            br=br,bdf=bdf,src=src,final=final,ent=ent,
+            br=br,bdf=bdf,src=src,
+            raw_final=raw_final, final=final, ent=ent,
             lp=float(last["close"]),chg=chg,vr=vr,
             cmf_v=float(c_.iloc[-1]),mfi_v=float(m_.iloc[-1]),
             obv_up=ob_up,ticker=ticker_input,
             fund=fund,own=own,ksei=ksei,
             sh_list=sh_list,sh_src=sh_src,sh_date=sh_date,
-            ez=ez,rs_data=rs_data,vcp=vcp,
+            ez=ez_new, rs_data=rs_data, vcp=vcp,
+            regime=regime, sector=sector,
+            sector_data=sector_data, reg_adj=reg_adj,
             fetched=datetime.now().strftime("%H:%M:%S WIB"),
         )
 
@@ -2363,75 +2847,162 @@ with tab_a:
           <div class='conds'>{conds}</div>
         </div>""", unsafe_allow_html=True)
 
+        # ── MARKET REGIME BANNER
+        regime   = R.get("regime", {})
+        reg_adj  = R.get("reg_adj", {})
+        sector   = R.get("sector", "Other")
+        if regime.get("available"):
+            reg_name  = regime["regime"]
+            reg_color = regime["color"]
+            reg_mult  = regime["multiplier"]
+            raw_sc    = R.get("raw_final", R["final"])
+            adj_sc    = reg_adj.get("score_adj", 0)
+            reg_notes = reg_adj.get("notes", [])
+            sect_info = (R.get("sector_data",{}).get("sectors",{}) or {}).get(sector,{})
+            sect_status = sect_info.get("status","—")
+            sect_color  = sect_info.get("color","#5a7a9a")
+            notes_html  = " · ".join(reg_notes[:2]) if reg_notes else ""
+
+            st.markdown(f"""
+            <div style='background:#0b1018;border:1px solid #141e2e;
+                        border-left:4px solid {reg_color};padding:11px 16px;
+                        border-radius:3px;margin-bottom:10px;
+                        display:flex;justify-content:space-between;align-items:center;
+                        flex-wrap:wrap;gap:10px'>
+              <div>
+                <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;
+                            color:#5a7a9a;letter-spacing:2px;margin-bottom:3px'>
+                  MARKET REGIME</div>
+                <div style='font-family:"IBM Plex Mono",monospace;font-size:1.1rem;
+                            font-weight:700;color:{reg_color}'>{reg_name}</div>
+                <div style='font-size:11px;color:#cdd8e6;margin-top:3px;max-width:500px'>
+                  {regime["description"][:120]}...</div>
+              </div>
+              <div style='display:flex;gap:20px;font-family:"IBM Plex Mono",monospace;
+                          text-align:center;flex-shrink:0'>
+                <div>
+                  <div style='font-size:9px;color:#5a7a9a'>SCORE BEFORE</div>
+                  <div style='font-size:1.1rem;font-weight:700;color:#5a7a9a'>{raw_sc}</div>
+                </div>
+                <div>
+                  <div style='font-size:9px;color:#5a7a9a'>REGIME ADJ</div>
+                  <div style='font-size:1.1rem;font-weight:700;
+                              color:{"#00e676" if adj_sc>0 else "#ff1744" if adj_sc<0 else "#5a7a9a"}'>
+                    {adj_sc:+d}</div>
+                </div>
+                <div>
+                  <div style='font-size:9px;color:#5a7a9a'>FINAL SCORE</div>
+                  <div style='font-size:1.1rem;font-weight:700;color:{reg_color}'>{R["final"]}</div>
+                </div>
+                <div>
+                  <div style='font-size:9px;color:#5a7a9a'>SECTOR ({sector})</div>
+                  <div style='font-size:1rem;font-weight:700;color:{sect_color}'>
+                    {sect_status}</div>
+                </div>
+              </div>
+            </div>
+            {f'<div style="font-size:10px;color:#5a7a9a;font-family:IBM Plex Mono,monospace;margin-bottom:10px">💡 {notes_html}</div>' if notes_html else ""}
+            """, unsafe_allow_html=True)
+
         # ── KEY METRICS — compute live statuses
         obv_status = "Rising ▲" if R["obv_up"] else "Falling ▼"
         obv_color  = "#00e676" if R["obv_up"] else "#ff1744"
         vr_now     = R["vr"]
         vr_color   = "#00e676" if vr_now>=1.5 else "#ffab00" if vr_now>=0.8 else "#5a7a9a"
-        vr_label   = "Tinggi" if vr_now>=1.5 else "Normal" if vr_now>=0.8 else "Sepi"
+        vr_label   = "High" if vr_now>=1.5 else "Normal" if vr_now>=0.8 else "Quiet"
         cmf_color  = "#00e676" if R["cmf_v"]>0.05 else "#ff1744" if R["cmf_v"]<-0.05 else "#ffab00"
-        cmf_label  = ("Akumulasi kuat"  if R["cmf_v"]>0.15 else
-                      "Akumulasi ringan" if R["cmf_v"]>0.05 else
-                      "Distribusi kuat"  if R["cmf_v"]<-0.15 else
-                      "Distribusi ringan" if R["cmf_v"]<-0.05 else "Netral")
+        cmf_label  = ("Strong inflow"    if R["cmf_v"]>0.15 else
+                      "Mild inflow"      if R["cmf_v"]>0.05 else
+                      "Strong outflow"   if R["cmf_v"]<-0.15 else
+                      "Mild outflow"     if R["cmf_v"]<-0.05 else "Neutral")
         mfi_color  = "#ff1744" if R["mfi_v"]>70 else "#00e676" if R["mfi_v"]<30 else "#5a7a9a"
         mfi_label  = "Overbought ⚠️" if R["mfi_v"]>70 else "Oversold ✅" if R["mfi_v"]<30 else "Normal"
         wyck_color = {"A":"#00b0ff","B":"#ffab00","C":"#00e676","D":"#ffab00","E":"#ff8888"}.get(R["wp"],"#5a7a9a")
         comp_color = "#00e676" if R["final"]>=65 else "#ff1744" if R["final"]<=35 else "#ffab00"
-        comp_label = "Akumulasi" if R["final"]>=65 else "Distribusi" if R["final"]<=35 else "Neutral"
+        comp_label = "Accumulation" if R["final"]>=65 else "Distribution" if R["final"]<=35 else "Neutral"
         ts_color   = "#00e676" if R["ts"]>=65 else "#ff1744" if R["ts"]<=35 else "#ffab00"
         br_color   = "#00e676" if br["score"]>=65 else "#ff1744" if br["score"]<=35 else "#ffab00"
+        raw_sc     = R.get("raw_final", R["final"])
+        adj_sc     = R.get("reg_adj",{}).get("score_adj",0)
+        sc_grade, sc_gc, sc_gl = score_grade(R["final"], 50)
 
         st.markdown('<div class="sec" style="margin-top:12px">KEY METRICS & INDICATOR LEGEND</div>',
                     unsafe_allow_html=True)
 
-        # ── Top score row (3 big numbers)
+        # ── Top score row (4 cards: Composite + Grade, Technical, Broker, VCP)
+        vcp_r = R.get("vcp",{}); vcp_grade = vcp_r.get("grade","NONE")
+        vcp_gc2 = vcp_r.get("grade_color","#5a7a9a")
+        vcp_s   = vcp_r.get("score",0)
         st.markdown(f"""
-        <div style='display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:10px'>
+        <div style='display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:10px'>
 
-          <div style='background:#0b1018;border:1px solid #141e2e;border-radius:4px;
-                      padding:14px 16px;display:flex;justify-content:space-between;align-items:center'>
-            <div>
-              <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;color:#5a7a9a;
-                          letter-spacing:1.5px;margin-bottom:4px'>COMPOSITE SCORE</div>
+          <!-- COMPOSITE — shows raw, adj, final -->
+          <div style='background:#0b1018;border:1px solid {comp_color};border-radius:4px;
+                      padding:14px 16px;border-top:2px solid {comp_color}'>
+            <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;color:#5a7a9a;
+                        letter-spacing:1.5px;margin-bottom:4px'>COMPOSITE SCORE</div>
+            <div style='display:flex;align-items:baseline;gap:8px'>
               <div style='font-family:"IBM Plex Mono",monospace;font-size:2rem;
-                          font-weight:700;color:{comp_color};line-height:1'>{R["final"]}/100</div>
-              <div style='font-size:10px;color:{comp_color};margin-top:4px'>{comp_label}</div>
+                          font-weight:700;color:{comp_color};line-height:1'>{R["final"]}</div>
+              <div style='font-family:"IBM Plex Mono",monospace;font-size:1.1rem;
+                          font-weight:700;color:{sc_gc}'>Grade {sc_grade}</div>
             </div>
-            <div style='text-align:right;font-size:10px;color:#5a7a9a;line-height:2'>
-              <span style='color:#00e676'>≥ 65</span> Akumulasi<br>
-              <span style='color:#ffab00'>35–64</span> Neutral<br>
-              <span style='color:#ff1744'>≤ 35</span> Distribusi
+            <div style='font-size:10px;color:{comp_color};margin-top:3px'>{comp_label}</div>
+            <div style='margin-top:6px;font-size:9px;color:#5a7a9a;font-family:"IBM Plex Mono",monospace;
+                        border-top:1px solid #141e2e;padding-top:5px'>
+              Raw {raw_sc}
+              <span style='color:{"#00e676" if adj_sc>0 else "#ff1744" if adj_sc<0 else "#5a7a9a"}'>
+                {adj_sc:+d} regime</span>
+              → <b style='color:{comp_color}'>{R["final"]}</b>
             </div>
           </div>
 
+          <!-- TECHNICAL -->
           <div style='background:#0b1018;border:1px solid #141e2e;border-radius:4px;
-                      padding:14px 16px;display:flex;justify-content:space-between;align-items:center'>
-            <div>
-              <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;color:#5a7a9a;
-                          letter-spacing:1.5px;margin-bottom:4px'>TECHNICAL SCORE</div>
-              <div style='font-family:"IBM Plex Mono",monospace;font-size:2rem;
-                          font-weight:700;color:{ts_color};line-height:1'>{R["ts"]}/100</div>
-              <div style='font-size:10px;color:#5a7a9a;margin-top:4px'>
-                CMF · OBV · MFI · Wyckoff · Volume</div>
-            </div>
-            <div style='text-align:right;font-size:10px;color:#5a7a9a;line-height:2'>
-              Bobot 55%<br>dari skor akhir
+                      padding:14px 16px;border-top:2px solid {ts_color}'>
+            <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;color:#5a7a9a;
+                        letter-spacing:1.5px;margin-bottom:4px'>TECHNICAL SCORE</div>
+            <div style='font-family:"IBM Plex Mono",monospace;font-size:2rem;
+                        font-weight:700;color:{ts_color};line-height:1'>{R["ts"]}/100</div>
+            <div style='font-size:10px;color:#5a7a9a;margin-top:3px'>
+              CMF · OBV · MFI · Wyckoff · Volume</div>
+            <div style='margin-top:6px;font-size:9px;color:#5a7a9a;font-family:"IBM Plex Mono",monospace;
+                        border-top:1px solid #141e2e;padding-top:5px'>
+              Weight: 55% of final score
             </div>
           </div>
 
+          <!-- BROKER -->
           <div style='background:#0b1018;border:1px solid #141e2e;border-radius:4px;
-                      padding:14px 16px;display:flex;justify-content:space-between;align-items:center'>
-            <div>
-              <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;color:#5a7a9a;
-                          letter-spacing:1.5px;margin-bottom:4px'>BROKER SCORE</div>
-              <div style='font-family:"IBM Plex Mono",monospace;font-size:2rem;
-                          font-weight:700;color:{br_color};line-height:1'>{br["score"]}/100</div>
-              <div style='font-size:10px;color:#5a7a9a;margin-top:4px'>
-                Net lot asing · Crossing · Kategori</div>
+                      padding:14px 16px;border-top:2px solid {br_color}'>
+            <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;color:#5a7a9a;
+                        letter-spacing:1.5px;margin-bottom:4px'>BROKER SCORE</div>
+            <div style='font-family:"IBM Plex Mono",monospace;font-size:2rem;
+                        font-weight:700;color:{br_color};line-height:1'>{br["score"]}/100</div>
+            <div style='font-size:10px;color:#5a7a9a;margin-top:3px'>
+              Net lot · Crossing · Category</div>
+            <div style='margin-top:6px;font-size:9px;color:#5a7a9a;font-family:"IBM Plex Mono",monospace;
+                        border-top:1px solid #141e2e;padding-top:5px'>
+              Weight: 35% of final score
             </div>
-            <div style='text-align:right;font-size:10px;color:#5a7a9a;line-height:2'>
-              Bobot 35%<br>dari skor akhir
+          </div>
+
+          <!-- VCP -->
+          <div style='background:#0b1018;border:1px solid #141e2e;border-radius:4px;
+                      padding:14px 16px;border-top:2px solid {vcp_gc2}'>
+            <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;color:#5a7a9a;
+                        letter-spacing:1.5px;margin-bottom:4px'>VCP SCORE</div>
+            <div style='display:flex;align-items:baseline;gap:8px'>
+              <div style='font-family:"IBM Plex Mono",monospace;font-size:2rem;
+                          font-weight:700;color:{vcp_gc2};line-height:1'>{vcp_s}/100</div>
+              <div style='font-family:"IBM Plex Mono",monospace;font-size:1.1rem;
+                          font-weight:700;color:{vcp_gc2}'>Grade {vcp_grade}</div>
+            </div>
+            <div style='font-size:10px;color:{vcp_gc2};margin-top:3px'>
+              {vcp_r.get("grade_desc","No VCP detected")[:40]}</div>
+            <div style='margin-top:6px;font-size:9px;color:#5a7a9a;font-family:"IBM Plex Mono",monospace;
+                        border-top:1px solid #141e2e;padding-top:5px'>
+              Weight: 10% of final score
             </div>
           </div>
 
@@ -2587,24 +3158,31 @@ with tab_a:
             st.markdown('<div class="sec">SCORE</div>', unsafe_allow_html=True)
             st.plotly_chart(chart_gauge(R["final"]), use_container_width=True)
 
-            # Entry zone
-            st.markdown('<div class="sec">ENTRY ZONE</div>', unsafe_allow_html=True)
-            if ent["sig"] in ("STRONG BUY","BUY","WATCH"):
+            # Entry zone (now ATR-based)
+            st.markdown('<div class="sec">ENTRY ZONE (ATR-BASED)</div>', unsafe_allow_html=True)
+            if ent["sig"] in ("STRONG BUY","BUY","WATCH","PREMIUM SETUP"):
+                atr_val = ez.get("atr",0)
+                sl_method = ez.get("sl_method","ATR")
                 st.markdown(f"""
                 <div class='entry-box'>
-                  <div style='font-size:9px;color:#5a7a9a;letter-spacing:2px'>ENTRY RANGE</div>
+                  <div style='font-size:9px;color:#5a7a9a;letter-spacing:2px'>ENTRY</div>
                   <div style='color:#00e676;font-size:1rem;font-weight:700;margin-top:2px'>
                     Rp {ez["el"]:,.0f} – {ez["eh"]:,.0f}</div>
-                  <div style='font-size:9px;color:#5a7a9a;margin-top:6px'>STOP-LOSS</div>
+                  <div style='font-size:9px;color:#5a7a9a;margin-top:6px'>
+                    STOP-LOSS
+                    <span style='color:#2a3d52;margin-left:4px'>({sl_method} × 1.5)</span></div>
                   <div style='color:#ff1744;font-size:.95rem;font-weight:700'>
                     Rp {ez["sl"]:,.0f}
                     <span style='font-size:9px;color:#5a7a9a'> (−{ez["risk_pct"]}%)</span></div>
-                  <div style='font-size:9px;color:#5a7a9a;margin-top:6px'>TARGET 1</div>
-                  <div style='color:#00b0ff;font-size:.95rem;font-weight:700'>
-                    Rp {ez["t1"]:,.0f}</div>
-                  <div style='margin-top:6px;padding-top:6px;border-top:1px solid rgba(0,230,118,.15);
-                              font-family:"IBM Plex Mono",monospace;font-size:10px;color:#5a7a9a'>
-                    Risk/Reward: <span style='color:#00e676;font-weight:700'>{ez["rr"]}:1</span>
+                  <div style='font-size:9px;color:#5a7a9a;margin-top:6px'>TARGETS  (R:R 1.5 / 2.5 / 4.0)</div>
+                  <div style='color:#00b0ff;font-size:.9rem;margin-top:2px;
+                              font-family:"IBM Plex Mono",monospace'>
+                    T1 Rp {ez["t1"]:,.0f} &nbsp;·&nbsp;
+                    T2 Rp {ez.get("t2",0):,.0f} &nbsp;·&nbsp;
+                    T3 Rp {ez.get("t3",0):,.0f}</div>
+                  <div style='margin-top:6px;padding-top:5px;border-top:1px solid rgba(0,230,118,.15);
+                              font-family:"IBM Plex Mono",monospace;font-size:9px;color:#5a7a9a'>
+                    ATR(14): <b style='color:#ffab00'>Rp {atr_val:,.0f}</b>
                   </div>
                 </div>""", unsafe_allow_html=True)
             else:
@@ -2613,9 +3191,75 @@ with tab_a:
                   <div style='font-size:10px;color:#ff1744;margin-bottom:5px'>DO NOT ENTER</div>
                   <div style='font-size:11px;color:#5a7a9a;line-height:1.6'>
                     Support: Rp {ez["sup"]:,.0f}<br>
-                    Resistance: Rp {ez["res"]:,.0f}
+                    Resistance: Rp {ez["res"]:,.0f}<br>
+                    ATR(14): Rp {ez.get("atr",0):,.0f}
                   </div>
                 </div>""", unsafe_allow_html=True)
+
+            # ── POSITION SIZING CALCULATOR
+            st.markdown('<div class="sec" style="margin-top:10px">POSITION SIZING</div>',
+                        unsafe_allow_html=True)
+            # Use session state for capital/risk inputs persistence
+            ps_cap  = st.session_state.get("ps_capital",  100_000_000)
+            ps_risk = st.session_state.get("ps_risk_pct", 2.0)
+            ps_cap  = st.number_input("Capital (Rp)", value=ps_cap,
+                                       min_value=1_000_000, step=10_000_000,
+                                       format="%d", key="ps_capital",
+                                       label_visibility="collapsed",
+                                       help="Total trading capital in Rupiah")
+            ps_risk = st.slider("Risk per trade %", 0.5, 5.0,
+                                 value=ps_risk, step=0.5,
+                                 key="ps_risk_pct",
+                                 help="% of capital you are willing to lose if stop-loss is hit. Professional standard: 1-2%")
+
+            if ez["sl"] > 0 and R["lp"] > ez["sl"]:
+                ps = calc_position_size(ps_cap, ps_risk, R["lp"], ez["sl"])
+                if ps["valid"]:
+                    cap_pct_color = "#00e676" if ps["pct_of_capital"]<20 else "#ffab00" if ps["pct_of_capital"]<40 else "#ff1744"
+                    st.markdown(f"""
+                    <div style='background:#0b1018;border:1px solid #141e2e;
+                                border-radius:3px;padding:10px;margin-top:4px;
+                                font-family:"IBM Plex Mono",monospace'>
+                      <div style='display:grid;grid-template-columns:1fr 1fr;gap:6px'>
+                        <div>
+                          <div style='font-size:8px;color:#5a7a9a;letter-spacing:1px'>BUY</div>
+                          <div style='font-size:1.1rem;font-weight:700;color:#00e676'>
+                            {ps["lots"]:,} lots</div>
+                          <div style='font-size:9px;color:#5a7a9a'>
+                            {ps["shares"]:,} shares</div>
+                        </div>
+                        <div>
+                          <div style='font-size:8px;color:#5a7a9a;letter-spacing:1px'>TOTAL COST</div>
+                          <div style='font-size:.95rem;font-weight:700;color:{cap_pct_color}'>
+                            Rp {ps["total_cost"]/1e6:.1f}M</div>
+                          <div style='font-size:9px;color:{cap_pct_color}'>
+                            {ps["pct_of_capital"]:.1f}% of capital</div>
+                        </div>
+                        <div>
+                          <div style='font-size:8px;color:#5a7a9a;letter-spacing:1px'>MAX LOSS</div>
+                          <div style='font-size:.95rem;font-weight:700;color:#ff1744'>
+                            Rp {ps["max_loss"]/1e6:.2f}M</div>
+                          <div style='font-size:9px;color:#5a7a9a'>
+                            {ps["actual_risk_pct"]:.2f}% of capital</div>
+                        </div>
+                        <div>
+                          <div style='font-size:8px;color:#5a7a9a;letter-spacing:1px'>RISK/SHARE</div>
+                          <div style='font-size:.95rem;font-weight:700;color:#ffab00'>
+                            Rp {ps["risk_per_share"]:,.0f}</div>
+                          <div style='font-size:9px;color:#5a7a9a'>
+                            entry − stop</div>
+                        </div>
+                      </div>
+                      <div style='margin-top:7px;padding-top:6px;border-top:1px solid #141e2e;
+                                  font-size:9px;color:#2a3d52'>
+                        Formula: ({ps_cap/1e6:.0f}M × {ps_risk}%) ÷ {ps["risk_per_share"]:,.0f} = {ps["lots"]} lots
+                      </div>
+                    </div>""", unsafe_allow_html=True)
+            else:
+                st.markdown("""<div style='font-size:10px;color:#2a3d52;
+                    font-family:"IBM Plex Mono",monospace;padding:6px'>
+                    Set entry price above stop-loss to calculate position size.
+                    </div>""", unsafe_allow_html=True)
 
             # Wyckoff
             st.markdown('<div class="sec" style="margin-top:10px">WYCKOFF PHASE</div>', unsafe_allow_html=True)
@@ -3653,14 +4297,14 @@ with tab_s:
     # VCP data requirement warning
     if period in ("1mo","1M"):
         st.warning(
-            "⚠️ **Period 1M terlalu pendek untuk VCP** — VCP butuh minimal 120 hari data (6M). "
-            "VCP akan otomatis di-fetch dari data 6M terpisah. "
-            "Ganti ke 3M/6M untuk hasil terbaik."
+            "⚠️ **Period 1M is too short for VCP** — VCP requires at least 120 days of data. "
+            "VCP will be automatically fetched from a separate 6M dataset in the background. "
+            "Switch to 3M/6M/1Y for best results."
         )
     elif period in ("3mo","3M"):
         st.info(
-            "💡 **Tip VCP**: Period 3M cukup untuk basic detection. "
-            "Gunakan 6M atau 1Y untuk deteksi kontraksi yang lebih akurat."
+            "💡 **VCP Tip**: 3M period is sufficient for basic VCP detection. "
+            "Use 6M or 1Y for more accurate multi-contraction analysis."
         )
 
     if st.button("▶  SCAN ALL STOCKS", use_container_width=False):
@@ -3722,27 +4366,89 @@ with tab_s:
                 })
             prog.empty()
             if rows:
-                df_r = pd.DataFrame(rows).sort_values("_s",ascending=False)
-                c1,c2,c3,c4 = st.columns(4)
-                c1.metric("STRONG BUY",len([r for r in rows if r["_sig"]=="STRONG BUY"]))
-                c2.metric("BUY",        len([r for r in rows if r["_sig"]=="BUY"]))
-                c3.metric("WATCH",      len([r for r in rows if r["_sig"]=="WATCH"]))
-                c4.metric("AVOID",      len([r for r in rows if "AVOID" in r["_sig"]]))
-                disp=["Ticker","Price","Change","Score","Signal","Risk",
-                      "VCP","Premium","Owner","Tier","Float","Pol","Ph","CMF","Vol","Cross","Data"]
-                st.dataframe(df_r[disp],hide_index=True,use_container_width=True,
-                    column_config={"Score":st.column_config.ProgressColumn(
-                        "Score",min_value=0,max_value=100,format="%d")})
-                sb_=[r["Ticker"] for r in rows if r["_sig"]=="STRONG BUY"]
-                b_= [r["Ticker"] for r in rows if r["_sig"]=="BUY"]
-                pol=[r["Ticker"] for r in rows if r["Pol"]=="⚡"]
-                vcp_a=[r["Ticker"] for r in rows if r["VCP"]=="A"]
-                prem=[r["Ticker"] for r in rows if r["Premium"]=="🔥"]
-                if sb_: st.success(f"🔥 **STRONG BUY**: {' · '.join(sb_)}")
-                if b_:  st.success(f"✅ **BUY**: {' · '.join(b_)}")
-                if vcp_a: st.success(f"⭐ **VCP Grade A** (ideal contraction): {' · '.join(vcp_a)}")
+                # ── SCORE NORMALIZATION — percentile rank within scanned universe
+                raw_scores = [r["_s"] for r in rows]
+                percentiles = normalize_scores(raw_scores)
+                for i, r in enumerate(rows):
+                    pct = percentiles[i]
+                    grade, gc, gl = score_grade(r["_s"], pct)
+                    r["Grade"]  = grade
+                    r["Pct"]    = f"{pct:.0f}%"
+                    r["_pct"]   = pct
+
+                df_r = pd.DataFrame(rows).sort_values("_s", ascending=False)
+                c1,c2,c3,c4,c5 = st.columns(5)
+                c1.metric("STRONG BUY", len([r for r in rows if r["_sig"]=="STRONG BUY"]))
+                c2.metric("BUY",         len([r for r in rows if r["_sig"]=="BUY"]))
+                c3.metric("WATCH",       len([r for r in rows if r["_sig"]=="WATCH"]))
+                c4.metric("AVOID",       len([r for r in rows if "AVOID" in r["_sig"]]))
+                c5.metric("VCP Grade A", len([r for r in rows if r["VCP"]=="A"]))
+
+                # Market regime at time of scan
+                regime_scan = detect_market_regime(period)
+                if regime_scan.get("available"):
+                    rc = regime_scan["color"]
+                    st.markdown(f"""
+                    <div style='padding:8px 14px;background:#0b1018;border:1px solid #141e2e;
+                                border-left:3px solid {rc};border-radius:3px;margin-bottom:8px;
+                                font-family:"IBM Plex Mono",monospace;font-size:10px;
+                                display:flex;gap:16px;align-items:center'>
+                      <span style='color:{rc};font-weight:700'>
+                        MARKET REGIME: {regime_scan["regime"]}</span>
+                      <span style='color:#5a7a9a'>
+                        IHSG {regime_scan["ret20"]:+.1f}% (20d) ·
+                        Conviction multiplier: {regime_scan["multiplier"]}x ·
+                        Scores already regime-adjusted
+                      </span>
+                    </div>""", unsafe_allow_html=True)
+
+                disp = ["Ticker","Price","Change","Score","Grade","Pct","Signal","Risk",
+                        "VCP","Premium","Owner","Tier","Float","Pol","Ph","CMF","Vol","Cross","Data"]
+                st.dataframe(df_r[disp], hide_index=True, use_container_width=True,
+                    column_config={
+                        "Score": st.column_config.ProgressColumn(
+                            "Score", min_value=0, max_value=100, format="%d"),
+                        "Pct": st.column_config.TextColumn("Pct Rank",
+                            help="Percentile rank within scanned universe today. 90% = top 10% of stocks scanned."),
+                        "Grade": st.column_config.TextColumn("Grade",
+                            help="S=Exceptional, A=Strong, B=Above avg, C=Average, D=Below avg"),
+                    })
+
+                sb_   = [r["Ticker"] for r in rows if r["_sig"]=="STRONG BUY"]
+                b_    = [r["Ticker"] for r in rows if r["_sig"]=="BUY"]
+                pol   = [r["Ticker"] for r in rows if r["Pol"]=="⚡"]
+                vcp_a = [r["Ticker"] for r in rows if r["VCP"]=="A"]
+                prem  = [r["Ticker"] for r in rows if r["Premium"]=="🔥"]
+                grade_s = [r["Ticker"] for r in rows if r["Grade"]=="S"]
+
                 if prem:  st.success(f"💎 **PREMIUM SETUP** (VCP + ACC Cross): {' · '.join(prem)}")
-                if pol: st.warning(f"⚡ **Political exposure** (extra risk): {', '.join(pol)}")
+                if sb_:   st.success(f"🔥 **STRONG BUY**: {' · '.join(sb_)}")
+                if b_:    st.success(f"✅ **BUY**: {' · '.join(b_)}")
+                if grade_s: st.success(f"⭐ **GRADE S** (top universe rank): {' · '.join(grade_s)}")
+                if vcp_a: st.info(f"📐 **VCP Grade A**: {' · '.join(vcp_a)}")
+                if pol:   st.warning(f"⚡ **Political exposure** (extra risk): {', '.join(pol)}")
+
+                # Sector heatmap
+                st.markdown("---")
+                st.markdown('<div class="sec">SECTOR ROTATION HEATMAP</div>',
+                            unsafe_allow_html=True)
+                st.markdown("""<div style='font-size:10px;color:#5a7a9a;font-family:"IBM Plex Mono",monospace;margin-bottom:8px'>
+                Excess return vs IHSG per sector. Green = money flowing IN. Red = money flowing OUT.
+                Focus your stock picks on sectors with positive RS 20d AND 60d.</div>""",
+                unsafe_allow_html=True)
+                with st.spinner("Loading sector data..."):
+                    sect_scan = detect_sector_rotation()
+                if sect_scan.get("available"):
+                    st.plotly_chart(chart_sector_heatmap(sect_scan), use_container_width=True)
+                    # Top 3 sectors with inflow
+                    top_sectors = sorted(
+                        [(s, d) for s, d in sect_scan["sectors"].items() if d.get("inflow")],
+                        key=lambda x: x[1]["rs20"], reverse=True
+                    )[:3]
+                    if top_sectors:
+                        s_names = " · ".join([f"{s} ({d['rs20']:+.1f}%)" for s,d in top_sectors])
+                        st.success(f"📈 **Sectors with inflows**: {s_names}")
+
     else:
         st.markdown("""<div style='text-align:center;padding:50px;border:1px dashed #141e2e;border-radius:4px'>
         <div style='font-family:"IBM Plex Mono",monospace;font-size:11px;color:#2a3d52'>
@@ -3812,154 +4518,250 @@ with tab_o:
 # ══════════════════════════════════════════════════════════════════════
 
 with tab_g:
-    st.markdown("#### BROKER INTELLIGENCE GUIDE")
+    st.markdown("#### BANDARMOLOGY PRO — COMPLETE GUIDE")
+    st.markdown("""
+    <div style='font-family:"IBM Plex Mono",monospace;font-size:10px;color:#5a7a9a;margin-bottom:14px'>
+    Full reference guide for all signals, indicators, broker categories, and VCP patterns used in this platform.
+    </div>""", unsafe_allow_html=True)
 
-    st.markdown("##### SIGNAL LEVELS")
+    # ── ENTRY SIGNALS
+    st.markdown("##### ENTRY SIGNAL LEVELS")
     for sig,c,desc in [
-        ("STRONG BUY","#00e676","ACC Cross + Score ≥65. Highest conviction. Enter with full position."),
-        ("BUY","#00e676","4+ conditions. Good R/R. Enter with proper stop-loss."),
-        ("WATCH","#ffab00","2–3 conditions forming. Add to watchlist."),
-        ("AVOID","#ff1744","2+ bearish. Don't enter."),
-        ("STRONG AVOID","#ff1744","Distribution Cross / Score ≤35. Exit if holding."),
+        ("PREMIUM SETUP","#00e676","VCP Grade A/B + Accumulation Cross + RS Positive. Triple confirmation — highest possible conviction."),
+        ("STRONG BUY",  "#00e676","Accumulation Cross confirmed + Score ≥65. Foreign institutions buying while retail sells."),
+        ("BUY",         "#00e676","4+ conditions confirmed. Smart money accumulation detected. Enter with stop-loss."),
+        ("WATCH",       "#ffab00","2–3 conditions forming. Setup building but not yet confirmed. Add to watchlist."),
+        ("AVOID",       "#ff1744","2+ bearish signals active. Risk outweighs reward. Stay out."),
+        ("STRONG AVOID","#ff1744","Distribution Cross confirmed OR Score ≤35. Smart money exiting. Exit if holding."),
     ]:
         st.markdown(f"""
-        <div style='display:flex;gap:12px;padding:6px 12px;border-bottom:1px solid #141e2e'>
-          <div style='font-family:"IBM Plex Mono",monospace;font-size:11px;font-weight:700;
-                      color:{c};min-width:130px'>{sig}</div>
-          <div style='font-size:12px;color:#cdd8e6'>{desc}</div>
+        <div style='display:flex;gap:12px;padding:7px 14px;border-bottom:1px solid #141e2e;align-items:flex-start'>
+          <span style='font-family:"IBM Plex Mono",monospace;font-size:11px;font-weight:700;
+                       color:{c};min-width:140px;flex-shrink:0'>{sig}</span>
+          <span style='font-size:12px;color:#cdd8e6;line-height:1.5'>{desc}</span>
         </div>""", unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
-    ca,cb = st.columns(2)
-    with ca:
-        st.markdown("##### 🟢 Foreign Smart Money")
-        st.dataframe(pd.DataFrame([{"Code":k,"Broker":v["name"],"Country":v.get("flag","—")}
-            for k,v in BROKER_DB.items() if v["cat"]=="FOREIGN_SMART"]),
-            hide_index=True,use_container_width=True)
-        st.markdown("##### 🏛️ BUMN & Local Institutional")
-        st.dataframe(pd.DataFrame([{"Code":k,"Broker":v["name"]}
-            for k,v in BROKER_DB.items() if v["cat"] in ("BUMN","LOCAL_INST")]),
-            hide_index=True,use_container_width=True)
-    with cb:
-        st.markdown("##### ⚠️ Retail (Contrarian) + ⚡ Scalper")
-        st.dataframe(pd.DataFrame([{"Code":k,"Broker":v["name"],
-            "Signal":"Contrarian" if v["cat"]=="RETAIL" else "Noise"}
-            for k,v in BROKER_DB.items() if v["cat"] in ("RETAIL","SCALPER")]),
-            hide_index=True,use_container_width=True)
-        st.markdown("##### 🔥 Local Bandar (Pump) + 🇰🇷 Korean")
-        st.dataframe(pd.DataFrame([{"Code":k,"Broker":v["name"],"Cat":v["cat"]}
-            for k,v in BROKER_DB.items() if v["cat"] in ("LOCAL_BANDAR","KOREAN")]),
-            hide_index=True,use_container_width=True)
-
-    st.markdown("---")
-    st.markdown("##### 7 GOLDEN RULES")
-    for icon,kw,body in [
-        ("✅","FOLLOW","2+ foreign SM brokers (AK/BK/DB/GW) simultaneously net buying"),
-        ("🔥","STRONGEST","ACC Cross: SM buying + retail selling = ideal entry"),
-        ("💀","DANGER","DIS Cross: SM selling + retail buying = distribution trap"),
-        ("⚠️","CAUTION","XC/YP/XL heavy net buy = retail FOMO, often distribution top"),
-        ("🔇","IGNORE","MG dominates volume = scalper noise; look at other brokers"),
-        ("🚨","HIGH RISK","MK+EP appear in quiet stock = likely pump-and-dump"),
-        ("📊","COMBINE","Broker + Wyckoff + CMF + Ownership + Fundamentals = full picture"),
-    ]:
-        st.markdown(f"""
-        <div style='display:flex;gap:10px;padding:7px 12px;border-bottom:1px solid #141e2e'>
-          <div style='font-size:14px;flex-shrink:0'>{icon}</div>
-          <div><b style='color:#eaf0f8'>{kw}</b> —
-          <span style='color:#cdd8e6;font-size:12px'>{body}</span></div>
-        </div>""", unsafe_allow_html=True)
 
     # ── INDICATOR GUIDE
-    st.markdown("---")
-    st.markdown("##### 📐 INDIKATOR TEKNIKAL — PENJELASAN LENGKAP")
+    st.markdown("##### TECHNICAL INDICATORS — HOW TO READ THEM")
     st.markdown("""
     <div style='font-family:"IBM Plex Mono",monospace;font-size:10px;color:#5a7a9a;margin-bottom:10px'>
-    Semua indikator yang digunakan dalam Bandarmology PRO beserta cara membacanya.
+    All indicators used in Bandarmology PRO. Composite score = Technical 55% + Broker 35% + VCP 10%.
     </div>""", unsafe_allow_html=True)
 
     indicators = [
         ("CMF","Chaikin Money Flow (14)","#00e676",
-         "Mengukur apakah uang mengalir masuk atau keluar dari saham selama 14 hari.",
-         [("≥ +0.15","Akumulasi kuat — uang deras masuk","#00e676"),
-          ("+0.05 – +0.14","Akumulasi ringan","#88ffbb"),
-          ("-0.05 – +0.04","Netral / sideways","#5a7a9a"),
-          ("-0.15 – -0.06","Distribusi ringan","#ff8888"),
-          ("≤ -0.15","Distribusi kuat — uang deras keluar","#ff1744")],
-         "CMF > 0 saat harga turun = divergensi bullish (bandar diam-diam beli). CMF < 0 saat harga naik = distribusi tersembunyi."),
+         "Measures whether money is flowing INTO or OUT of a stock over the last 14 days. Combines price position with volume to reveal hidden accumulation or distribution.",
+         [("≥ +0.15","Strong accumulation — heavy money inflow","#00e676"),
+          ("+0.05 – +0.14","Mild accumulation","#88ffbb"),
+          ("-0.05 – +0.04","Neutral / balanced","#5a7a9a"),
+          ("-0.15 – -0.06","Mild distribution","#ff8888"),
+          ("≤ -0.15","Strong distribution — heavy money outflow","#ff1744")],
+         "CMF > 0 while price drops = bullish divergence (smart money quietly buying). CMF < 0 while price rises = hidden distribution. This is one of the strongest signals in the system."),
 
         ("OBV","On Balance Volume","#00b0ff",
-         "Akumulasi kumulatif volume beli vs jual. Indikator paling murni untuk deteksi smart money.",
-         [("OBV Naik + Harga Naik","Konfirmasi trend kuat — ikuti","#00e676"),
-          ("OBV Naik + Harga Turun","⭐ Divergensi Bullish — bandar BELI diam-diam! Entry zone.","#00e676"),
-          ("OBV Datar","Konsolidasi — tunggu konfirmasi","#5a7a9a"),
-          ("OBV Turun + Harga Naik","⚠️ Divergensi Bearish — bandar JUAL diam-diam! Waspadai.","#ff1744"),
-          ("OBV Turun + Harga Turun","Distribusi terkonfirmasi","#ff1744")],
-         "OBV adalah favorit Wyckoff analyst. Ketika OBV naik tapi harga belum naik = bandar sedang akumulasi sebelum markup."),
+         "Cumulative volume indicator. Every up-day adds volume, every down-day subtracts it. The purest measure of buying vs selling pressure over time.",
+         [("Rising + Price Rising","Strong trend confirmation — follow it","#00e676"),
+          ("Rising + Price Falling","⭐ BULLISH DIVERGENCE — smart money accumulating! Best entry zone.","#00e676"),
+          ("Flat","Consolidation — wait for directional breakout","#5a7a9a"),
+          ("Falling + Price Rising","⚠️ BEARISH DIVERGENCE — smart money distributing! Be cautious.","#ff1744"),
+          ("Falling + Price Falling","Confirmed distribution / downtrend","#ff1744")],
+         "Wyckoff analysts love OBV. When OBV rises while price hasn't yet = smart money accumulating before the markup phase. This divergence often precedes a 20–40% move."),
 
         ("MFI","Money Flow Index (14)","#ffab00",
-         "Seperti RSI tapi memperhitungkan volume — lebih akurat untuk deteksi oversold/overbought.",
-         [("≥ 80","Overbought — jangan beli baru, siapkan exit","#ff1744"),
-          ("70 – 79","Mendekati overbought","#ff8888"),
+         "RSI that incorporates volume — more accurate than plain RSI. Measures the intensity of buying/selling pressure over 14 days, weighted by traded volume.",
+         [("≥ 80","Overbought — don't chase, prepare exit","#ff1744"),
+          ("70 – 79","Approaching overbought","#ff8888"),
           ("45 – 69","Normal range","#5a7a9a"),
-          ("20 – 44","Oversold ringan — potensi reversal","#88ffbb"),
-          ("≤ 20","⭐ Oversold kuat — potensi reversal besar, cek CMF konfirmasi","#00e676")],
-         "MFI Divergence: Harga turun tapi MFI naik = bandar beli saat retail panik jual. Ini salah satu sinyal terkuat."),
+          ("20 – 44","Mild oversold — potential reversal","#88ffbb"),
+          ("≤ 20","⭐ Strong oversold — high probability reversal. Confirm with CMF.","#00e676")],
+         "MFI Divergence: Price falling but MFI rising = smart money buying while retail panic-sells. One of the strongest bandarmology signals. Combine with OBV and CMF for high-conviction setup."),
 
-        ("VOL RATIO","Volume Ratio (vs MA20)","#e040fb",
-         "Volume hari ini dibagi rata-rata volume 20 hari. Mengukur seberapa 'ramai' aktivitas hari ini.",
-         [("≥ 3x","Aktivitas ekstrem — kemungkinan news/aksi korporasi","#ff1744"),
-          ("1.5x – 2.9x","Volume tinggi — sinyal pergerakan signifikan","#00e676"),
-          ("0.8x – 1.4x","Volume normal","#5a7a9a"),
-          ("≤ 0.5x","Volume sangat sepi — hindari, likuiditas rendah","#2a3d52")],
-         "Volume tinggi + harga naik + CMF positif = akumulasi valid. Volume tinggi + harga turun = distribusi atau shakeout."),
+        ("VOL RATIO","Volume Ratio vs MA20","#e040fb",
+         "Today's volume divided by the 20-day average volume. Measures how 'active' the stock is today vs its normal baseline.",
+         [("≥ 3.0x","Extreme activity — likely news, corporate action, or breakout","#ff1744"),
+          ("1.5x – 2.9x","High volume — significant move likely","#00e676"),
+          ("0.8x – 1.4x","Normal range","#5a7a9a"),
+          ("≤ 0.5x","Very quiet — avoid, low liquidity","#2a3d52")],
+         "High volume + price rising + CMF positive = valid accumulation breakout. High volume + price falling = distribution or shakeout. Volume is the fuel — without it, price moves are unreliable."),
 
         ("WYCKOFF","Wyckoff Phase Analysis","#00e5ff",
-         "Mengidentifikasi posisi saham dalam siklus akumulasi-distribusi Richard Wyckoff (1910s, masih relevan).",
-         [("Phase A — Selling Climax","Harga jatuh + volume meledak. Bandar mulai serap supply.","#00b0ff"),
-          ("Phase B — Building Cause","Sideways panjang. Bandar kumpul diam-diam. Bisa berbulan-bulan.","#ffab00"),
-          ("Phase C — Spring ⭐","FALSE BREAKDOWN — harga ditekan lalu balik. ENTRY IDEAL!","#00e676"),
-          ("Phase D — Sign of Strength","Volume + harga breakout. Konfirmasi akumulasi selesai.","#88ffbb"),
-          ("Phase E — Markup","Harga trending naik. Bandar sudah untung. Waspadai distribusi.","#ff8888")],
-         "Phase C (Spring) adalah entry paling ideal dalam Wyckoff — retail terkena stop-loss, bandar lanjut beli. Selalu konfirmasi dengan CMF dan OBV."),
+         "Identifies where a stock is in its accumulation-distribution cycle, based on Richard Wyckoff's methodology (1910s, still highly relevant). Uses price range, trend, and volume patterns.",
+         [("Phase A — Selling Climax","Price collapses + volume spikes. Smart money begins absorbing supply.","#00b0ff"),
+          ("Phase B — Building Cause","Extended sideways range. Smart money quietly accumulating. Can last months.","#ffab00"),
+          ("Phase C — Spring ⭐","FALSE BREAKDOWN — price pushed below support then reverses. IDEAL ENTRY POINT.","#00e676"),
+          ("Phase D — Sign of Strength","Volume expands, price breaks out. Accumulation confirmed complete.","#88ffbb"),
+          ("Phase E — Markup","Strong uptrend. Smart money already profitable. Watch for distribution signs.","#ff8888")],
+         "Phase C (Spring) is the single best entry in Wyckoff analysis — retail hits stop-losses, smart money buys the dip. Always confirm with CMF > 0 and OBV rising. Combine with VCP for maximum conviction."),
 
-        ("BROKER SCORE","Broker Flow Score","#00e676",
-         "Skor 0–100 berdasarkan aktivitas broker. Mengkombinasikan banyak faktor broker flow.",
-         [("≥ 70","Akumulasi kuat — smart money beli, retail jual","#00e676"),
-          ("55 – 69","Akumulasi moderat","#88ffbb"),
-          ("45 – 54","Netral","#5a7a9a"),
-          ("35 – 44","Distribusi moderat","#ff8888"),
-          ("≤ 34","Distribusi kuat","#ff1744")],
-         "Faktor: net lot foreign smart money (bobot 30%), crossing signal (bobot 20%), institutional flow (bobot 15%), retail kontrarian (bobot 10%), goreng alert (bonus 5%)."),
+        ("BROKER SCORE","Broker Flow Score (0–100)","#00e676",
+         "Composite score based on broker transaction patterns. Weights foreign smart money most heavily, as they have the best research and longest-horizon capital.",
+         [("≥ 70","Strong accumulation — smart money buying, retail selling","#00e676"),
+          ("55 – 69","Moderate accumulation","#88ffbb"),
+          ("45 – 54","Neutral / mixed","#5a7a9a"),
+          ("35 – 44","Moderate distribution","#ff8888"),
+          ("≤ 34","Strong distribution","#ff1744")],
+         "Components: Foreign smart money net lot (30%), Crossing signal (20%), Institutional flow (15%), Retail contrarian signal (10%), Goreng/pump alert (5% bonus). The Accumulation Cross is the most powerful single signal: SM buying + retail selling simultaneously."),
+
+        ("VCP","Volatility Contraction Pattern (Minervini)","#00e5ff",
+         "A series of progressively smaller price consolidations, each with declining volume. Signals supply exhaustion — fewer sellers remain at each contraction. Developed by Mark Minervini.",
+         [("Grade A","3–4 tight contractions, vol dry-up, above all MAs, pivot ≤6%. IDEAL SETUP.","#00e676"),
+          ("Grade B","2–3 contractions, volume contracting, setup forming near pivot.","#88ffbb"),
+          ("Grade C","Early contraction forming, setup not yet complete. Monitor.","#ffab00"),
+          ("Grade C-","Contraction detected but stock is below key MAs. High risk.","#ff8888"),
+          ("NONE","No VCP structure detected.","#5a7a9a")],
+         "VCP Entry Rule: Buy the breakout ABOVE the pivot price on volume ≥1.5x average. Stop-loss: below the last contraction low. VCP + Wyckoff Phase C + Accumulation Cross = PREMIUM SETUP (highest conviction trade in this system)."),
+
+        ("RS","Relative Strength vs IHSG","#e040fb",
+         "Measures how the stock performs RELATIVE to the Jakarta Composite Index (^JKSE). A stock rising only because IHSG rises is not showing alpha — smart money is not specifically targeting it.",
+         [("RS > 110, Rising ▲","Strong Outperform — money rotating IN specifically to this stock","#00e676"),
+          ("RS 100–110, Rising ▲","Outperforming — beating market with improving momentum","#88ffbb"),
+          ("RS 95–105, Flat","In-line with market — no specific alpha","#5a7a9a"),
+          ("RS 90–99, Falling ▼","Underperforming — lagging behind IHSG","#ff8888"),
+          ("RS < 90, Falling ▼","Strong Underperform — money rotating OUT of this stock","#ff1744")],
+         "RS is a LEADING indicator. Smart money enters stocks with rising RS BEFORE the price breakout. RS adjustment in scoring: Strong Outperform +8 pts, Outperform +4 pts, Strong Underperform −8 pts. Always check RS before entering any position."),
     ]
 
     for ind_code, ind_name, ind_color, ind_desc, levels, ind_tip in indicators:
         with st.expander(f"**{ind_code}** — {ind_name}", expanded=False):
             st.markdown(f"""
             <div style='background:#0b1018;border:1px solid #141e2e;border-top:2px solid {ind_color};
-                        padding:12px;border-radius:3px;margin-bottom:10px'>
-              <div style='font-size:12px;color:#cdd8e6;line-height:1.6'>{ind_desc}</div>
+                        padding:12px 14px;border-radius:3px;margin-bottom:10px'>
+              <div style='font-size:12px;color:#cdd8e6;line-height:1.7'>{ind_desc}</div>
             </div>""", unsafe_allow_html=True)
 
-            st.markdown('<div style="font-family:IBM Plex Mono,monospace;font-size:9px;color:#5a7a9a;letter-spacing:2px;margin-bottom:6px">CARA MEMBACA</div>', unsafe_allow_html=True)
-            for val,meaning,color in levels:
+            st.markdown("""<div style='font-family:"IBM Plex Mono",monospace;font-size:9px;
+                color:#5a7a9a;letter-spacing:2px;margin-bottom:6px'>HOW TO READ</div>""",
+                unsafe_allow_html=True)
+            for val, meaning, color in levels:
                 st.markdown(f"""
-                <div style='display:flex;gap:12px;padding:5px 10px;border-bottom:1px solid #141e2e;
+                <div style='display:flex;gap:14px;padding:5px 10px;border-bottom:1px solid #141e2e;
                             font-family:"IBM Plex Mono",monospace;font-size:11px'>
-                  <span style='color:{color};font-weight:700;min-width:160px'>{val}</span>
+                  <span style='color:{color};font-weight:700;min-width:170px;flex-shrink:0'>{val}</span>
                   <span style='color:#cdd8e6'>{meaning}</span>
                 </div>""", unsafe_allow_html=True)
 
             st.markdown(f"""
-            <div style='margin-top:8px;padding:8px 12px;background:rgba(0,0,0,.3);
+            <div style='margin-top:8px;padding:9px 13px;background:rgba(0,0,0,.3);
                         border-radius:3px;font-size:11px;color:#5a7a9a;
                         font-family:"IBM Plex Mono",monospace;border-left:2px solid {ind_color}'>
               💡 {ind_tip}
             </div>""", unsafe_allow_html=True)
 
-    st.markdown("<br>",unsafe_allow_html=True)
+    # ── BROKER TABLES
+    st.markdown("---")
+    st.markdown("##### BROKER CATEGORIES — IDX")
+    ca,cb = st.columns(2)
+    with ca:
+        st.markdown("**🟢 Foreign Smart Money** — Follow when 2+ net buying simultaneously")
+        st.dataframe(pd.DataFrame([{"Code":k,"Broker":v["name"],"Country":v.get("flag","—")}
+            for k,v in BROKER_DB.items() if v["cat"]=="FOREIGN_SMART"]),
+            hide_index=True, use_container_width=True)
+        st.markdown("**🏛️ BUMN & Local Institutional**")
+        st.dataframe(pd.DataFrame([{"Code":k,"Broker":v["name"]}
+            for k,v in BROKER_DB.items() if v["cat"] in ("BUMN","LOCAL_INST")]),
+            hide_index=True, use_container_width=True)
+    with cb:
+        st.markdown("**⚠️ Retail (Contrarian Signal)** — Heavy net buy = distribution warning")
+        st.dataframe(pd.DataFrame([{"Code":k,"Broker":v["name"],
+            "Signal":"Contrarian" if v["cat"]=="RETAIL" else "Noise"}
+            for k,v in BROKER_DB.items() if v["cat"] in ("RETAIL","SCALPER")]),
+            hide_index=True, use_container_width=True)
+        st.markdown("**🔥 Local Bandar (Pump Risk) + 🇰🇷 Korean**")
+        st.dataframe(pd.DataFrame([{"Code":k,"Broker":v["name"],"Cat":v["cat"]}
+            for k,v in BROKER_DB.items() if v["cat"] in ("LOCAL_BANDAR","KOREAN")]),
+            hide_index=True, use_container_width=True)
+
+    # ── GOLDEN RULES
+    st.markdown("---")
+    st.markdown("##### 7 GOLDEN RULES OF BROKER ANALYSIS")
+    for icon,kw,body in [
+        ("✅","FOLLOW","2+ foreign SM brokers (AK/BK/DB/GW) simultaneously net buying the same stock"),
+        ("🔥","STRONGEST SIGNAL","Accumulation Cross: SM buying + retail selling simultaneously = ideal entry"),
+        ("💀","DANGER SIGNAL","Distribution Cross: SM selling + retail buying = classic distribution trap. Exit."),
+        ("⚠️","CAUTION","XC/YP/XL heavy net buy = retail FOMO. Often signals end of distribution phase."),
+        ("🔇","IGNORE","MG (Semesta) dominates volume = pure scalper noise. Check other brokers."),
+        ("🚨","HIGH RISK","MK + EP suddenly appear in a quiet stock = likely pump-and-dump operation."),
+        ("📊","COMBINE LAYERS","Broker + VCP + Wyckoff + CMF + RS + Ownership = full conviction"),
+    ]:
+        st.markdown(f"""
+        <div style='display:flex;gap:12px;padding:7px 14px;border-bottom:1px solid #141e2e'>
+          <div style='font-size:15px;flex-shrink:0'>{icon}</div>
+          <div><b style='color:#eaf0f8;font-family:"IBM Plex Mono",monospace;font-size:11px'>{kw}</b>
+          <span style='color:#cdd8e6;font-size:12px'> — {body}</span></div>
+        </div>""", unsafe_allow_html=True)
+
+    # ── VCP GUIDE
+    st.markdown("---")
+    st.markdown("##### VCP — VOLATILITY CONTRACTION PATTERN (MINERVINI METHOD)")
+    st.markdown(f"""
+    <div style='background:#0b1018;border:1px solid #141e2e;border-left:3px solid #00e5ff;
+                padding:14px 16px;border-radius:3px;margin-bottom:14px'>
+      <div style='font-size:12px;color:#cdd8e6;line-height:1.8'>
+        VCP is a price pattern where a stock makes a series of progressively <b style='color:#00e5ff'>narrower
+        consolidations</b>, each with <b style='color:#00e5ff'>declining volume</b>. This signals that supply
+        (sellers) is being exhausted — fewer and fewer shares are being offered at each contraction.
+        When supply runs out and demand returns (breakout above pivot), price can move sharply higher.
+      </div>
+    </div>""", unsafe_allow_html=True)
+
+    col_v1, col_v2 = st.columns(2)
+    with col_v1:
+        st.markdown("""
+        <div style='background:#0b1018;border:1px solid #141e2e;padding:14px;border-radius:3px'>
+          <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;color:#5a7a9a;
+                      letter-spacing:2px;margin-bottom:10px'>IDEAL VCP STRUCTURE</div>
+          <div style='font-family:"IBM Plex Mono",monospace;font-size:11px;color:#cdd8e6;line-height:2'>
+            <span style='color:#5a7a9a'>Prior Uptrend:</span> Stock above MA50 / MA150 / MA200<br>
+            <span style='color:#ffab00'>Contraction 1:</span> −20% correction, volume declines<br>
+            <span style='color:#ffab00'>Contraction 2:</span> −10% correction, volume dries up<br>
+            <span style='color:#88ffbb'>Contraction 3:</span> −5% correction, very low volume<br>
+            <span style='color:#00e676'><b>Pivot:</b></span>
+            <b style='color:#00e676'> Buy breakout above recent high on 1.5x+ volume</b><br>
+            <span style='color:#ff1744'>Stop-loss:</span> Below last contraction low
+          </div>
+        </div>""", unsafe_allow_html=True)
+    with col_v2:
+        st.markdown("""
+        <div style='background:#0b1018;border:1px solid #141e2e;padding:14px;border-radius:3px'>
+          <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;color:#5a7a9a;
+                      letter-spacing:2px;margin-bottom:10px'>VCP GRADES IN THIS SYSTEM</div>""",
+        unsafe_allow_html=True)
+        for grade, gc, desc in [
+            ("A","#00e676","3–4 contractions + vol dry-up + above all MAs + tight ≤6% = IDEAL. Enter at pivot breakout."),
+            ("B","#88ffbb","2–3 contractions + some volume contraction. Good setup, nearly ready."),
+            ("C","#ffab00","Early contraction forming. Promising but incomplete. Monitor daily."),
+            ("C-","#ff8888","Contraction present but stock is BELOW key MAs. High risk — avoid or short only."),
+            ("NONE","#5a7a9a","No VCP pattern detected. Use other signals only."),
+        ]:
+            st.markdown(f"""
+            <div style='display:flex;gap:10px;padding:5px 0;border-bottom:1px solid #141e2e;
+                        font-family:"IBM Plex Mono",monospace;font-size:11px'>
+              <span style='color:{gc};font-weight:700;min-width:40px'>Grade {grade}</span>
+              <span style='color:#cdd8e6;font-size:10px'>{desc}</span>
+            </div>""", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("""
+    <div style='margin-top:12px;padding:12px 14px;background:rgba(0,229,255,.05);
+                border:1px solid rgba(0,229,255,.2);border-radius:3px'>
+      <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;color:#5a7a9a;
+                  letter-spacing:2px;margin-bottom:6px'>PREMIUM SETUP = VCP + ACCUMULATION CROSS</div>
+      <div style='font-size:12px;color:#cdd8e6;line-height:1.7'>
+        The highest conviction signal in this platform is when <b style='color:#00e676'>VCP Grade A or B</b>
+        aligns with an <b style='color:#00e676'>Accumulation Cross</b> (foreign smart money buying + retail selling).
+        This means: supply is exhausted (VCP) AND institutional demand is actively entering (broker flow).
+        Add <b style='color:#e040fb'>RS Outperform</b> for the complete triple-confirmation setup.
+      </div>
+    </div>""", unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
     st.info("""
-    **Important** — Bandarmology adalah probabilistic tool, bukan prediksi pasti.
-    Selalu gunakan stop-loss, position sizing yang tepat, dan kombinasikan dengan analisis fundamental.
-    Data broker = ESTIMASI berdasarkan net flow harian — bukan actual sub-account holdings KSEI.
+    **Disclaimer** — Bandarmology PRO is a probabilistic analytical tool, not a guarantee of profit.
+    All signals indicate probability, not certainty. Always apply stop-loss discipline, proper position sizing,
+    and combine with fundamental analysis. Broker data is ESTIMATED from daily net flow — not actual
+    sub-account holdings from KSEI. Past performance does not guarantee future results.
     """)
+
 
