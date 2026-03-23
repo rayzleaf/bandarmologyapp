@@ -426,7 +426,6 @@ def fetch_idx_day(ticker: str, date: str):
     return None
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
 
 # ══════════════════════════════════════════════════════════════════════
 #  STOCKBIT API CLIENT
@@ -2125,8 +2124,6 @@ SECTOR_REGIME_MAP = {
     "Industrial"  : ["bull_market",  "global_growth"],
 }
 
-
-@st.cache_data(ttl=1800, show_spinner=False)
 
 # ══════════════════════════════════════════════════════════════════════
 #  MODULE: MULTI-TIMEFRAME WEEKLY CONFLUENCE
