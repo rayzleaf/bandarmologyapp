@@ -3900,91 +3900,131 @@ with tab_a:
         ts_color   = "#00e676" if R["ts"]>=65 else "#ff1744" if R["ts"]<=35 else "#ffab00"
         br_color   = "#00e676" if br["score"]>=65 else "#ff1744" if br["score"]<=35 else "#ffab00"
         raw_sc     = R.get("raw_final", R["final"])
-        adj_sc     = R.get("reg_adj",{}).get("score_adj",0)
-        sc_grade, sc_gc, sc_gl = score_grade(R["final"], 50)
+        total_adj  = R.get("total_adj", 0)
 
-        st.markdown('<div class="sec" style="margin-top:12px">KEY METRICS & INDICATOR LEGEND</div>',
-                    unsafe_allow_html=True)
+        # ── Grade: for single-stock analysis, base purely on raw score (no percentile)
+        final_sc = R["final"]
+        if   final_sc >= 80: sc_grade, sc_gc = "S", "#00e676"
+        elif final_sc >= 65: sc_grade, sc_gc = "A", "#88ffbb"
+        elif final_sc >= 50: sc_grade, sc_gc = "B", "#ffab00"
+        elif final_sc >= 35: sc_grade, sc_gc = "C", "#ff8888"
+        else:                sc_grade, sc_gc = "D", "#ff1744"
 
-        # ── Top score row (4 cards: Composite + Grade, Technical, Broker, VCP)
+        sc_gl = {
+            "S": "Exceptional — all conditions aligned",
+            "A": "Strong — majority of conditions confirmed",
+            "B": "Above average — setup forming",
+            "C": "Average — mixed signals",
+            "D": "Weak — mostly bearish signals",
+        }[sc_grade]
+
         vcp_r = R.get("vcp",{}); vcp_grade = vcp_r.get("grade","NONE")
         vcp_gc2 = vcp_r.get("grade_color","#5a7a9a")
         vcp_s   = vcp_r.get("score",0)
-        _adj_sc_c = "#00e676" if adj_sc>0 else ("#ff1744" if adj_sc<0 else "#5a7a9a")
-        st.markdown(f"""
-        <div style='display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:10px'>
+        _adj_sc_c = "#00e676" if total_adj>0 else ("#ff1744" if total_adj<0 else "#5a7a9a")
 
-          <!-- COMPOSITE — shows raw, adj, final -->
-          <div style='background:#0b1018;border:1px solid {comp_color};border-radius:4px;
-                      padding:14px 16px;border-top:2px solid {comp_color}'>
-            <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;color:#5a7a9a;
-                        letter-spacing:1.5px;margin-bottom:4px'>COMPOSITE SCORE</div>
-            <div style='display:flex;align-items:baseline;gap:8px'>
-              <div style='font-family:"IBM Plex Mono",monospace;font-size:2rem;
-                          font-weight:700;color:{comp_color};line-height:1'>{R["final"]}</div>
-              <div style='font-family:"IBM Plex Mono",monospace;font-size:1.1rem;
-                          font-weight:700;color:{sc_gc}'>Grade {sc_grade}</div>
-            </div>
-            <div style='font-size:10px;color:{comp_color};margin-top:3px'>{comp_label}</div>
-            <div style='margin-top:6px;font-size:9px;color:#5a7a9a;font-family:"IBM Plex Mono",monospace;
-                        border-top:1px solid #141e2e;padding-top:5px'>
-              Raw {raw_sc}
-              <span style='color:{_adj_sc_c}'>
-                {adj_sc:+d} regime</span>
-              → <b style='color:{comp_color}'>{R["final"]}</b>
-            </div>
-          </div>
+        st.markdown('<div class="sec" style="margin-top:12px">KEY METRICS</div>',
+                    unsafe_allow_html=True)
 
-          <!-- TECHNICAL -->
-          <div style='background:#0b1018;border:1px solid #141e2e;border-radius:4px;
-                      padding:14px 16px;border-top:2px solid {ts_color}'>
-            <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;color:#5a7a9a;
-                        letter-spacing:1.5px;margin-bottom:4px'>TECHNICAL SCORE</div>
-            <div style='font-family:"IBM Plex Mono",monospace;font-size:2rem;
-                        font-weight:700;color:{ts_color};line-height:1'>{R["ts"]}/100</div>
-            <div style='font-size:10px;color:#5a7a9a;margin-top:3px'>
-              CMF · OBV · MFI · Wyckoff · Volume</div>
-            <div style='margin-top:6px;font-size:9px;color:#5a7a9a;font-family:"IBM Plex Mono",monospace;
-                        border-top:1px solid #141e2e;padding-top:5px'>
-              Weight: 55% of final score
-            </div>
-          </div>
+        # ── HERO FINAL SCORE (dominant, unmistakable)
+        wc_s  = R.get("weekly_c",{}).get("score",0)
+        liq_s = R.get("liq",{}).get("score",50)
+        wc_lbl_short  = R.get("weekly_c",{}).get("label","—")
+        liq_lbl_short = R.get("liq",{}).get("label","—")
 
-          <!-- BROKER -->
-          <div style='background:#0b1018;border:1px solid #141e2e;border-radius:4px;
-                      padding:14px 16px;border-top:2px solid {br_color}'>
-            <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;color:#5a7a9a;
-                        letter-spacing:1.5px;margin-bottom:4px'>BROKER SCORE</div>
-            <div style='font-family:"IBM Plex Mono",monospace;font-size:2rem;
-                        font-weight:700;color:{br_color};line-height:1'>{br["score"]}/100</div>
-            <div style='font-size:10px;color:#5a7a9a;margin-top:3px'>
-              Net lot · Crossing · Category</div>
-            <div style='margin-top:6px;font-size:9px;color:#5a7a9a;font-family:"IBM Plex Mono",monospace;
-                        border-top:1px solid #141e2e;padding-top:5px'>
-              Weight: 35% of final score
-            </div>
-          </div>
+        col_hero, col_sub = st.columns([2, 3])
 
-          <!-- VCP -->
-          <div style='background:#0b1018;border:1px solid #141e2e;border-radius:4px;
-                      padding:14px 16px;border-top:2px solid {vcp_gc2}'>
-            <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;color:#5a7a9a;
-                        letter-spacing:1.5px;margin-bottom:4px'>VCP SCORE</div>
-            <div style='display:flex;align-items:baseline;gap:8px'>
-              <div style='font-family:"IBM Plex Mono",monospace;font-size:2rem;
-                          font-weight:700;color:{vcp_gc2};line-height:1'>{vcp_s}/100</div>
-              <div style='font-family:"IBM Plex Mono",monospace;font-size:1.1rem;
-                          font-weight:700;color:{vcp_gc2}'>Grade {vcp_grade}</div>
-            </div>
-            <div style='font-size:10px;color:{vcp_gc2};margin-top:3px'>
-              {vcp_r.get("grade_desc","No VCP detected")[:40]}</div>
-            <div style='margin-top:6px;font-size:9px;color:#5a7a9a;font-family:"IBM Plex Mono",monospace;
-                        border-top:1px solid #141e2e;padding-top:5px'>
-              Weight: 10% of final score
-            </div>
-          </div>
+        with col_hero:
+            st.markdown(
+                f"<div style='background:#0b1018;border:2px solid {comp_color};"
+                f"border-radius:6px;padding:24px 28px;text-align:center;"
+                f"box-shadow:0 0 30px rgba({','.join(str(int(comp_color.lstrip('#')[i:i+2],16)) for i in (0,2,4))},.15)'>"
+                f"<div style='font-family:IBM Plex Mono,monospace;font-size:10px;"
+                f"color:#5a7a9a;letter-spacing:3px;margin-bottom:6px'>FINAL SCORE</div>"
+                f"<div style='font-family:IBM Plex Mono,monospace;font-size:4.5rem;"
+                f"font-weight:700;color:{comp_color};line-height:1;'>{final_sc}</div>"
+                f"<div style='font-family:IBM Plex Mono,monospace;font-size:1.1rem;"
+                f"font-weight:700;color:{sc_gc};margin-top:6px'>Grade {sc_grade}</div>"
+                f"<div style='font-size:11px;color:{sc_gc};margin-top:3px'>{sc_gl}</div>"
+                f"<div style='margin-top:12px;padding-top:10px;border-top:1px solid #141e2e;"
+                f"font-size:10px;color:#5a7a9a;font-family:IBM Plex Mono,monospace'>"
+                f"Raw {raw_sc} "
+                f"<span style='color:{_adj_sc_c}'>{total_adj:+d} adj</span>"
+                f" → <b style='color:{comp_color}'>{final_sc}</b>"
+                f"</div></div>",
+                unsafe_allow_html=True
+            )
 
-        </div>""", unsafe_allow_html=True)
+        with col_sub:
+            # 4 sub-score cards stacked 2×2
+            sub1, sub2 = st.columns(2)
+            with sub1:
+                st.markdown(
+                    f"<div style='background:#090d12;border:1px solid #141e2e;"
+                    f"border-left:3px solid {ts_color};border-radius:4px;"
+                    f"padding:10px 12px;margin-bottom:8px'>"
+                    f"<div style='font-family:IBM Plex Mono,monospace;font-size:8px;"
+                    f"color:#5a7a9a;letter-spacing:1.5px'>TECHNICAL · 55%</div>"
+                    f"<div style='font-family:IBM Plex Mono,monospace;font-size:1.6rem;"
+                    f"font-weight:700;color:{ts_color};line-height:1.2'>{R['ts']}</div>"
+                    f"<div style='font-size:9px;color:#5a7a9a'>CMF · OBV · MFI · Wyckoff</div>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+                st.markdown(
+                    f"<div style='background:#090d12;border:1px solid #141e2e;"
+                    f"border-left:3px solid {vcp_gc2};border-radius:4px;padding:10px 12px'>"
+                    f"<div style='font-family:IBM Plex Mono,monospace;font-size:8px;"
+                    f"color:#5a7a9a;letter-spacing:1.5px'>VCP · 10%</div>"
+                    f"<div style='display:flex;align-items:baseline;gap:6px'>"
+                    f"<div style='font-family:IBM Plex Mono,monospace;font-size:1.6rem;"
+                    f"font-weight:700;color:{vcp_gc2};line-height:1.2'>{vcp_s}</div>"
+                    f"<div style='font-family:IBM Plex Mono,monospace;font-size:.9rem;"
+                    f"font-weight:700;color:{vcp_gc2}'>Grade {vcp_grade}</div>"
+                    f"</div>"
+                    f"<div style='font-size:9px;color:{vcp_gc2}'>{vcp_r.get('grade_desc','')[:35]}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+            with sub2:
+                st.markdown(
+                    f"<div style='background:#090d12;border:1px solid #141e2e;"
+                    f"border-left:3px solid {br_color};border-radius:4px;"
+                    f"padding:10px 12px;margin-bottom:8px'>"
+                    f"<div style='font-family:IBM Plex Mono,monospace;font-size:8px;"
+                    f"color:#5a7a9a;letter-spacing:1.5px'>BROKER · 35%</div>"
+                    f"<div style='font-family:IBM Plex Mono,monospace;font-size:1.6rem;"
+                    f"font-weight:700;color:{br_color};line-height:1.2'>{br['score']}</div>"
+                    f"<div style='font-size:9px;color:#5a7a9a'>Net lot · Crossing · Category</div>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+                # Weekly + Liquidity mini
+                wc_color2  = R.get("weekly_c",{}).get("color","#5a7a9a")
+                liq_color2 = R.get("liq",{}).get("color","#5a7a9a")
+                st.markdown(
+                    f"<div style='background:#090d12;border:1px solid #141e2e;"
+                    f"border-radius:4px;padding:10px 12px'>"
+                    f"<div style='display:grid;grid-template-columns:1fr 1fr;gap:6px'>"
+                    f"<div>"
+                    f"<div style='font-family:IBM Plex Mono,monospace;font-size:8px;"
+                    f"color:#5a7a9a'>WEEKLY</div>"
+                    f"<div style='font-family:IBM Plex Mono,monospace;font-size:1rem;"
+                    f"font-weight:700;color:{wc_color2}'>{wc_s}/100</div>"
+                    f"<div style='font-size:8px;color:{wc_color2}'>{wc_lbl_short}</div>"
+                    f"</div>"
+                    f"<div>"
+                    f"<div style='font-family:IBM Plex Mono,monospace;font-size:8px;"
+                    f"color:#5a7a9a'>LIQUIDITY</div>"
+                    f"<div style='font-family:IBM Plex Mono,monospace;font-size:1rem;"
+                    f"font-weight:700;color:{liq_color2}'>{liq_s}/100</div>"
+                    f"<div style='font-size:8px;color:{liq_color2}'>{liq_lbl_short}</div>"
+                    f"</div>"
+                    f"</div></div>",
+                    unsafe_allow_html=True
+                )
+
+        st.markdown("<div style='margin-bottom:12px'></div>", unsafe_allow_html=True)
 
         # ── Indicator table (clean rows, easy to scan)
         st.markdown(f"""
@@ -3996,9 +4036,9 @@ with tab_a:
                       background:#0d1420;padding:8px 14px;border-bottom:2px solid #141e2e;
                       font-family:"IBM Plex Mono",monospace;font-size:9px;
                       color:#5a7a9a;letter-spacing:1.5px;gap:12px'>
-            <span>INDIKATOR</span>
-            <span>NILAI SEKARANG</span>
-            <span>CARA MEMBACA</span>
+            <span>INDICATOR</span>
+            <span>CURRENT VALUE</span>
+            <span>HOW TO READ</span>
             <span>THRESHOLD</span>
           </div>
 
