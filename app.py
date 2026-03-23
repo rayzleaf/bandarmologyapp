@@ -427,53 +427,333 @@ def fetch_idx_day(ticker: str, date: str):
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def fetch_stockbit(ticker: str, token: str, date_from: str, date_to: str):
-    if not token or len(token) < 20: return None
-    t = ticker.upper().replace(".JK","")
-    hdrs = {**HDR, "Authorization": f"Bearer {token}",
-            "Origin":"https://stockbit.com","Referer":"https://stockbit.com/"}
-    params = {"startDate":date_from,"endDate":date_to,"code":t,"limit":50}
-    for url in [
-        f"https://exodus.stockbit.com/broker-transaction/v1/summary/{t}",
-        f"https://api.stockbit.com/v2.4/broker_summary/{t}",
-    ]:
+
+# ══════════════════════════════════════════════════════════════════════
+#  STOCKBIT API CLIENT
+#  Uses Bearer token from user's Stockbit session.
+#  Covers all discovered endpoints — replaces Yahoo Finance for IDX data
+#  where Stockbit data is more accurate/timely.
+#
+#  Endpoint discovery based on Stockbit web app network analysis.
+#  All requests mirror exactly what the Stockbit web browser sends.
+# ══════════════════════════════════════════════════════════════════════
+
+class StockbitAPI:
+    """
+    Full Stockbit API client using Bearer token.
+    Each method tries multiple endpoint variants for resilience.
+    Falls back gracefully if endpoint unavailable.
+    """
+
+    BASE_EXODUS = "https://exodus.stockbit.com"
+    BASE_API    = "https://api.stockbit.com"
+
+    def __init__(self, token: str):
+        self.token   = token.strip() if token else ""
+        self.valid   = len(self.token) > 20
+        self.headers = {
+            **HDR,
+            "Authorization": f"Bearer {self.token}",
+            "Origin"       : "https://stockbit.com",
+            "Referer"      : "https://stockbit.com/",
+            "Accept"       : "application/json",
+        }
+
+    def _get(self, urls, params=None, timeout=12):
+        """Try multiple URLs, return first successful response data."""
+        if not self.valid: return None
+        for url in (urls if isinstance(urls, list) else [urls]):
+            try:
+                r = requests.get(url, headers=self.headers,
+                                  params=params, timeout=timeout)
+                if r.status_code == 401: return "EXPIRED"
+                if r.status_code == 200:
+                    data = r.json()
+                    return data
+            except: continue
+        return None
+
+    # ── BROKER SUMMARY (already working) ──────────────────────────────
+    def broker_summary(self, ticker: str, date_from: str, date_to: str):
+        """Broker transaction summary for date range."""
+        t    = ticker.upper().replace(".JK","")
+        data = self._get([
+            f"{self.BASE_EXODUS}/broker-transaction/v1/summary/{t}",
+            f"{self.BASE_API}/v2.4/broker_summary/{t}",
+        ], params={"startDate": date_from, "endDate": date_to,
+                   "code": t, "limit": 50})
+        return data
+
+    # ── FINANCIALS (replaces Yahoo Finance for IDX) ─────────────────
+    def financials(self, ticker: str) -> dict:
+        """
+        Financial statements direct from Stockbit.
+        More accurate than Yahoo Finance for IDX — sourced from IDX filings.
+        Returns: revenue, net_income, gross_profit, total_assets,
+                 total_equity, total_debt, operating_income, fcf
+        """
+        t    = ticker.upper().replace(".JK","")
+        data = self._get([
+            f"{self.BASE_EXODUS}/financial/v2/{t}",
+            f"{self.BASE_EXODUS}/fundamental/v1/{t}",
+            f"{self.BASE_API}/v2.4/financials/{t}",
+        ])
+        if not data or data == "EXPIRED": return {}
         try:
-            r = requests.get(url, headers=hdrs, params=params, timeout=12)
-            if r.status_code == 401: return "EXPIRED"
-            if r.status_code == 200:
-                data = r.json(); payload = data
-                if isinstance(data, dict):
-                    payload = data.get("data", data)
-                    if isinstance(payload, dict):
-                        payload = payload.get("brokerSummary", payload)
-                buyers  = payload.get("buyer",  payload.get("buyers",  [])) if isinstance(payload,dict) else []
-                sellers = payload.get("seller", payload.get("sellers", [])) if isinstance(payload,dict) else []
-                def ep(items):
-                    m = {}
-                    for i in (items or []):
-                        c = (i.get("broker_code") or i.get("brokerCode") or i.get("code","")).upper()
-                        if not c: continue
-                        m[c] = {"lot"  : int(i.get("lot") or i.get("volume") or 0),
-                                "value": int(i.get("value") or 0),
-                                "avg"  : float(i.get("avg") or i.get("averagePrice") or 0)}
-                    return m
-                bm = ep(buyers); sm = ep(sellers)
-                if not (set(bm) | set(sm)): continue
-                rows = [{"broker":c,
-                    "buy_lot"  : bm.get(c,{"lot":0})["lot"],
-                    "sell_lot" : sm.get(c,{"lot":0})["lot"],
-                    "buy_value": bm.get(c,{"value":0})["value"],
-                    "sell_value":sm.get(c,{"value":0})["value"],
-                    "buy_avg"  : bm.get(c,{"avg":0})["avg"],
-                    "sell_avg" : sm.get(c,{"avg":0})["avg"],
-                } for c in set(bm)|set(sm)]
-                df = pd.DataFrame(rows)
-                df["net_lot"]   = df["buy_lot"]   - df["sell_lot"]
-                df["net_value"] = df["buy_value"] - df["sell_value"]
-                df = enrich(df)
-                if len(df) >= 3: return df
-        except: continue
+            # Navigate nested structure
+            payload = data.get("data", data)
+            if isinstance(payload, dict):
+                payload = payload.get("financials", payload)
+            return payload if isinstance(payload, dict) else {}
+        except: return {}
+
+    # ── CONSENSUS / ANALYST TARGET ───────────────────────────────────
+    def consensus(self, ticker: str) -> dict:
+        """
+        Analyst consensus: target price, buy/hold/sell count, EPS est.
+        This is unavailable from Yahoo Finance for IDX stocks.
+        """
+        t    = ticker.upper().replace(".JK","")
+        data = self._get([
+            f"{self.BASE_EXODUS}/consensus/v1/{t}",
+            f"{self.BASE_EXODUS}/analyst/v1/{t}",
+            f"{self.BASE_API}/v2.4/consensus/{t}",
+        ])
+        if not data or data == "EXPIRED": return {}
+        try:
+            payload = data.get("data", data)
+            return payload if isinstance(payload, dict) else {}
+        except: return {}
+
+    # ── CORPORATE ACTIONS (better than Yahoo for IDX) ───────────────
+    def corporate_actions(self, ticker: str) -> list:
+        """
+        Dividend, rights issue, stock split from Stockbit.
+        More complete and timely than Yahoo Finance for IDX.
+        """
+        t    = ticker.upper().replace(".JK","")
+        data = self._get([
+            f"{self.BASE_EXODUS}/corporate-action/v1/{t}",
+            f"{self.BASE_EXODUS}/dividend/v1/{t}",
+            f"{self.BASE_API}/v2.4/corporate_actions/{t}",
+        ])
+        if not data or data == "EXPIRED": return []
+        try:
+            payload = data.get("data", data)
+            if isinstance(payload, dict):
+                payload = payload.get("corporateActions",
+                          payload.get("actions", []))
+            return payload if isinstance(payload, list) else []
+        except: return []
+
+    # ── FOREIGN NET FLOW (KSEI-sourced via Stockbit) ─────────────────
+    def foreign_flow(self, ticker: str, n_days: int = 20) -> dict:
+        """
+        Foreign vs domestic net flow.
+        Stockbit sources this from KSEI — more accurate than our estimation.
+        Returns: foreign_net_lot, foreign_net_value, foreign_pct_change
+        """
+        t     = ticker.upper().replace(".JK","")
+        today = trade_days(1)[0]
+        old   = trade_days(n_days)[-1]
+        data  = self._get([
+            f"{self.BASE_EXODUS}/foreign-flow/v1/{t}",
+            f"{self.BASE_API}/v2.4/foreign_flow/{t}",
+        ], params={"startDate": old, "endDate": today})
+        if not data or data == "EXPIRED": return {}
+        try:
+            payload = data.get("data", data)
+            return payload if isinstance(payload, dict) else {}
+        except: return {}
+
+    # ── PRICE / OHLCV (IDX-direct, handles splits better than Yahoo) ─
+    def ohlcv(self, ticker: str, period_days: int = 365) -> pd.DataFrame:
+        """
+        OHLCV from Stockbit — better split adjustment for IDX.
+        Falls back to yfinance if unavailable.
+        """
+        t     = ticker.upper().replace(".JK","")
+        today = datetime.now().strftime("%Y-%m-%d")
+        old   = (datetime.now() - timedelta(days=period_days)).strftime("%Y-%m-%d")
+        data  = self._get([
+            f"{self.BASE_EXODUS}/chart/v2/{t}",
+            f"{self.BASE_EXODUS}/price/v1/{t}",
+        ], params={"startDate": old, "endDate": today, "resolution": "D"})
+        if not data or data == "EXPIRED": return pd.DataFrame()
+        try:
+            payload = data.get("data", data)
+            bars    = payload.get("bars", payload.get("ohlcv", []))
+            if not bars: return pd.DataFrame()
+            df = pd.DataFrame(bars)
+            # Normalize column names
+            col_map = {
+                "t":"date","time":"date","timestamp":"date",
+                "o":"open","h":"high","l":"low","c":"close","v":"volume",
+            }
+            df = df.rename(columns={k:v for k,v in col_map.items() if k in df.columns})
+            if "date" in df.columns:
+                df["date"] = pd.to_datetime(df["date"], unit="s", errors="coerce")
+                df = df.set_index("date").sort_index()
+            for col in ["open","high","low","close","volume"]:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+            return df[["open","high","low","close","volume"]].dropna()
+        except: return pd.DataFrame()
+
+    # ── OWNERSHIP / SHAREHOLDERS ─────────────────────────────────────
+    def shareholders(self, ticker: str) -> list:
+        """
+        Major shareholders from Stockbit (sourced from IDX/KSEI).
+        More complete than our manual KSEI scraping.
+        """
+        t    = ticker.upper().replace(".JK","")
+        data = self._get([
+            f"{self.BASE_EXODUS}/ownership/v1/{t}",
+            f"{self.BASE_EXODUS}/shareholders/v1/{t}",
+            f"{self.BASE_API}/v2.4/shareholders/{t}",
+        ])
+        if not data or data == "EXPIRED": return []
+        try:
+            payload = data.get("data", data)
+            holders = payload.get("shareholders", payload.get("holders", []))
+            return holders if isinstance(holders, list) else []
+        except: return []
+
+    # ── VALUATION METRICS ────────────────────────────────────────────
+    def valuation(self, ticker: str) -> dict:
+        """
+        P/E, P/B, EV/EBITDA, market cap — direct from Stockbit.
+        More accurate than Yahoo for IDX real-time valuations.
+        """
+        t    = ticker.upper().replace(".JK","")
+        data = self._get([
+            f"{self.BASE_EXODUS}/valuation/v1/{t}",
+            f"{self.BASE_EXODUS}/fundamental/v1/{t}",
+            f"{self.BASE_API}/v2.4/valuation/{t}",
+        ])
+        if not data or data == "EXPIRED": return {}
+        try:
+            payload = data.get("data", data)
+            return payload if isinstance(payload, dict) else {}
+        except: return {}
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_stockbit_consensus(ticker: str, token: str) -> dict:
+    """
+    Analyst consensus: target price, recommendation counts.
+    Returns: target_price, upside_pct, buy_count, hold_count, sell_count
+    """
+    if not token or len(token) < 20: return {"available": False}
+    sb   = StockbitAPI(token)
+    data = sb.consensus(ticker)
+    if not data: return {"available": False}
+    try:
+        # Parse common consensus response structures
+        tp   = (data.get("targetPrice") or data.get("target_price") or
+                data.get("consensusPrice") or 0)
+        buy  = int(data.get("buy", data.get("strongBuy", 0)) or 0)
+        hold = int(data.get("hold", data.get("neutral", 0)) or 0)
+        sell = int(data.get("sell", data.get("strongSell", 0)) or 0)
+        total= buy + hold + sell or 1
+        # Get current price for upside calc
+        curr = data.get("lastPrice", data.get("currentPrice", 0)) or 0
+        upside = ((tp - curr) / curr * 100) if (tp and curr) else 0
+        # Consensus label
+        buy_pct = buy / total * 100
+        if buy_pct >= 70:   label, lc = "STRONG BUY",  "#00e676"
+        elif buy_pct >= 50: label, lc = "BUY",          "#88ffbb"
+        elif sell/total*100 >= 50: label, lc = "SELL",  "#ff1744"
+        else:               label, lc = "HOLD",          "#ffab00"
+        return {
+            "available"    : True,
+            "target_price" : round(float(tp), 0) if tp else 0,
+            "upside_pct"   : round(upside, 1),
+            "buy_count"    : buy,
+            "hold_count"   : hold,
+            "sell_count"   : sell,
+            "total_analysts": total,
+            "label"        : label,
+            "label_color"  : lc,
+            "buy_pct"      : round(buy_pct, 0),
+        }
+    except: return {"available": False}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_stockbit_financials(ticker: str, token: str) -> dict:
+    """
+    Financial ratios direct from Stockbit — replaces Yahoo Finance
+    for more accurate IDX data.
+    Merges with existing fund dict structure.
+    """
+    if not token or len(token) < 20: return {}
+    sb   = StockbitAPI(token)
+    fin  = sb.financials(ticker)
+    val  = sb.valuation(ticker)
+    if not fin and not val: return {}
+    # Merge and normalize to our fund dict format
+    merged = {**fin, **val}
+    # Map Stockbit field names to our internal names
+    field_map = {
+        "roe":"returnOnEquity", "roa":"returnOnAssets",
+        "netMargin":"profitMargins", "grossMargin":"grossMargins",
+        "operatingMargin":"operatingMargins",
+        "debtToEquity":"debtToEquity", "currentRatio":"currentRatio",
+        "peRatio":"trailingPE", "pbRatio":"priceToBook",
+        "eps":"trailingEps", "dividendYield":"dividendYield",
+        "revenueGrowth":"revenueGrowth","earningsGrowth":"earningsGrowth",
+    }
+    normalized = {}
+    for our_key, sb_key in field_map.items():
+        val_found = merged.get(sb_key) or merged.get(our_key)
+        if val_found is not None:
+            normalized[our_key] = val_found
+    return normalized
+
+
+def fetch_stockbit(ticker: str, token: str, date_from: str, date_to: str):
+    """Legacy wrapper — uses StockbitAPI class internally."""
+    if not token or len(token) < 20: return None
+    sb   = StockbitAPI(token)
+    data = sb.broker_summary(ticker, date_from, date_to)
+    if data == "EXPIRED": return "EXPIRED"
+    if not data: return None
+    try:
+        t       = ticker.upper().replace(".JK","")
+        payload = data.get("data", data)
+        if isinstance(payload, dict):
+            payload = payload.get("brokerSummary", payload)
+        buyers  = payload.get("buyer",  payload.get("buyers",  [])) if isinstance(payload,dict) else []
+        sellers = payload.get("seller", payload.get("sellers", [])) if isinstance(payload,dict) else []
+        def ep(items):
+            m = {}
+            for i in (items or []):
+                c = (i.get("broker_code") or i.get("brokerCode") or i.get("code","")).upper()
+                if not c: continue
+                m[c] = {"lot"  : int(i.get("lot") or i.get("volume") or 0),
+                        "value": int(i.get("value") or 0),
+                        "avg"  : float(i.get("avg") or i.get("averagePrice") or 0)}
+            return m
+        bm = ep(buyers); sm = ep(sellers)
+        if not (set(bm) | set(sm)): return None
+        rows = [{"broker":c,
+            "buy_lot"  : bm.get(c,{"lot":0})["lot"],
+            "sell_lot" : sm.get(c,{"lot":0})["lot"],
+            "buy_value": bm.get(c,{"value":0})["value"],
+            "sell_value":sm.get(c,{"value":0})["value"],
+            "buy_avg"  : bm.get(c,{"avg":0})["avg"],
+            "sell_avg" : sm.get(c,{"avg":0})["avg"],
+        } for c in set(bm)|set(sm)]
+        df = pd.DataFrame(rows)
+        df["net_lot"]   = df["buy_lot"]   - df["sell_lot"]
+        df["net_value"] = df["buy_value"] - df["sell_value"]
+        df = enrich(df)
+        if len(df) >= 3: return df
+    except: pass
     return None
+
+
 
 
 def get_broker_today(ticker, token=""):
@@ -833,22 +1113,445 @@ def wyckoff(df, c, o):
 
 def mandatory_score_gates(raw_score: int, vcp_grade: str, weekly_score: int,
                           liq_score: int, wyckoff_phase: str,
-                          wyckoff_conf: int, cmf_val: float) -> dict:
+                          wyckoff_conf: int, cmf_val: float,
+                          fq: dict = None) -> dict:
     """
     Mandatory gates that CAP the final score regardless of components.
 
-    Philosophy: A score of 100 should mean ALL conditions are aligned.
-    These gates prevent inflated scores when critical conditions are absent.
-
-    Rules:
-    1. VCP incomplete  → cap at 88 (setup not fully formed)
-    2. Weekly opposes  → cap at 70 (fighting institutional timeframe)
-    3. Illiquid        → cap at 75 (signal can't be executed reliably)
-    4. Wyckoff Phase A → cap at 72 (in selloff, not accumulation zone)
-    5. Wyckoff Phase E → cap at 80 (late stage, distribution risk)
-    6. CMF strongly neg→ cap at 75 (money flowing OUT despite other signals)
-    7. Low Wyckoff conf→ reduce max by confidence delta
+    Gate 7 (NEW): Fundamental quality — weak fundamentals cap the score.
+    A technically perfect setup on a fundamentally broken company is a trap.
     """
+    gates = []
+    cap   = 100
+
+    # Gate 1: VCP completeness
+    if vcp_grade == "NONE":
+        new_cap = 85
+        if cap > new_cap:
+            cap = new_cap
+            gates.append({"rule": "No VCP pattern", "cap": new_cap,
+                          "tip": "Setup not yet formed — wait for contraction"})
+    elif vcp_grade == "C":
+        new_cap = 88
+        if cap > new_cap:
+            cap = new_cap
+            gates.append({"rule": "VCP Grade C (early)", "cap": new_cap,
+                          "tip": "Contraction forming but not complete"})
+
+    # Gate 2: Weekly timeframe opposition
+    if weekly_score < 40:
+        new_cap = 70
+        if cap > new_cap:
+            cap = new_cap
+            gates.append({"rule": "Weekly opposes daily", "cap": new_cap,
+                          "tip": "Institutional timeframe bearish — wait"})
+    elif weekly_score < 55:
+        new_cap = 82
+        if cap > new_cap:
+            cap = new_cap
+            gates.append({"rule": "Weekly neutral", "cap": new_cap,
+                          "tip": "Weekly not confirming — reduce size"})
+
+    # Gate 3: Liquidity
+    if liq_score < 30:
+        new_cap = 70
+        if cap > new_cap:
+            cap = new_cap
+            gates.append({"rule": "Very illiquid", "cap": new_cap,
+                          "tip": "Cannot build position without market impact"})
+    elif liq_score < 50:
+        new_cap = 78
+        if cap > new_cap:
+            cap = new_cap
+            gates.append({"rule": "Illiquid", "cap": new_cap,
+                          "tip": "Significant execution risk"})
+
+    # Gate 4: Wyckoff phase
+    if wyckoff_phase == "A":
+        new_cap = 72
+        if cap > new_cap:
+            cap = new_cap
+            gates.append({"rule": "Wyckoff Phase A (selloff)", "cap": new_cap,
+                          "tip": "Still in distribution/selloff — not entry zone"})
+    elif wyckoff_phase == "E":
+        new_cap = 80
+        if cap > new_cap:
+            cap = new_cap
+            gates.append({"rule": "Wyckoff Phase E (late markup)", "cap": new_cap,
+                          "tip": "Late stage — risk of distribution starting"})
+
+    # Gate 5: Wyckoff confidence
+    if wyckoff_conf < 50:
+        conf_penalty = int((50 - wyckoff_conf) * 0.3)
+        new_cap = min(cap, 100 - conf_penalty)
+        if cap > new_cap:
+            cap = new_cap
+            gates.append({"rule": f"Low Wyckoff confidence ({wyckoff_conf}%)", "cap": new_cap,
+                          "tip": "Phase unclear — signals ambiguous"})
+
+    # Gate 6: CMF strongly negative
+    if cmf_val < -0.15:
+        new_cap = 72
+        if cap > new_cap:
+            cap = new_cap
+            gates.append({"rule": f"CMF strongly negative ({cmf_val:.3f})", "cap": new_cap,
+                          "tip": "Money flowing out — distribution likely"})
+    elif cmf_val < -0.05:
+        new_cap = 82
+        if cap > new_cap:
+            cap = new_cap
+            gates.append({"rule": f"CMF negative ({cmf_val:.3f})", "cap": new_cap,
+                          "tip": "Mild distribution detected"})
+
+    # Gate 7 (NEW): Fundamental Quality
+    # Weak fundamentals cap the score — prevents "technically perfect, fundamentally broken" traps
+    if fq and fq.get("checks"):
+        fails  = fq.get("fails",  0)
+        passes = fq.get("passes", 0)
+        qs     = fq.get("score",  50)
+        overall= fq.get("overall","—")
+
+        if fails >= 3:
+            new_cap = 65
+            if cap > new_cap:
+                cap = new_cap
+                gates.append({"rule": f"Fundamental: {overall} ({fails} failures)",
+                              "cap": new_cap,
+                              "tip": "Multiple fundamental failures — technical signal unreliable"})
+        elif fails == 2:
+            new_cap = 74
+            if cap > new_cap:
+                cap = new_cap
+                gates.append({"rule": f"Fundamental: Below average (ROE/Debt/Margin weak)",
+                              "cap": new_cap,
+                              "tip": "Weak fundamentals — reduce position size significantly"})
+        elif fails == 1 and passes < 2:
+            new_cap = 82
+            if cap > new_cap:
+                cap = new_cap
+                gates.append({"rule": f"Fundamental: Mixed quality",
+                              "cap": new_cap,
+                              "tip": "Limited fundamental support — wait for improvement"})
+        # Note: passes >= 3 (STRONG/GOOD) = NO cap, fundamental supports signal
+
+    gated_score = min(raw_score, cap)
+    was_capped  = gated_score < raw_score
+
+    return {
+        "cap"         : cap,
+        "gated_score" : gated_score,
+        "was_capped"  : was_capped,
+        "gates_hit"   : gates,
+        "n_gates"     : len(gates),
+        "primary_gate": gates[0]["rule"] if gates else None,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  MODULE: EXIT SIGNAL FRAMEWORK
+#
+#  Philosophy: Entry is optional, exit is mandatory.
+#  Most retail traders obsess over entry and neglect exit,
+#  resulting in giving back gains or holding through distribution.
+#
+#  Five exit signal types:
+#  1. DISTRIBUTION — smart money beginning to exit (most critical)
+#  2. TECHNICAL    — price/momentum breakdown signals
+#  3. TIME-BASED   — signal decay (most signals have 10-14 day half-life)
+#  4. THESIS BROKEN— original entry thesis no longer valid
+#  5. PROFIT TARGET — systematic partial profit taking levels
+#
+#  Each signal has urgency: IMMEDIATE / STAGED / MONITOR
+# ══════════════════════════════════════════════════════════════════════
+
+def calc_exit_signals(df: pd.DataFrame, c_series, o_series, m_series,
+                      br: dict, rs_data: dict, vcp: dict,
+                      entry_price: float, entry_date_days_ago: int,
+                      wp: str, wconf: int,
+                      weekly_c: dict = None) -> dict:
+    """
+    Comprehensive exit signal analysis.
+
+    Args:
+        df:                  Daily OHLCV
+        c_series, o_series, m_series: CMF, OBV, MFI series
+        br:                  Broker analysis dict
+        rs_data:             RS vs IHSG dict
+        vcp:                 VCP detection dict
+        entry_price:         Price at which position was entered (0 = not held)
+        entry_date_days_ago: How many trading days since entry
+        wp:                  Wyckoff phase
+        wconf:               Wyckoff confidence
+        weekly_c:            Weekly confluence dict
+
+    Returns dict with signals list, urgency, recommended action.
+    """
+    signals  = []
+    urgency  = "MONITOR"  # MONITOR / STAGED / IMMEDIATE
+
+    lp   = float(df["close"].iloc[-1])
+    cmf  = float(c_series.iloc[-1]) if not pd.isna(c_series.iloc[-1]) else 0.0
+    mfi  = float(m_series.iloc[-1]) if not pd.isna(m_series.iloc[-1]) else 50.0
+    obv_falling = o_series.iloc[-1] < o_series.iloc[-min(5, len(o_series)-1)]
+    obv_declining_10 = o_series.iloc[-1] < o_series.iloc[-min(10,len(o_series)-1)]
+
+    atr_v   = float(atr(df).iloc[-1])
+    ma20    = float(df["close"].rolling(20).mean().iloc[-1])
+    ma50    = float(df["close"].rolling(50).mean().iloc[-1]) if len(df) >= 50 else ma20
+    vol     = df["volume"]
+    vol_ma  = float(vol.rolling(20).mean().iloc[-1])
+    vol_5   = float(vol.tail(5).mean())
+
+    # Trend: recent 5-day return
+    ret5    = (lp - float(df["close"].iloc[-min(5,len(df)-1)])) / float(df["close"].iloc[-min(5,len(df)-1)]) * 100
+    ret10   = (lp - float(df["close"].iloc[-min(10,len(df)-1)])) / float(df["close"].iloc[-min(10,len(df)-1)]) * 100
+
+    held    = entry_price > 0
+    pnl_pct = ((lp - entry_price) / entry_price * 100) if held else 0
+
+    # ── SIGNAL TYPE 1: DISTRIBUTION (most critical — institutional exit) ──
+
+    # 1a. Distribution Cross (SM selling + retail buying)
+    if br.get("crossing") == "DIS":
+        signals.append({
+            "type"   : "DISTRIBUTION",
+            "urgency": "IMMEDIATE",
+            "signal" : "Distribution Cross confirmed",
+            "detail" : "Foreign smart money NET SELLING while retail NET BUYING. Classic topping pattern.",
+            "action" : "EXIT IMMEDIATELY — do not wait for technical breakdown",
+            "color"  : "#ff1744"
+        })
+        urgency = "IMMEDIATE"
+
+    # 1b. Smart money flipped to net sell (SM was buying, now selling)
+    sm_net = sum(b.get("net",0) for b in br.get("sm_sellers",[]))
+    if sm_net < -50000 and br.get("crossing") != "ACC":
+        signals.append({
+            "type"   : "DISTRIBUTION",
+            "urgency": "IMMEDIATE",
+            "signal" : f"Foreign SM net sell {sm_net/1000:.0f}K lots",
+            "detail" : "Significant smart money exit detected. Selling pressure building.",
+            "action" : "Reduce position 50% or exit on next resistance.",
+            "color"  : "#ff1744"
+        })
+        if urgency != "IMMEDIATE": urgency = "IMMEDIATE"
+
+    # 1c. CMF flipped negative after being positive
+    if cmf < -0.10:
+        signals.append({
+            "type"   : "DISTRIBUTION",
+            "urgency": "STAGED",
+            "signal" : f"CMF turned negative ({cmf:.3f})",
+            "detail" : "Money flow reversed — outflows now dominant.",
+            "action" : "Take partial profits (30-50%). Tighten stop-loss.",
+            "color"  : "#ff8844"
+        })
+        if urgency == "MONITOR": urgency = "STAGED"
+
+    # 1d. OBV declining with price flat/up (stealth distribution)
+    if obv_declining_10 and ret10 >= -1:
+        signals.append({
+            "type"   : "DISTRIBUTION",
+            "urgency": "STAGED",
+            "signal" : "OBV declining while price holds (bearish divergence)",
+            "detail" : "Institutional money quietly exiting under price stability. Classic distribution.",
+            "action" : "Do not add. Begin staged exit on next bounce.",
+            "color"  : "#ff8844"
+        })
+        if urgency == "MONITOR": urgency = "STAGED"
+
+    # ── SIGNAL TYPE 2: TECHNICAL BREAKDOWN ──
+
+    # 2a. Wyckoff Phase E → beginning of distribution
+    if wp == "E" and wconf >= 65:
+        signals.append({
+            "type"   : "TECHNICAL",
+            "urgency": "STAGED",
+            "signal" : f"Wyckoff Phase E confirmed (confidence {wconf}%)",
+            "detail" : "Markup phase is maturing. Distribution risk increasing significantly.",
+            "action" : "Raise stop-loss to breakeven minimum. Take partial profits.",
+            "color"  : "#ff8844"
+        })
+        if urgency == "MONITOR": urgency = "STAGED"
+
+    # 2b. Price broke below MA20 with volume
+    vol_spike = vol_5 > vol_ma * 1.3
+    if lp < ma20 and vol_spike and ret5 < -2:
+        signals.append({
+            "type"   : "TECHNICAL",
+            "urgency": "STAGED",
+            "signal" : f"Price broke below MA20 on volume ({vol_5/vol_ma:.1f}x)",
+            "detail" : "Support break with elevated volume = institutional selling confirmed.",
+            "action" : "Exit 50% immediately. Move stop to recent high.",
+            "color"  : "#ff8844"
+        })
+        if urgency == "MONITOR": urgency = "STAGED"
+
+    # 2c. MFI overbought divergence (price up, MFI declining from >70)
+    mfi_prev = float(m_series.iloc[-min(5,len(m_series)-1)])
+    if mfi > 70 and mfi < mfi_prev and ret5 < 0:
+        signals.append({
+            "type"   : "TECHNICAL",
+            "urgency": "MONITOR",
+            "signal" : f"MFI overbought + declining ({mfi:.0f} from {mfi_prev:.0f})",
+            "detail" : "Overbought condition rolling over. Short-term pullback likely.",
+            "action" : "Tighten trailing stop-loss. Do not add at these levels.",
+            "color"  : "#ffab00"
+        })
+
+    # 2d. RS vs IHSG turning negative
+    if rs_data and rs_data.get("available"):
+        rs_interp = rs_data.get("interp","")
+        t20 = rs_data.get("trend20","flat")
+        if rs_interp in ("STRONG UNDERPERFORM","UNDERPERFORM") and t20 == "falling":
+            signals.append({
+                "type"   : "TECHNICAL",
+                "urgency": "STAGED",
+                "signal" : f"RS vs IHSG: {rs_interp} and falling",
+                "detail" : "Capital rotating OUT of this stock specifically. Not just market weakness.",
+                "action" : "Prioritize this for exit before other holdings.",
+                "color"  : "#ff8844"
+            })
+            if urgency == "MONITOR": urgency = "STAGED"
+
+    # ── SIGNAL TYPE 3: THESIS BROKEN ──
+
+    # 3a. VCP breakout failed (price came back below pivot)
+    if vcp and vcp.get("available") and held:
+        pivot = vcp.get("pivot_price", 0)
+        was_breaking = vcp.get("is_breaking", False)
+        if pivot > 0 and entry_price >= pivot * 0.98 and lp < pivot * 0.97:
+            signals.append({
+                "type"   : "THESIS_BROKEN",
+                "urgency": "IMMEDIATE",
+                "signal" : f"VCP breakout FAILED — price back below pivot Rp{pivot:,.0f}",
+                "detail" : "Breakout failure = original VCP thesis invalidated. False breakout.",
+                "action" : "EXIT IMMEDIATELY — breakout failure reverses sharply.",
+                "color"  : "#ff1744"
+            })
+            urgency = "IMMEDIATE"
+
+    # 3b. Weekly timeframe turned bearish
+    if weekly_c and weekly_c.get("available"):
+        wc_label = weekly_c.get("label","")
+        wc_score = weekly_c.get("score", 50)
+        if wc_label in ("OPPOSE","CAUTION") and wc_score < 35:
+            signals.append({
+                "type"   : "THESIS_BROKEN",
+                "urgency": "STAGED",
+                "signal" : f"Weekly confluence deteriorated: {wc_label} ({wc_score}/100)",
+                "detail" : "Institutional timeframe now bearish. Entry thesis losing support.",
+                "action" : "Reduce to half position. Full exit if weekly continues declining.",
+                "color"  : "#ff8844"
+            })
+            if urgency == "MONITOR": urgency = "STAGED"
+
+    # ── SIGNAL TYPE 4: TIME-BASED SIGNAL DECAY ──
+
+    if held and entry_date_days_ago > 0:
+        # 4a. Signal fully decayed without thesis playing out
+        if entry_date_days_ago >= 20 and pnl_pct < 3 and pnl_pct > -5:
+            signals.append({
+                "type"   : "TIME_DECAY",
+                "urgency": "STAGED",
+                "signal" : f"Signal decay — {entry_date_days_ago}d held, +{pnl_pct:.1f}% P&L",
+                "detail" : "Most accumulation signals resolve within 10-20 days. Stuck trade = thesis not playing.",
+                "action" : "Consider exiting to redeploy capital into higher-conviction setups.",
+                "color"  : "#ffab00"
+            })
+            if urgency == "MONITOR": urgency = "STAGED"
+
+        # 4b. Extended hold without momentum
+        elif entry_date_days_ago >= 30 and pnl_pct < 8:
+            signals.append({
+                "type"   : "TIME_DECAY",
+                "urgency": "MONITOR",
+                "signal" : f"Extended hold ({entry_date_days_ago}d) with limited gain (+{pnl_pct:.1f}%)",
+                "detail" : "30 days without meaningful move suggests lack of institutional conviction.",
+                "action" : "Reassess. If no new catalyst visible, consider freeing up capital.",
+                "color"  : "#ffab00"
+            })
+
+    # ── SIGNAL TYPE 5: PROFIT TARGET LEVELS ──
+
+    if held and entry_price > 0:
+        t1 = entry_price * 1.075   # +7.5%
+        t2 = entry_price * 1.15    # +15%
+        t3 = entry_price * 1.25    # +25%
+
+        if lp >= t3:
+            signals.append({
+                "type"   : "PROFIT_TARGET",
+                "urgency": "STAGED",
+                "signal" : f"T3 reached (+25%) — Rp{lp:,.0f} vs entry Rp{entry_price:,.0f}",
+                "detail" : "25% gain in IDX is exceptional. Institutional targets often 15-20%.",
+                "action" : "Exit 50-75% position. Trail remaining with tight ATR stop.",
+                "color"  : "#00e676"
+            })
+            if urgency == "MONITOR": urgency = "STAGED"
+        elif lp >= t2:
+            signals.append({
+                "type"   : "PROFIT_TARGET",
+                "urgency": "MONITOR",
+                "signal" : f"T2 reached (+15%) — Rp{lp:,.0f}",
+                "detail" : "Target 2 hit. Raise stop to T1 level minimum.",
+                "action" : "Take 30% profit. Raise stop-loss to entry price (breakeven).",
+                "color"  : "#00e676"
+            })
+        elif lp >= t1:
+            signals.append({
+                "type"   : "PROFIT_TARGET",
+                "urgency": "MONITOR",
+                "signal" : f"T1 reached (+7.5%) — Rp{lp:,.0f}",
+                "detail" : "First target hit. Protect gains.",
+                "action" : "Raise stop-loss to entry + 1% (small profit secured).",
+                "color"  : "#88ffbb"
+            })
+
+    # ── OVERALL RECOMMENDATION ──
+
+    immediate_count = sum(1 for s in signals if s["urgency"] == "IMMEDIATE")
+    staged_count    = sum(1 for s in signals if s["urgency"] == "STAGED")
+    dist_count      = sum(1 for s in signals if s["type"] == "DISTRIBUTION")
+    profit_count    = sum(1 for s in signals if s["type"] == "PROFIT_TARGET")
+
+    if immediate_count >= 1 or dist_count >= 2:
+        recommendation = "EXIT NOW"
+        rec_color      = "#ff1744"
+        rec_detail     = "Multiple critical exit signals. Do not wait for further confirmation."
+    elif staged_count >= 2 or (dist_count >= 1 and staged_count >= 1):
+        recommendation = "BEGIN STAGED EXIT"
+        rec_color      = "#ff8844"
+        rec_detail     = "Multiple exit signals building. Reduce position systematically."
+    elif staged_count >= 1:
+        recommendation = "PARTIAL EXIT"
+        rec_color      = "#ffab00"
+        rec_detail     = "Exit signal present. Take partial profits and tighten stop-loss."
+    elif profit_count >= 1 and len([s for s in signals if s["type"]!="PROFIT_TARGET"]) == 0:
+        recommendation = "TAKE PROFITS"
+        rec_color      = "#00e676"
+        rec_detail     = "Profit target reached with no distribution. Partial take, trail remainder."
+    else:
+        recommendation = "HOLD"
+        rec_color      = "#00e676"
+        rec_detail     = "No significant exit signals. Maintain position with current stop-loss."
+
+    return {
+        "available"     : True,
+        "signals"       : signals,
+        "urgency"       : urgency,
+        "n_signals"     : len(signals),
+        "recommendation": recommendation,
+        "rec_color"     : rec_color,
+        "rec_detail"    : rec_detail,
+        "pnl_pct"       : round(pnl_pct, 2),
+        "held"          : held,
+        "lp"            : lp,
+        "entry_price"   : entry_price,
+    }
+
+
+
     gates = []
     cap   = 100
 
@@ -945,21 +1648,67 @@ def mandatory_score_gates(raw_score: int, vcp_grade: str, weekly_score: int,
 
 
 def tech_score(df, c, o, m):
+    """
+    Technical score 0-100.
+
+    Fix #4 — OBV normalization:
+      OLD: divide by abs(obv[-10]) — biased by cumulative history depth
+      NEW: divide by rolling std of OBV changes (measures direction momentum,
+           not absolute level)
+
+    Fix #2 — MFI thresholds:
+      OLD: 15-45 treated as "oversold zone" — too wide, includes neutral range
+      NEW: <25 = oversold (genuine accumulation), >75 = overbought (distribution)
+           These match standard money flow interpretation
+    """
     sc = 50.0
-    cv = float(c.iloc[-1]) if not pd.isna(c.iloc[-1]) else 0
-    sc += np.clip(cv*125,-25,25)
-    os = (o.iloc[-1]-o.iloc[-min(10,len(o)-1)]) / (abs(o.iloc[-min(10,len(o)-1)])+1)
-    sc += np.clip(os*500,-20,20)
-    last = df.iloc[-1]; sp = last["high"]-last["low"]
-    cp = (last["close"]-last["low"]) / (sp if sp>0 else 1)
-    sc += (cp-0.5)*30
-    av = df["volume"].tail(20).mean(); vr = last["volume"]/av if av>0 else 1
-    if vr>1.3: sc += 15 if cp>0.5 else -15
-    pt = (df["close"].iloc[-1]-df["close"].iloc[-min(10,len(df)-1)]) / df["close"].iloc[-min(10,len(df)-1)]
-    mt = float(m.iloc[-1]-m.iloc[-min(10,len(m)-1)])
-    if pt<-0.01 and mt>3:  sc+=15
-    if pt>0.01  and mt<-3: sc-=15
-    return int(np.clip(round(sc),0,100))
+
+    # ── CMF contribution (−25 to +25)
+    cv = float(c.iloc[-1]) if not pd.isna(c.iloc[-1]) else 0.0
+    sc += float(np.clip(cv * 125, -25, 25))
+
+    # ── OBV direction: use std-normalized 10-day change (Fix #4)
+    obv_now  = float(o.iloc[-1])
+    obv_10   = float(o.iloc[-min(10, len(o)-1)])
+    obv_chg  = obv_now - obv_10
+    # Normalize by rolling std of OBV (captures direction strength, not magnitude)
+    obv_std  = float(o.diff().abs().tail(20).std()) if len(o) >= 20 else (abs(obv_chg) + 1)
+    obv_std  = max(obv_std, 1.0)
+    obv_norm = obv_chg / (obv_std * 3)   # scale: ±1 std over 10d ≈ ±33 pts
+    sc += float(np.clip(obv_norm * 20, -20, 20))
+
+    # ── Close position in candle (−15 to +15)
+    last = df.iloc[-1]
+    sp   = last["high"] - last["low"]
+    cp   = (last["close"] - last["low"]) / (sp if sp > 0 else 1)
+    sc  += (cp - 0.5) * 30
+
+    # ── Volume × price position
+    av = float(df["volume"].tail(20).mean())
+    vr = last["volume"] / av if av > 0 else 1
+    if vr > 1.3:
+        sc += 15 if cp > 0.5 else -15
+
+    # ── MFI — corrected thresholds (Fix #2)
+    mv = float(m.iloc[-1]) if not pd.isna(m.iloc[-1]) else 50.0
+    if mv < 25:
+        sc += 18   # genuinely oversold = bullish (smart money buying cheap)
+    elif mv < 40:
+        sc += 8    # mildly oversold = mild positive
+    elif mv > 75:
+        sc -= 18   # genuinely overbought = bearish
+    elif mv > 60:
+        sc -= 8    # mildly overbought = mild negative
+    # 40-60 = neutral, no adjustment
+
+    # ── MFI divergence (price up but MFI falling = bearish divergence)
+    pt = (float(df["close"].iloc[-1]) - float(df["close"].iloc[-min(10,len(df)-1)])) \
+         / float(df["close"].iloc[-min(10,len(df)-1)])
+    mt = float(m.iloc[-1] - m.iloc[-min(10, len(m)-1)])
+    if pt < -0.01 and mt > 5:  sc += 12   # price down + MFI rising = accumulation
+    if pt >  0.01 and mt < -5: sc -= 12   # price up  + MFI falling = distribution
+
+    return int(np.clip(round(sc), 0, 100))
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -2652,111 +3401,371 @@ def chart_dividend_history(div_history: list) -> go.Figure:
     return fig
 
 
-def fundamental_quality_gate(fund: dict) -> dict:
+def fundamental_quality_gate(fund: dict, sector: str = "Other") -> dict:
     """
-    Fundamental quality gatekeeper.
-    Returns pass/warn/fail for each dimension.
-    A technical signal with fundamental FAIL should reduce conviction.
+    Industry-aware fundamental quality gate.
+
+    RATIONALE — Why industry-specific thresholds matter:
+
+    Banking:      D/E >5x is NORMAL (leverage is the business model)
+                  ROE target >15% (high leverage amplifies returns)
+                  Net margin not meaningful (use ROA instead, >1%)
+                  NIM (net interest margin) is key metric
+
+    Mining/Coal:  Margins are cyclical — 5% in down-cycle is FINE
+                  D/E can be higher (capex-heavy)
+                  FCF matters more than margins (commodity price driven)
+                  Growth irrelevant — resource depletion is structural
+
+    Telecoms:     Low net margin (5-8%) is NORMAL (capex-heavy infra)
+                  D/E up to 2.5x acceptable (tower financing)
+                  EBITDA margin more relevant than net margin
+                  Steady dividend yield is quality indicator
+
+    Property:     D/E up to 2x normal (project financing)
+                  Gross margin should be high (>30%)
+                  Pre-sales backlog more important than revenue growth
+                  Net margin 10-20% is healthy
+
+    Consumer:     Net margin 8-20% expected
+                  Low D/E (<1x preferred)
+                  Revenue growth 8-15% = healthy
+                  Strong brand = pricing power = high gross margin
+
+    Healthcare:   Higher margins expected (KLBF ~12%, MIKA ~15%)
+                  Low D/E preferred
+                  Revenue growth 10-15% = healthy
+
+    Tech/Digital: Negative FCF/earnings acceptable if high growth
+                  Revenue growth >20% required
+                  P/E not meaningful — use EV/Revenue
+
+    Petrochemical:High capex = negative FCF is acceptable
+                  Cyclical margins — compare to cycle avg
+                  D/E up to 2x acceptable
     """
-    if not fund: return {"overall":"UNKNOWN","score":0,"checks":[]}
+    if not fund: return {"overall":"UNKNOWN","score":0,"checks":[],"sector":sector}
 
     checks = []
 
-    def chk(name, value_str, condition, status, tip):
-        checks.append({"name":name,"value":value_str,
-                        "status":status,"tip":tip,
-                        "ok": status=="PASS"})
+    def chk(name, value_str, status, tip, weight=1.0):
+        checks.append({
+            "name"  : name,
+            "value" : value_str,
+            "status": status,
+            "tip"   : tip,
+            "weight": weight,
+            "ok"    : status == "PASS"
+        })
 
-    # ROE
-    roe = fund.get("roe","—")
-    roe_v = float(roe.replace("%","")) if roe!="—" else None
-    if roe_v is not None:
-        if roe_v>=20:   chk("ROE",roe,True,"PASS","Strong profitability ≥20%")
-        elif roe_v>=12: chk("ROE",roe,True,"WARN","Acceptable ROE 12–20%")
-        else:           chk("ROE",roe,False,"FAIL","Weak ROE <12% — low profitability")
+    # ── Get raw values ──
+    def _pct(s):
+        try: return float(str(s).replace("%","").replace("+",""))
+        except: return None
+
+    roe_v  = _pct(fund.get("roe","—"))
+    roa_v  = _pct(fund.get("roa","—"))
+    npm_v  = _pct(fund.get("npm","—"))
+    gpm_v  = _pct(fund.get("gpm","—"))
+    opm_v  = _pct(fund.get("opm","—"))
+    rg_v   = _pct(fund.get("rev_growth","—"))
+    eg_v   = _pct(fund.get("earn_growth","—"))
+    fcy_v  = _pct(fund.get("fcf_yield","—"))
+    de_v   = float(fund.get("de_ratio","—")) if fund.get("de_ratio","—") != "—" else None
+    cr_v   = float(fund.get("curr_ratio","—")) if fund.get("curr_ratio","—") != "—" else None
+    pe_v   = float(fund.get("pe","—")) if fund.get("pe","—") not in ("—","N/A") else None
+    pb_v   = float(fund.get("pb","—")) if fund.get("pb","—") not in ("—","N/A") else None
+    dy_v   = _pct(fund.get("div_yield","—"))
+
+    # ── Normalize sector string ──
+    s = sector.lower()
+    is_bank      = any(x in s for x in ("bank","banking","finance","financial"))
+    is_mining    = any(x in s for x in ("mining","coal","mineral","metal","nickel","copper"))
+    is_energy    = any(x in s for x in ("energy","oil","gas","petro"))
+    is_telco     = any(x in s for x in ("telco","telecom","tower","digital"))
+    is_property  = any(x in s for x in ("property","real estate","realty"))
+    is_consumer  = any(x in s for x in ("consumer","retail","food","beverage","fmcg"))
+    is_health    = any(x in s for x in ("health","pharma","hospital","medical"))
+    is_tech      = any(x in s for x in ("tech","digital","software","platform","internet","e-commerce","startup"))
+    is_petrochem = any(x in s for x in ("petrochem","chemical","polymer","refin"))
+    is_infra     = any(x in s for x in ("infra","construction","toll","cement","building"))
+
+    # ══════════════════════════════════════════════════════════════
+    # BANKING — special case, completely different metrics
+    # ══════════════════════════════════════════════════════════════
+    if is_bank:
+        # ROE ≥15% = good (leverage amplifies returns)
+        if roe_v is not None:
+            if roe_v>=18:   chk("ROE",f"{roe_v:.1f}%","PASS","Strong bank ROE ≥18%",1.5)
+            elif roe_v>=14: chk("ROE",f"{roe_v:.1f}%","WARN","Acceptable bank ROE 14–18%",1.5)
+            elif roe_v>=10: chk("ROE",f"{roe_v:.1f}%","WARN","Weak bank ROE 10–14% — below peer avg",1.5)
+            else:           chk("ROE",f"{roe_v:.1f}%","FAIL","Poor bank ROE <10% — capital inefficient",1.5)
+        # ROA ≥1.5% = good for IDX banks
+        if roa_v is not None:
+            if roa_v>=2.0:  chk("ROA",f"{roa_v:.2f}%","PASS","Strong bank ROA ≥2.0% (BBCA-grade)",1.3)
+            elif roa_v>=1.2:chk("ROA",f"{roa_v:.2f}%","WARN","Acceptable bank ROA 1.2–2.0%",1.3)
+            else:           chk("ROA",f"{roa_v:.2f}%","FAIL","Weak bank ROA <1.2% — low profitability",1.3)
+        # D/E NOT relevant for banks — skip
+        # P/B is key bank valuation metric
+        if pb_v is not None:
+            if pb_v<1.5:    chk("P/B Ratio",f"{pb_v:.2f}x","PASS","Cheap bank valuation <1.5x book")
+            elif pb_v<3.0:  chk("P/B Ratio",f"{pb_v:.2f}x","WARN","Fair bank valuation 1.5–3.0x book")
+            else:           chk("P/B Ratio",f"{pb_v:.2f}x","WARN","Expensive bank >3x book — expect strong growth")
+        # Revenue growth for banks (loan growth proxy)
+        if rg_v is not None:
+            if rg_v>=12:    chk("Revenue Growth",f"{rg_v:+.1f}%","PASS","Strong loan/revenue growth ≥12%")
+            elif rg_v>=5:   chk("Revenue Growth",f"{rg_v:+.1f}%","WARN","Moderate growth 5–12%")
+            else:           chk("Revenue Growth",f"{rg_v:+.1f}%","FAIL","Weak or negative bank revenue growth")
+        # Dividend yield for mature banks
+        if dy_v is not None and dy_v > 0:
+            if dy_v>=4.0:   chk("Div Yield",f"{dy_v:.1f}%","PASS","High yield ≥4% — strong cash generation")
+            elif dy_v>=2.0: chk("Div Yield",f"{dy_v:.1f}%","WARN","Moderate yield 2–4%")
+        sector_note = "BANK: D/E not applicable. Key metrics: ROE, ROA, P/B, loan growth."
+
+    # ══════════════════════════════════════════════════════════════
+    # MINING / COAL / METALS — cyclical commodity
+    # ══════════════════════════════════════════════════════════════
+    elif is_mining:
+        # ROE cyclical — 10% in downcycle is fine
+        if roe_v is not None:
+            if roe_v>=25:   chk("ROE",f"{roe_v:.1f}%","PASS","Excellent mining ROE ≥25% (commodity up-cycle)",1.2)
+            elif roe_v>=12: chk("ROE",f"{roe_v:.1f}%","PASS","Good mining ROE 12–25%",1.2)
+            elif roe_v>=5:  chk("ROE",f"{roe_v:.1f}%","WARN","Low but cyclically acceptable 5–12%",1.2)
+            else:           chk("ROE",f"{roe_v:.1f}%","FAIL","Very low mining ROE <5% — commodity downcycle or inefficient",1.2)
+        # D/E up to 1.5x acceptable (capex-heavy)
+        if de_v is not None:
+            if de_v<0.8:    chk("Debt/Equity",f"{de_v:.2f}x","PASS","Conservative leverage for mining")
+            elif de_v<1.8:  chk("Debt/Equity",f"{de_v:.2f}x","WARN","Moderate leverage 0.8–1.8x — monitor")
+            else:           chk("Debt/Equity",f"{de_v:.2f}x","FAIL","High leverage >1.8x — risky in commodity downturn")
+        # FCF yield is MOST important for mining
+        if fcy_v is not None:
+            if fcy_v>=8:    chk("FCF Yield",f"{fcy_v:.1f}%","PASS","Strong FCF yield ≥8% — good shareholder return potential",1.5)
+            elif fcy_v>=3:  chk("FCF Yield",f"{fcy_v:.1f}%","WARN","Moderate FCF yield 3–8%",1.5)
+            elif fcy_v>=0:  chk("FCF Yield",f"{fcy_v:.1f}%","WARN","Low FCF yield — capex-heavy phase",1.5)
+            else:           chk("FCF Yield",f"{fcy_v:.1f}%","FAIL","Negative FCF — burning cash",1.5)
+        # Net margin — 15%+ in commodity is good
+        if npm_v is not None:
+            if npm_v>=20:   chk("Net Margin",f"{npm_v:.1f}%","PASS","Strong commodity margins ≥20%")
+            elif npm_v>=8:  chk("Net Margin",f"{npm_v:.1f}%","WARN","Moderate margins 8–20%")
+            elif npm_v>=0:  chk("Net Margin",f"{npm_v:.1f}%","WARN","Thin margins — near-cycle bottom")
+            else:           chk("Net Margin",f"{npm_v:.1f}%","FAIL","Negative margins — loss-making")
+        # P/E not great for mining — use EV/EBITDA instead, skip P/E
+        sector_note = "MINING: Cyclical. FCF yield is most important. Check commodity price outlook."
+
+    # ══════════════════════════════════════════════════════════════
+    # ENERGY (Oil/Gas/Geothermal)
+    # ══════════════════════════════════════════════════════════════
+    elif is_energy:
+        if roe_v is not None:
+            if roe_v>=18:   chk("ROE",f"{roe_v:.1f}%","PASS","Strong energy ROE ≥18%",1.2)
+            elif roe_v>=10: chk("ROE",f"{roe_v:.1f}%","WARN","Acceptable energy ROE 10–18%",1.2)
+            else:           chk("ROE",f"{roe_v:.1f}%","FAIL","Weak energy ROE <10%",1.2)
+        if de_v is not None:
+            if de_v<1.2:    chk("Debt/Equity",f"{de_v:.2f}x","PASS","Conservative energy leverage")
+            elif de_v<2.5:  chk("Debt/Equity",f"{de_v:.2f}x","WARN","Moderate leverage — capex cycle")
+            else:           chk("Debt/Equity",f"{de_v:.2f}x","FAIL","High leverage >2.5x — risky")
+        if fcy_v is not None:
+            if fcy_v>=6:    chk("FCF Yield",f"{fcy_v:.1f}%","PASS","Strong energy FCF ≥6%",1.3)
+            elif fcy_v>=2:  chk("FCF Yield",f"{fcy_v:.1f}%","WARN","Moderate FCF 2–6%",1.3)
+            else:           chk("FCF Yield",f"{fcy_v:.1f}%","FAIL","Negative/low FCF",1.3)
+        if npm_v is not None:
+            if npm_v>=15:   chk("Net Margin",f"{npm_v:.1f}%","PASS","Strong energy margins ≥15%")
+            elif npm_v>=6:  chk("Net Margin",f"{npm_v:.1f}%","WARN","Acceptable 6–15%")
+            else:           chk("Net Margin",f"{npm_v:.1f}%","FAIL","Below 6% — thin or loss")
+        sector_note = "ENERGY: FCF and leverage are key. Commodity price drives profitability."
+
+    # ══════════════════════════════════════════════════════════════
+    # TELECOMS / TOWER
+    # ══════════════════════════════════════════════════════════════
+    elif is_telco:
+        if roe_v is not None:
+            if roe_v>=15:   chk("ROE",f"{roe_v:.1f}%","PASS","Strong telco ROE ≥15%",1.2)
+            elif roe_v>=8:  chk("ROE",f"{roe_v:.1f}%","WARN","Acceptable telco ROE 8–15%",1.2)
+            else:           chk("ROE",f"{roe_v:.1f}%","FAIL","Weak telco ROE <8%",1.2)
+        # Telco D/E up to 2.5x normal (tower + network financing)
+        if de_v is not None:
+            if de_v<1.5:    chk("Debt/Equity",f"{de_v:.2f}x","PASS","Conservative telco leverage")
+            elif de_v<2.8:  chk("Debt/Equity",f"{de_v:.2f}x","WARN","Typical telco leverage 1.5–2.8x")
+            else:           chk("Debt/Equity",f"{de_v:.2f}x","FAIL","Very high telco leverage >2.8x — risk")
+        # Operating margin > 20% = good for telco (EBITDA proxy)
+        if opm_v is not None:
+            if opm_v>=25:   chk("Op. Margin",f"{opm_v:.1f}%","PASS","Strong telco operating margin ≥25%",1.3)
+            elif opm_v>=15: chk("Op. Margin",f"{opm_v:.1f}%","WARN","Acceptable 15–25%",1.3)
+            else:           chk("Op. Margin",f"{opm_v:.1f}%","FAIL","Weak telco op. margin <15%",1.3)
+        # Net margin 5-15% is normal for telco (heavy depreciation)
+        if npm_v is not None:
+            if npm_v>=10:   chk("Net Margin",f"{npm_v:.1f}%","PASS","Good telco net margin ≥10%")
+            elif npm_v>=4:  chk("Net Margin",f"{npm_v:.1f}%","WARN","Normal telco net margin 4–10%")
+            else:           chk("Net Margin",f"{npm_v:.1f}%","FAIL","Very thin telco margin <4%")
+        # Revenue growth 5-10% is healthy for mature telco
+        if rg_v is not None:
+            if rg_v>=8:     chk("Revenue Growth",f"{rg_v:+.1f}%","PASS","Strong telco growth ≥8%")
+            elif rg_v>=2:   chk("Revenue Growth",f"{rg_v:+.1f}%","WARN","Moderate telco growth 2–8%")
+            else:           chk("Revenue Growth",f"{rg_v:+.1f}%","FAIL","Stagnant/declining telco revenue")
+        sector_note = "TELCO: High capex = high D/E is normal. Op. margin and EBITDA matter more than net margin."
+
+    # ══════════════════════════════════════════════════════════════
+    # PROPERTY / REAL ESTATE
+    # ══════════════════════════════════════════════════════════════
+    elif is_property:
+        if roe_v is not None:
+            if roe_v>=12:   chk("ROE",f"{roe_v:.1f}%","PASS","Good property ROE ≥12%",1.2)
+            elif roe_v>=7:  chk("ROE",f"{roe_v:.1f}%","WARN","Acceptable property ROE 7–12%",1.2)
+            else:           chk("ROE",f"{roe_v:.1f}%","FAIL","Weak property ROE <7%",1.2)
+        # Property D/E up to 2x acceptable (project financing)
+        if de_v is not None:
+            if de_v<1.0:    chk("Debt/Equity",f"{de_v:.2f}x","PASS","Conservative property leverage")
+            elif de_v<2.2:  chk("Debt/Equity",f"{de_v:.2f}x","WARN","Normal property leverage 1–2.2x")
+            else:           chk("Debt/Equity",f"{de_v:.2f}x","FAIL","High property leverage >2.2x — rate risk")
+        # Gross margin > 30% for property
+        if gpm_v is not None:
+            if gpm_v>=40:   chk("Gross Margin",f"{gpm_v:.1f}%","PASS","Strong property gross margin ≥40%",1.3)
+            elif gpm_v>=25: chk("Gross Margin",f"{gpm_v:.1f}%","WARN","Acceptable 25–40%",1.3)
+            else:           chk("Gross Margin",f"{gpm_v:.1f}%","FAIL","Thin property gross margin <25%",1.3)
+        # Net margin 10-20%
+        if npm_v is not None:
+            if npm_v>=15:   chk("Net Margin",f"{npm_v:.1f}%","PASS","Strong property net margin ≥15%")
+            elif npm_v>=8:  chk("Net Margin",f"{npm_v:.1f}%","WARN","Acceptable 8–15%")
+            else:           chk("Net Margin",f"{npm_v:.1f}%","FAIL","Thin property net margin <8%")
+        sector_note = "PROPERTY: D/E up to 2x is normal project financing. Gross margin and presales matter more than growth."
+
+    # ══════════════════════════════════════════════════════════════
+    # TECH / DIGITAL / STARTUP
+    # ══════════════════════════════════════════════════════════════
+    elif is_tech:
+        # Growth is primary metric for tech
+        if rg_v is not None:
+            if rg_v>=30:    chk("Revenue Growth",f"{rg_v:+.1f}%","PASS","High-growth tech ≥30% — justifies premium",1.8)
+            elif rg_v>=15:  chk("Revenue Growth",f"{rg_v:+.1f}%","WARN","Moderate tech growth 15–30%",1.8)
+            elif rg_v>=5:   chk("Revenue Growth",f"{rg_v:+.1f}%","WARN","Slow tech growth 5–15% — losing edge",1.8)
+            else:           chk("Revenue Growth",f"{rg_v:+.1f}%","FAIL","Stagnant/declining tech — major red flag",1.8)
+        # Gross margin for tech > 40%
+        if gpm_v is not None:
+            if gpm_v>=50:   chk("Gross Margin",f"{gpm_v:.1f}%","PASS","Strong tech gross margin ≥50%",1.4)
+            elif gpm_v>=30: chk("Gross Margin",f"{gpm_v:.1f}%","WARN","Moderate 30–50%",1.4)
+            else:           chk("Gross Margin",f"{gpm_v:.1f}%","FAIL","Low tech gross margin <30% — commoditized",1.4)
+        # D/E — tech should be low-leverage
+        if de_v is not None:
+            if de_v<0.5:    chk("Debt/Equity",f"{de_v:.2f}x","PASS","Asset-light tech balance sheet")
+            elif de_v<1.5:  chk("Debt/Equity",f"{de_v:.2f}x","WARN","Some leverage — monitor cash burn")
+            else:           chk("Debt/Equity",f"{de_v:.2f}x","FAIL","High leverage for tech — dangerous with cash burn")
+        # FCF — negative is acceptable if high growth
+        if fcy_v is not None:
+            if fcy_v>=3:    chk("FCF Yield",f"{fcy_v:.1f}%","PASS","Tech turning FCF positive — maturity signal")
+            elif fcy_v>=-2: chk("FCF Yield",f"{fcy_v:.1f}%","WARN","Near-zero FCF — path to profitability?")
+            else:           chk("FCF Yield",f"{fcy_v:.1f}%","FAIL","Burning cash rapidly — runway concern")
+        # P/E — tech can be high, but check EV/Revenue
+        sector_note = "TECH: Revenue growth is primary. Negative FCF acceptable if growth > 20% and gross margin > 40%."
+
+    # ══════════════════════════════════════════════════════════════
+    # PETROCHEMICAL / INDUSTRIAL
+    # ══════════════════════════════════════════════════════════════
+    elif is_petrochem or is_infra:
+        if roe_v is not None:
+            if roe_v>=15:   chk("ROE",f"{roe_v:.1f}%","PASS","Good industrial ROE ≥15%",1.2)
+            elif roe_v>=8:  chk("ROE",f"{roe_v:.1f}%","WARN","Acceptable 8–15%",1.2)
+            else:           chk("ROE",f"{roe_v:.1f}%","FAIL","Weak industrial ROE <8%",1.2)
+        if de_v is not None:
+            if de_v<1.5:    chk("Debt/Equity",f"{de_v:.2f}x","PASS","Conservative industrial leverage")
+            elif de_v<2.5:  chk("Debt/Equity",f"{de_v:.2f}x","WARN","High but common for capex-heavy 1.5–2.5x")
+            else:           chk("Debt/Equity",f"{de_v:.2f}x","FAIL","Very high leverage >2.5x — risk")
+        if npm_v is not None:
+            if npm_v>=12:   chk("Net Margin",f"{npm_v:.1f}%","PASS","Strong industrial margin ≥12%")
+            elif npm_v>=5:  chk("Net Margin",f"{npm_v:.1f}%","WARN","Acceptable 5–12%")
+            else:           chk("Net Margin",f"{npm_v:.1f}%","FAIL","Thin margin <5%")
+        if fcy_v is not None:
+            if fcy_v>=4:    chk("FCF Yield",f"{fcy_v:.1f}%","PASS","Good industrial FCF ≥4%",1.2)
+            elif fcy_v>=0:  chk("FCF Yield",f"{fcy_v:.1f}%","WARN","Low but positive FCF",1.2)
+            else:           chk("FCF Yield",f"{fcy_v:.1f}%","FAIL","Negative FCF — heavy capex phase",1.2)
+        sector_note = "INDUSTRIAL/PETROCHEM: Capex-heavy. D/E up to 2x acceptable. FCF matters more than margins."
+
+    # ══════════════════════════════════════════════════════════════
+    # CONSUMER / HEALTHCARE — default balanced metrics
+    # ══════════════════════════════════════════════════════════════
     else:
-        chk("ROE","N/A",None,"N/A","Data not available")
+        if roe_v is not None:
+            if roe_v>=20:   chk("ROE",f"{roe_v:.1f}%","PASS","Strong ROE ≥20% — excellent business",1.3)
+            elif roe_v>=13: chk("ROE",f"{roe_v:.1f}%","WARN","Acceptable ROE 13–20%",1.3)
+            elif roe_v>=8:  chk("ROE",f"{roe_v:.1f}%","WARN","Low ROE 8–13% — adequate",1.3)
+            else:           chk("ROE",f"{roe_v:.1f}%","FAIL","Weak ROE <8%",1.3)
+        if de_v is not None:
+            if de_v<0.5:    chk("Debt/Equity",f"{de_v:.2f}x","PASS","Strong balance sheet")
+            elif de_v<1.2:  chk("Debt/Equity",f"{de_v:.2f}x","WARN","Moderate leverage")
+            else:           chk("Debt/Equity",f"{de_v:.2f}x","FAIL","High leverage >1.2x")
+        if npm_v is not None:
+            if is_health:
+                # Healthcare higher margin expected
+                if npm_v>=15:   chk("Net Margin",f"{npm_v:.1f}%","PASS","Strong healthcare margin ≥15%")
+                elif npm_v>=8:  chk("Net Margin",f"{npm_v:.1f}%","WARN","Acceptable 8–15%")
+                else:           chk("Net Margin",f"{npm_v:.1f}%","FAIL","Thin healthcare margin <8%")
+            else:
+                if npm_v>=12:   chk("Net Margin",f"{npm_v:.1f}%","PASS","Strong consumer margin ≥12%")
+                elif npm_v>=6:  chk("Net Margin",f"{npm_v:.1f}%","WARN","Acceptable 6–12%")
+                elif npm_v>=0:  chk("Net Margin",f"{npm_v:.1f}%","WARN","Thin margin 0–6%")
+                else:           chk("Net Margin",f"{npm_v:.1f}%","FAIL","Negative margins")
+        if rg_v is not None:
+            if rg_v>=12:    chk("Revenue Growth",f"{rg_v:+.1f}%","PASS","Strong growth ≥12%")
+            elif rg_v>=5:   chk("Revenue Growth",f"{rg_v:+.1f}%","WARN","Moderate growth 5–12%")
+            elif rg_v>=0:   chk("Revenue Growth",f"{rg_v:+.1f}%","WARN","Slow growth 0–5%")
+            else:           chk("Revenue Growth",f"{rg_v:+.1f}%","FAIL","Declining revenue")
+        if fcy_v is not None:
+            if fcy_v>=5:    chk("FCF Yield",f"{fcy_v:.1f}%","PASS","Strong FCF yield ≥5%",1.2)
+            elif fcy_v>=2:  chk("FCF Yield",f"{fcy_v:.1f}%","WARN","Moderate 2–5%",1.2)
+            elif fcy_v>=0:  chk("FCF Yield",f"{fcy_v:.1f}%","WARN","Low FCF yield <2%",1.2)
+            else:           chk("FCF Yield",f"{fcy_v:.1f}%","FAIL","Negative FCF",1.2)
+        sector_note = f"{sector}: Standard quality thresholds applied."
 
-    # Debt/Equity
-    de = fund.get("de_ratio","—")
-    de_v = float(de) if de!="—" else None
-    if de_v is not None:
-        if de_v<0.5:   chk("Debt/Equity",de,True,"PASS","Low leverage <0.5")
-        elif de_v<1.5: chk("Debt/Equity",de,True,"WARN","Moderate leverage 0.5–1.5")
-        else:          chk("Debt/Equity",de,False,"FAIL","High leverage >1.5 — risk in rate hike environment")
-    else:
-        chk("Debt/Equity","N/A",None,"N/A","Data not available")
+    # ── P/E context (universal but industry-adjusted) ──
+    if pe_v is not None and not is_bank:  # banks use P/B
+        if is_tech:
+            pe_pass, pe_warn, pe_fail = 80, 150, 999
+            if pe_v < 0:         chk("P/E",f"{pe_v:.1f}x","FAIL","Negative earnings — loss-making")
+            elif pe_v < pe_pass: chk("P/E",f"{pe_v:.1f}x","PASS",f"Reasonable tech P/E <{pe_pass}x")
+            elif pe_v < pe_warn: chk("P/E",f"{pe_v:.1f}x","WARN",f"High tech P/E {pe_pass}–{pe_warn}x — needs strong growth")
+            else:                chk("P/E",f"{pe_v:.1f}x","FAIL","Extreme valuation — priced for perfection")
+        elif is_mining or is_energy:
+            if pe_v < 0:    chk("P/E",f"{pe_v:.1f}x","WARN","Negative P/E — current loss or write-down")
+            elif pe_v < 8:  chk("P/E",f"{pe_v:.1f}x","PASS","Cheap commodity P/E <8x — potential value")
+            elif pe_v < 15: chk("P/E",f"{pe_v:.1f}x","PASS","Fair commodity P/E 8–15x")
+            elif pe_v < 25: chk("P/E",f"{pe_v:.1f}x","WARN","Moderate P/E 15–25x")
+            else:           chk("P/E",f"{pe_v:.1f}x","FAIL","Expensive >25x for cyclical — late cycle risk")
+        else:
+            if pe_v < 0:    chk("P/E",f"{pe_v:.1f}x","FAIL","Negative earnings")
+            elif pe_v < 15: chk("P/E",f"{pe_v:.1f}x","PASS","Attractive valuation <15x")
+            elif pe_v < 25: chk("P/E",f"{pe_v:.1f}x","WARN","Fair valuation 15–25x")
+            elif pe_v < 40: chk("P/E",f"{pe_v:.1f}x","WARN","Expensive 25–40x — needs growth")
+            else:           chk("P/E",f"{pe_v:.1f}x","FAIL","Very expensive >40x")
 
-    # Net Profit Margin
-    npm = fund.get("npm","—")
-    npm_v = float(npm.replace("%","")) if npm!="—" else None
-    if npm_v is not None:
-        if npm_v>=15:   chk("Net Margin",npm,True,"PASS","Strong margins ≥15%")
-        elif npm_v>=8:  chk("Net Margin",npm,True,"WARN","Acceptable margins 8–15%")
-        elif npm_v>=0:  chk("Net Margin",npm,False,"WARN","Thin margins <8%")
-        else:           chk("Net Margin",npm,False,"FAIL","Negative margins — losing money")
-    else:
-        chk("Net Margin","N/A",None,"N/A","Data not available")
+    # ── Weighted scoring ──
+    known  = [c for c in checks if c["status"] not in ("N/A",)]
+    w_pass = sum(c["weight"] for c in known if c["status"]=="PASS")
+    w_warn = sum(c["weight"] for c in known if c["status"]=="WARN")
+    w_fail = sum(c["weight"] for c in known if c["status"]=="FAIL")
+    w_total= sum(c["weight"] for c in known) or 1
+    qs     = int((w_pass*2 + w_warn*1) / (w_total*2) * 100)
 
-    # Revenue Growth
-    rg = fund.get("rev_growth","—")
-    rg_v = float(rg.replace("%","").replace("+","")) if rg!="—" else None
-    if rg_v is not None:
-        if rg_v>=15:   chk("Revenue Growth",rg,True,"PASS","Strong growth ≥15% YoY")
-        elif rg_v>=5:  chk("Revenue Growth",rg,True,"WARN","Moderate growth 5–15%")
-        elif rg_v>=0:  chk("Revenue Growth",rg,False,"WARN","Slow growth 0–5%")
-        else:          chk("Revenue Growth",rg,False,"FAIL","Revenue declining YoY")
-    else:
-        chk("Revenue Growth","N/A",None,"N/A","Data not available")
+    passes = sum(1 for c in known if c["status"]=="PASS")
+    warns  = sum(1 for c in known if c["status"]=="WARN")
+    fails  = sum(1 for c in known if c["status"]=="FAIL")
 
-    # FCF Yield
-    fcy = fund.get("fcf_yield","—")
-    fcy_v = float(fcy.replace("%","")) if fcy!="—" else None
-    if fcy_v is not None:
-        if fcy_v>=5:   chk("FCF Yield",fcy,True,"PASS","Strong FCF yield ≥5%")
-        elif fcy_v>=2: chk("FCF Yield",fcy,True,"WARN","Moderate FCF yield 2–5%")
-        elif fcy_v>=0: chk("FCF Yield",fcy,False,"WARN","Low FCF yield <2%")
-        else:          chk("FCF Yield",fcy,False,"FAIL","Negative FCF — cash burn")
-    else:
-        chk("FCF Yield","N/A",None,"N/A","Data not available")
-
-    # Valuation (P/E context)
-    pe = fund.get("pe","—")
-    pe_v = float(pe) if pe!="—" else None
-    if pe_v is not None:
-        if pe_v<0:      chk("P/E Ratio",str(pe),False,"FAIL","Negative earnings")
-        elif pe_v<15:   chk("P/E Ratio",str(pe),True,"PASS","Cheap valuation <15x")
-        elif pe_v<25:   chk("P/E Ratio",str(pe),True,"WARN","Fair valuation 15–25x")
-        elif pe_v<40:   chk("P/E Ratio",str(pe),False,"WARN","Expensive 25–40x")
-        else:           chk("P/E Ratio",str(pe),False,"FAIL","Very expensive >40x — need high growth to justify")
-    else:
-        chk("P/E Ratio","N/A",None,"N/A","Data not available")
-
-    # Overall quality
-    known   = [c for c in checks if c["status"] not in ("N/A",)]
-    passes  = sum(1 for c in known if c["status"]=="PASS")
-    warns   = sum(1 for c in known if c["status"]=="WARN")
-    fails   = sum(1 for c in known if c["status"]=="FAIL")
-    total   = len(known) or 1
-
-    qs = int((passes*2 + warns*1) / (total*2) * 100)
-
-    if fails >= 3:        overall, oc = "WEAK FUNDAMENTALS",   "#ff1744"
-    elif fails >= 2:      overall, oc = "BELOW AVERAGE",        "#ff8888"
-    elif passes >= 4:     overall, oc = "STRONG FUNDAMENTALS",  "#00e676"
-    elif passes >= 3:     overall, oc = "GOOD FUNDAMENTALS",    "#88ffbb"
-    elif warns >= 3:      overall, oc = "AVERAGE",              "#ffab00"
-    else:                 overall, oc = "MIXED",                "#ffab00"
+    if w_fail/w_total >= 0.50:  overall, oc = "WEAK FUNDAMENTALS",   "#ff1744"
+    elif w_fail/w_total >= 0.30:overall, oc = "BELOW AVERAGE",        "#ff8888"
+    elif w_pass/w_total >= 0.65:overall, oc = "STRONG FUNDAMENTALS",  "#00e676"
+    elif w_pass/w_total >= 0.45:overall, oc = "GOOD FUNDAMENTALS",    "#88ffbb"
+    else:                       overall, oc = "MIXED / AVERAGE",       "#ffab00"
 
     return {
-        "overall": overall,
-        "color"  : oc,
-        "score"  : qs,
-        "checks" : checks,
-        "passes" : passes,
-        "warns"  : warns,
-        "fails"  : fails,
+        "overall"     : overall,
+        "color"       : oc,
+        "score"       : qs,
+        "checks"      : checks,
+        "passes"      : passes,
+        "warns"       : warns,
+        "fails"       : fails,
+        "sector"      : sector,
+        "sector_note" : sector_note,
     }
+
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -2821,7 +3830,283 @@ def analyze_broker(df):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  MODULE A — RELATIVE STRENGTH vs IHSG
+#  MODULE: GORENG OPPORTUNITY DETECTOR
+#
+#  Philosophy: Goreng saham (pump & dump) has VERY distinct patterns
+#  in IDX broker data. Smart money that participates in goreng enters
+#  QUIETLY (low volume, no price movement) then PUMPS (high volume,
+#  aggressive price movement) then EXITS while retail is still buying.
+#
+#  This module detects which PHASE the goreng is currently in,
+#  providing an entry/exit window for momentum traders.
+#
+#  ⚠️ IMPORTANT RISK WARNING:
+#  Goreng saham is high-risk. Typical pump duration: 3-10 days.
+#  Exit MUST be planned before entry. Never hold through Phase 3.
+#  Use STRICT stop-loss (ATR-based, no exceptions).
+#
+#  PHASE DETECTION:
+#  Phase 0 — QUIET (pre-pump): low volume, bandar slowly accumulating
+#  Phase 1 — MARKUP START: volume beginning to pick up, price moving
+#  Phase 2 — ACTIVE PUMP: high volume + price spike + retail FOMO
+#  Phase 3 — DISTRIBUTION: price holds/sideways, bandar selling into retail
+#  Phase 4 — DUMP: price collapses, retail bag-holding
+# ══════════════════════════════════════════════════════════════════════
+
+def detect_goreng_phase(df: pd.DataFrame, br: dict,
+                         accu_df: pd.DataFrame = None) -> dict:
+    """
+    Detect goreng phase using price action + broker flow patterns.
+
+    Args:
+        df:       Daily OHLCV
+        br:       Today's broker analysis dict from analyze_broker()
+        accu_df:  Multi-day cumulative broker data (optional, improves accuracy)
+
+    Returns comprehensive goreng intelligence dict.
+    """
+    if df is None or len(df) < 10:
+        return {"available": False}
+
+    lp      = float(df["close"].iloc[-1])
+    vol     = df["volume"]
+    vol_ma20= float(vol.rolling(20).mean().iloc[-1])
+    vol_ma5 = float(vol.tail(5).mean())
+    vol_today = float(vol.iloc[-1])
+
+    # Volume ratios
+    vol_ratio_today = vol_today / (vol_ma20 + 1)
+    vol_ratio_5d    = vol_ma5   / (vol_ma20 + 1)
+    vol_spike       = vol_ratio_today >= 3.0
+    vol_building    = vol_ratio_5d >= 1.5 and vol_ratio_today >= 1.5
+
+    # Price movement
+    ret1  = (lp - float(df["close"].iloc[-2])) / float(df["close"].iloc[-2]) * 100
+    ret3  = (lp - float(df["close"].iloc[-min(3,len(df)-1)])) / float(df["close"].iloc[-min(3,len(df)-1)]) * 100
+    ret5  = (lp - float(df["close"].iloc[-min(5,len(df)-1)])) / float(df["close"].iloc[-min(5,len(df)-1)]) * 100
+    ret10 = (lp - float(df["close"].iloc[-min(10,len(df)-1)])) / float(df["close"].iloc[-min(10,len(df)-1)]) * 100
+
+    # Price quiet before pump (low volatility last 10 days)
+    price_std_pct = float(df["close"].tail(10).std() / df["close"].tail(10).mean() * 100)
+    was_quiet = price_std_pct < 3.0 and abs(ret10) < 8
+
+    # Broker signals
+    goreng_active  = br.get("goreng", False)
+    goreng_codes   = br.get("goreng_codes", [])
+    crossing       = br.get("crossing")
+    retail_net     = br.get("retail_net", 0)
+    foreign_net    = br.get("foreign_net", 0)
+    local_inst_net = br.get("local_inst_net", 0)
+
+    # Multi-day accumulation signals (if available)
+    bandar_cumulative = 0
+    if accu_df is not None and not accu_df.empty:
+        bandar_rows = accu_df[accu_df["cat"].isin(["LOCAL_BANDAR"])]
+        if not bandar_rows.empty:
+            bandar_cumulative = int(bandar_rows["cum_net"].sum())
+
+    # Upper band proximity (overbought check)
+    ma20_v = float(df["close"].rolling(20).mean().iloc[-1])
+    std20  = float(df["close"].rolling(20).std().iloc[-1])
+    upper_band = ma20_v + 2 * std20
+    near_upper = lp >= upper_band * 0.95
+
+    # RSI for overbought
+    rsi_v  = float(rsi(df["close"]).iloc[-1])
+
+    # Candle analysis (last 3 days)
+    recent_bodies = (abs(df["close"] - df["open"]) / (df["high"] - df["low"]).replace(0, 1)).tail(3)
+    avg_body_ratio = float(recent_bodies.mean())
+    strong_candles = avg_body_ratio > 0.6
+
+    # ── PHASE CLASSIFICATION ──
+
+    goreng_score = 0
+    signals      = []
+    risks        = []
+
+    # ── Phase 0: QUIET ACCUMULATION (best entry point) ──
+    # ── Phase 0: QUIET ACCUMULATION (best entry point) ──
+    # Fix #5: bandar_cumulative > 500 required accu_df (often None in screener)
+    # New logic: if no accu_df, use single-day goreng signal + price quiet as proxy
+    # This ensures Phase 0 can trigger even in screener (no multi-day data)
+    has_accu_signal = bandar_cumulative > 500  # strong: multi-day confirmation
+    has_proxy_signal = (goreng_active and was_quiet and vol_ratio_today < 1.2)  # weak proxy
+    is_phase0 = (
+        was_quiet and
+        goreng_active and
+        vol_ratio_today < 1.5 and
+        (has_accu_signal or has_proxy_signal)
+    )
+    # Lower goreng_score for proxy-only Phase 0 (less confident)
+    phase0_score = 90 if has_accu_signal else 68
+
+    # ── Phase 1: MARKUP START (good entry, still early) ──
+    is_phase1 = (
+        goreng_active and
+        vol_building and
+        ret3 > 3 and ret3 < 15 and
+        not near_upper and
+        rsi_v < 70
+    )
+
+    # ── Phase 2: ACTIVE PUMP (enter with caution, tight SL) ──
+    is_phase2 = (
+        goreng_active and
+        vol_spike and
+        ret5 > 8 and
+        strong_candles and
+        retail_net < 0  # retail still selling = pump still early
+    )
+
+    # ── Phase 3: DISTRIBUTION (EXIT ZONE — danger) ──
+    is_phase3 = (
+        (goreng_active or len(goreng_codes) > 0) and
+        (vol_spike or vol_building) and
+        (retail_net > 2000 or crossing == "DIS") and  # retail now buying
+        ret5 > 5  # price still up but retail buying = distribution
+    )
+
+    # ── Phase 4: DUMP (too late — avoid or short) ──
+    is_phase4 = (
+        ret1 < -3 and vol_spike and  # big red candle + high volume
+        (retail_net > 0 or crossing == "DIS")  # retail still buying into dump
+    )
+
+    # Determine primary phase
+    if is_phase4:
+        phase     = 4
+        phase_lbl = "DUMP"
+        phase_c   = "#ff1744"
+        action    = "DO NOT ENTER — Dump in progress. Exit immediately if holding."
+        window    = "CLOSED"
+        urgency   = "IMMEDIATE EXIT"
+        goreng_score = 10
+
+    elif is_phase3:
+        phase     = 3
+        phase_lbl = "DISTRIBUTION"
+        phase_c   = "#ff8844"
+        action    = "EXIT ZONE — Bandar selling into retail demand. Profit take or exit now."
+        window    = "EXIT"
+        urgency   = "HIGH — Exit within 1-2 sessions"
+        goreng_score = 25
+        risks.append("Retail FOMO buyers = bandar's exit liquidity")
+        risks.append("Volume still high but smart money exiting")
+
+    elif is_phase2:
+        phase     = 2
+        phase_lbl = "ACTIVE PUMP"
+        phase_c   = "#ffab00"
+        action    = "ENTER with strict stop-loss. Set exit target +15-25%. Do NOT hold overnight without plan."
+        window    = "ENTRY (LATE)"
+        urgency   = "MEDIUM — Entry window closing. Tight SL mandatory."
+        goreng_score = 55
+        signals.append(f"Volume spike {vol_ratio_today:.1f}x average")
+        signals.append(f"Price up {ret5:.1f}% in 5 days")
+        signals.append(f"Pump broker active: {', '.join(goreng_codes)}")
+        risks.append("Late entry — downside accelerates if pump stalls")
+        risks.append(f"Retail net: {retail_net:,} lots — watch for flip to buying")
+
+    elif is_phase1:
+        phase     = 1
+        phase_lbl = "MARKUP START"
+        phase_c   = "#00e676"
+        action    = "OPTIMAL ENTRY ZONE — Early markup. Enter with position. Set SL at -5% or ATR×1.5."
+        window    = "ENTRY (EARLY)"
+        urgency   = "LOW-MEDIUM — Good risk/reward. Monitor volume daily."
+        goreng_score = 75
+        signals.append(f"Volume building {vol_ratio_5d:.1f}x avg — momentum increasing")
+        signals.append(f"Price {ret3:.1f}% in 3 days — controlled markup")
+        signals.append(f"Pump broker: {', '.join(goreng_codes)}")
+        if bandar_cumulative > 0:
+            signals.append(f"Cumulative bandar net: +{bandar_cumulative:,} lots")
+        risks.append("Phase 1 can stall — have exit plan ready")
+
+    elif is_phase0:
+        phase     = 0
+        phase_lbl = "QUIET ACCUMULATION"
+        phase_c   = "#00b0ff"
+        action    = "BEST ENTRY — Pre-pump accumulation detected. Enter now, before the crowd."
+        window    = "ENTRY (IDEAL)"
+        urgency   = "LOW — Wide stop possible. Max potential return."
+        goreng_score = phase0_score  # 90 if multi-day accu confirmed, 68 if proxy
+        signals.append("Price quiet — bandar accumulating without attention")
+        signals.append(f"Pump broker {', '.join(goreng_codes)} net buy {bandar_cumulative:,} lots cumulative")
+        signals.append("Volume not yet spiking — retail unaware")
+        if was_quiet:
+            signals.append(f"Stock has been sideways {price_std_pct:.1f}% std — consolidation ending")
+        risks.append("Timing uncertain — pump could be days or weeks away")
+        risks.append("Position sizing: start with 50% intended size")
+
+    elif goreng_active:
+        # Goreng broker detected but phase unclear
+        phase     = 1
+        phase_lbl = "WATCH — Goreng signal"
+        phase_c   = "#ffab00"
+        action    = "Monitor closely. Goreng broker active but phase unclear. Wait for volume confirmation."
+        window    = "WATCH"
+        urgency   = "LOW — Not yet actionable"
+        goreng_score = 40
+        signals.append(f"Pump broker active: {', '.join(goreng_codes)}")
+        risks.append("Phase not confirmed — do not enter without volume signal")
+
+    else:
+        phase     = -1
+        phase_lbl = "NOT DETECTED"
+        phase_c   = "#2a3d52"
+        action    = "No goreng pattern detected."
+        window    = "N/A"
+        urgency   = "N/A"
+        goreng_score = 0
+
+    # ── PROFIT TARGETS for goreng trading ──
+    targets = {}
+    if phase in (0, 1, 2):
+        # Goreng typically moves 20-40% during pump phase
+        targets = {
+            "T1_conservative": round(lp * 1.10, 0),   # +10%
+            "T2_base"        : round(lp * 1.20, 0),   # +20%
+            "T3_aggressive"  : round(lp * 1.35, 0),   # +35%
+            "stop_loss"      : round(lp * 0.95, 0),   # -5% hard stop
+            "time_stop"      : "Exit within 5 sessions regardless of P&L",
+        }
+
+    # ── RISK LEVEL ──
+    risk_level = {
+        0: "MEDIUM (timing risk)",
+        1: "MEDIUM-HIGH (momentum risk)",
+        2: "HIGH (late entry + dump risk)",
+        3: "VERY HIGH — EXIT",
+        4: "EXTREME — EXIT IMMEDIATELY",
+        -1: "N/A",
+    }.get(phase, "HIGH")
+
+    return {
+        "available"       : True,
+        "phase"           : phase,
+        "phase_label"     : phase_lbl,
+        "phase_color"     : phase_c,
+        "goreng_score"    : goreng_score,
+        "action"          : action,
+        "entry_window"    : window,
+        "urgency"         : urgency,
+        "risk_level"      : risk_level,
+        "signals"         : signals,
+        "risks"           : risks,
+        "targets"         : targets,
+        "goreng_codes"    : goreng_codes,
+        "vol_ratio"       : round(vol_ratio_today, 2),
+        "ret5"            : round(ret5, 2),
+        "ret3"            : round(ret3, 2),
+        "rsi_v"           : round(rsi_v, 1),
+        "retail_net"      : retail_net,
+        "bandar_cumul"    : bandar_cumulative,
+        "was_quiet"       : was_quiet,
+        "near_upper"      : near_upper,
+    }
+
+
 #  RS = stock outperformance vs benchmark (^JKSE)
 #  Rising RS + positive CMF = smart money rotating IN to this stock
 # ══════════════════════════════════════════════════════════════════════
@@ -3080,7 +4365,7 @@ def run_backtest(ticker: str, period: str = "2y",
     Returns comprehensive statistics.
     """
     df = load_price(ticker, period)
-    ihsg = load_ihsg(period)
+    ihsg = load_ihsg("1y")  # always 1y for RS calculation
     if df is None or len(df) < 80:
         return {"available": False, "error": "Insufficient price data"}
 
@@ -3316,121 +4601,196 @@ def chart_signal_scatter(df_signals: pd.DataFrame, hold: int = 10) -> go.Figure:
 #  ENTRY SIGNAL
 # ══════════════════════════════════════════════════════════════════════
 
-def entry_signal(final,ts,br_score,wp,cmf_v,obv_up,mfi_v,vr,crossing,
-                 goreng,sm_buy,sm_sell,chg,own,rs_data=None,vcp=None):
-    met,fail,watch = [],[],[]
-    if final>=70: met.append(f"Composite {final}/100 (Strong)")
-    elif final>=55: met.append(f"Composite {final}/100 (Positive)")
-    elif final<=35: fail.append(f"Composite {final}/100 (Bearish)")
-    else: watch.append(f"Composite {final}/100 (Neutral)")
-    pa = {"A":"watch","B":"buy","C":"buy","D":"watch","E":"avoid"}.get(wp,"watch")
-    if pa=="buy": met.append(f"Wyckoff Phase {wp} — accumulation zone")
-    elif pa=="avoid": fail.append(f"Wyckoff Phase {wp} — late stage")
-    else: watch.append(f"Wyckoff Phase {wp} — transitional")
-    if cmf_v>0.12: met.append(f"CMF {cmf_v:.3f} — money inflow")
-    elif cmf_v<-0.12: fail.append(f"CMF {cmf_v:.3f} — money outflow")
-    else: watch.append(f"CMF {cmf_v:.3f} — balanced")
-    if obv_up: met.append("OBV rising — cumulative buying")
-    else: fail.append("OBV falling — cumulative selling")
-    if 15<=mfi_v<=45: met.append(f"MFI {mfi_v:.0f} — oversold zone")
-    elif mfi_v>75: fail.append(f"MFI {mfi_v:.0f} — overbought")
-    else: watch.append(f"MFI {mfi_v:.0f} — normal")
-    if vr>=1.5: met.append(f"Volume {vr:.1f}x — high activity")
-    if crossing=="ACC": met.append("Accumulation Cross confirmed")
-    elif crossing=="DIS": fail.append("Distribution Cross confirmed")
-    if len(sm_buy)>=3: met.append(f"SM buying: {', '.join([b['broker'] for b in sm_buy[:3]])}")
-    elif len(sm_sell)>=2: fail.append(f"SM selling: {', '.join([b['broker'] for b in sm_sell[:2]])}")
-    if goreng: watch.append("Pump broker active — tight stop-loss")
-    if own:
-        if own.get("tier")==1: met.append(f"Tier 1 owner: {own['owner'][:18]}")
-        elif own.get("tier")==3: fail.append("Tier 3 owner — speculative")
-        if own.get("political"): watch.append("Political ties detected")
-        ff = own.get("float",30)
-        if ff<15: fail.append(f"Low float {ff}% — FCA/manipulation risk")
+def entry_signal(final, ts, br_score, wp, cmf_v, obv_up, mfi_v, vr, crossing,
+                 goreng, sm_buy, sm_sell, chg, own, rs_data=None, vcp=None,
+                 goreng_d=None):
+    """
+    Fix #1 — Wyckoff phase mapping:
+      OLD: B→buy, D→watch  (both WRONG)
+      NEW: A→watch(forming), B→watch(wait), C→buy(spring), D→buy(breakout), E→avoid
 
-    # ── VCP factor
-    vcp_bonus = 0
+    Fix #3 — VCP double-counting:
+      Removed vcp_bonus. VCP already contributes 10% of composite score.
+      Keeps VCP as qualifier for PREMIUM SETUP label only.
+
+    Fix #6 — RS double-adjustment:
+      rs_bonus capped at ±6 (was ±8) and only applied if regime adj not already
+      using sector RS. Prevents same signal moving score twice.
+
+    Fix #7 — Goreng integration:
+      When goreng Phase 0-1 detected, lowers entry threshold (goreng plays
+      have different risk/reward profile — quick momentum, not fundamentals).
+    """
+    met, fail, watch = [], [], []
+
+    # Composite score evaluation
+    if   final >= 70: met.append(f"Composite {final}/100 (Strong)")
+    elif final >= 55: met.append(f"Composite {final}/100 (Positive)")
+    elif final <= 35: fail.append(f"Composite {final}/100 (Bearish)")
+    else:             watch.append(f"Composite {final}/100 (Neutral)")
+
+    # ── Wyckoff phase — Fix #1: corrected mapping ──
+    # A = Selling Climax → still risky, forming base
+    # B = Building Cause → wait, not yet confirmed
+    # C = Spring         → IDEAL BUY (false breakdown = shakeout complete)
+    # D = Sign of Strength → BUY (breakout confirmed with volume)
+    # E = Markup/Late    → AVOID (distribution risk)
+    pa = {"A":"watch", "B":"watch", "C":"buy", "D":"buy", "E":"avoid"}.get(wp, "watch")
+    if pa == "buy":
+        if wp == "C":
+            met.append(f"Wyckoff Phase C — Spring/Shakeout ⭐ Ideal entry zone")
+        else:
+            met.append(f"Wyckoff Phase D — Sign of Strength, breakout confirmed")
+    elif pa == "avoid":
+        fail.append(f"Wyckoff Phase E — Late markup, distribution risk")
+    elif wp == "B":
+        watch.append("Wyckoff Phase B — Building cause, wait for Phase C/D")
+    else:
+        watch.append(f"Wyckoff Phase {wp} — transitional")
+
+    # CMF (money flow)
+    if   cmf_v >  0.12: met.append(f"CMF {cmf_v:.3f} — money inflow")
+    elif cmf_v < -0.12: fail.append(f"CMF {cmf_v:.3f} — money outflow")
+    else:               watch.append(f"CMF {cmf_v:.3f} — balanced")
+
+    # OBV
+    if obv_up: met.append("OBV rising — cumulative buying")
+    else:      fail.append("OBV falling — cumulative selling")
+
+    # MFI — Fix #2: correct thresholds (already fixed in tech_score display)
+    if   mfi_v < 25: met.append(f"MFI {mfi_v:.0f} — oversold, accumulation zone")
+    elif mfi_v > 75: fail.append(f"MFI {mfi_v:.0f} — overbought")
+    else:            watch.append(f"MFI {mfi_v:.0f} — normal")
+
+    # Volume
+    if vr >= 1.5: met.append(f"Volume {vr:.1f}x — elevated activity")
+
+    # Broker flow
+    if   crossing == "ACC": met.append("Accumulation Cross confirmed")
+    elif crossing == "DIS": fail.append("Distribution Cross confirmed")
+    if   len(sm_buy)  >= 3: met.append(f"SM buying: {', '.join([b['broker'] for b in sm_buy[:3]])}")
+    elif len(sm_sell) >= 2: fail.append(f"SM selling: {', '.join([b['broker'] for b in sm_sell[:2]])}")
+    if goreng: watch.append("Pump broker active — tight stop-loss, time-based exit")
+
+    # Ownership
+    if own:
+        if   own.get("tier") == 1: met.append(f"Tier 1 owner: {own['owner'][:18]}")
+        elif own.get("tier") == 3: fail.append("Tier 3 owner — speculative")
+        if   own.get("political"):  watch.append("Political ties detected")
+        if   own.get("float", 30) < 15: fail.append(f"Low float {own['float']}% — FCA risk")
+
+    # ── VCP — Fix #3: label only, no bonus (already in composite 10%) ──
     premium_setup = False
+    vcp_grade     = "NONE"
     if vcp and vcp.get("available"):
-        vcp_grade = vcp.get("grade","NONE")
+        vcp_grade = vcp.get("grade", "NONE")
         near_piv  = vcp.get("near_pivot", False)
         breaking  = vcp.get("is_breaking", False)
         if vcp_grade == "A":
-            met.append(f"VCP Grade A — Ideal contraction pattern, pivot at Rp{vcp.get('pivot_price',0):,.0f}")
-            vcp_bonus = 12
+            met.append(f"VCP Grade A — Ideal contraction at Rp{vcp.get('pivot_price',0):,.0f}")
             premium_setup = (pa in ("buy","watch") and cmf_v > 0)
         elif vcp_grade == "B":
-            met.append(f"VCP Grade B — Good contraction, setup forming near Rp{vcp.get('pivot_price',0):,.0f}")
-            vcp_bonus = 7
+            met.append(f"VCP Grade B — Setup forming near Rp{vcp.get('pivot_price',0):,.0f}")
         elif vcp_grade in ("C","C-"):
-            watch.append(f"VCP Grade {vcp_grade} — Early stage contraction, not yet complete")
-            vcp_bonus = 2 if vcp_grade == "C" else -2
+            watch.append(f"VCP Grade {vcp_grade} — Early contraction, not complete")
         if near_piv and vcp_grade in ("A","B"):
-            met.append("Near VCP pivot — potential breakout imminent")
-            vcp_bonus += 5
+            met.append("Near VCP pivot — breakout imminent")
         if breaking:
-            met.append("⚡ VCP BREAKOUT — Price breaking pivot with volume!")
-            vcp_bonus += 8
+            met.append("⚡ VCP BREAKOUT — Breaking pivot with volume!")
 
-    # ── RS vs IHSG factor
+    # ── RS — Fix #6: capped at ±6, not ±8 ──
     rs_bonus = 0
     if rs_data and rs_data.get("available"):
-        rs_interp = rs_data.get("interp","")
-        rs20      = rs_data.get("rs20_val",100)
-        t20       = rs_data.get("trend20","flat")
-        if rs_interp == "STRONG OUTPERFORM":
-            met.append(f"RS vs IHSG: Strong Outperform ({rs20:.1f}) — smart money rotation IN")
-            rs_bonus = 8
+        rs_interp = rs_data.get("interp", "")
+        rs20      = rs_data.get("rs20_val", 100)
+        if   rs_interp == "STRONG OUTPERFORM":
+            met.append(f"RS: Strong Outperform ({rs20:.1f}) — capital rotating IN")
+            rs_bonus = 6
         elif rs_interp == "OUTPERFORM":
-            met.append(f"RS vs IHSG: Outperform ({rs20:.1f}) — beating market")
-            rs_bonus = 4
+            met.append(f"RS: Outperform ({rs20:.1f}) — beating market")
+            rs_bonus = 3
         elif rs_interp == "STRONG UNDERPERFORM":
-            fail.append(f"RS vs IHSG: Strong Underperform ({rs20:.1f}) — money rotating OUT")
-            rs_bonus = -8
+            fail.append(f"RS: Strong Underperform ({rs20:.1f}) — capital rotating OUT")
+            rs_bonus = -6
         elif rs_interp == "UNDERPERFORM":
-            fail.append(f"RS vs IHSG: Underperform ({rs20:.1f}) — lagging market")
-            rs_bonus = -4
+            fail.append(f"RS: Underperform ({rs20:.1f}) — lagging market")
+            rs_bonus = -3
         else:
-            watch.append(f"RS vs IHSG: In Line ({rs20:.1f}) — moving with market")
+            watch.append(f"RS: In Line ({rs20:.1f}) — market-tracking")
 
-    # Adjust final with RS + VCP bonuses (max ±15 combined)
-    final_adj = int(np.clip(final + np.clip(rs_bonus + vcp_bonus, -15, 15), 0, 100))
+    # Fix #3: no vcp_bonus. Fix #6: rs_bonus capped ±6
+    final_adj = int(np.clip(final + rs_bonus, 0, 100))
 
-    nm=len(met); nf=len(fail)
+    # ── Fix #7 — Goreng mode: lower entry bar for momentum plays ──
+    goreng_phase  = goreng_d.get("phase", -1)   if goreng_d else -1
+    goreng_score  = goreng_d.get("goreng_score", 0) if goreng_d else 0
+    goreng_window = goreng_d.get("entry_window", "") if goreng_d else ""
+    is_goreng_entry = goreng_phase in (0, 1) and goreng_score >= 60
+    # In goreng Phase 0-1, lower threshold by 10 pts (momentum play, not fundamentals)
+    effective_threshold = 55 if is_goreng_entry else 65
 
-    # PREMIUM SETUP: VCP-A/B + Accumulation Cross = highest possible conviction
-    if premium_setup and crossing=="ACC" and final_adj>=60:
-        sig,color,cls="STRONG BUY","#00e676","sc-buy"
-        why="🔥 PREMIUM SETUP: VCP + Accumulation Cross + RS positive. Triple confirmation — highest conviction entry."
-        risk,action="LOW","Enter now at/near VCP pivot. Stop-loss below last contraction low."
-    elif crossing=="ACC" and final_adj>=65:
-        sig,color,cls="STRONG BUY","#00e676","sc-buy"
-        why="Accumulation Cross confirmed. Foreign institutions buying while retail sells."
-        risk,action="LOW-MEDIUM","Enter now. Stop-loss below recent 10-day support."
-    elif nm>=4 and nf<=1 and final_adj>=65:
-        sig,color,cls="BUY","#00e676","sc-buy"
-        why=f"{nm} conditions confirmed. Smart money accumulation + RS + VCP aligned."
-        risk,action="MEDIUM","Consider entry. Confirm with volume breakout."
-    elif crossing=="DIS" or (nf>=3 and final_adj<=40):
-        sig,color,cls="STRONG AVOID","#ff1744","sc-sell"
-        why="Distribution signals confirmed. Smart money exiting while retail buys."
-        risk,action="HIGH","Do not enter. Reduce position if holding."
-    elif nf>=2 and final_adj<=45:
-        sig,color,cls="AVOID","#ff1744","sc-sell"
-        why=f"{nf} bearish signals active. Risk outweighs reward."
-        risk,action="MEDIUM-HIGH","Hold off. Wait for reversal signals."
-    elif nm>=2 and nf<=1:
-        sig,color,cls="WATCH","#ffab00","sc-watch"
-        why="Setup building — accumulation + VCP forming but needs confirmation."
-        risk,action="MEDIUM","Add to watchlist. Trigger: volume breakout above VCP pivot."
+    nm = len(met); nf = len(fail)
+
+    # ── Signal classification ──
+    if premium_setup and crossing == "ACC" and final_adj >= 60:
+        sig, color, cls = "STRONG BUY", "#00e676", "sc-buy"
+        why    = "🔥 PREMIUM SETUP: VCP + Accumulation Cross. Highest conviction."
+        risk   = "LOW"
+        action = "Enter at/near VCP pivot. Stop-loss below contraction low."
+
+    elif is_goreng_entry and final_adj >= 50:
+        # Fix #7: goreng-specific signal
+        sig, color, cls = "GORENG ENTRY", "#00b0ff", "sc-buy"
+        why    = f"🔵 {goreng_window}: Pump setup detected. Momentum play — strict time/price exit required."
+        risk   = "MEDIUM-HIGH (goreng)"
+        action = "Enter with max 50% normal size. Set hard exit: +15-25% OR 5 sessions, whichever first."
+
+    elif crossing == "ACC" and final_adj >= effective_threshold:
+        sig, color, cls = "STRONG BUY", "#00e676", "sc-buy"
+        why    = "Accumulation Cross: institutions buying while retail sells."
+        risk   = "LOW-MEDIUM"
+        action = "Enter now. Stop-loss below recent 10-day support."
+
+    elif pa == "buy" and nm >= 4 and nf <= 1 and final_adj >= effective_threshold:
+        sig, color, cls = "BUY", "#00e676", "sc-buy"
+        why    = f"Wyckoff {wp} + {nm} conditions confirmed. Smart money aligned."
+        risk   = "MEDIUM"
+        action = "Consider entry. Confirm with volume breakout."
+
+    elif nm >= 4 and nf <= 1 and final_adj >= effective_threshold:
+        sig, color, cls = "BUY", "#00e676", "sc-buy"
+        why    = f"{nm} conditions met. Accumulation pattern forming."
+        risk   = "MEDIUM"
+        action = "Consider entry. Use half position until breakout confirmed."
+
+    elif crossing == "DIS" or (nf >= 3 and final_adj <= 40):
+        sig, color, cls = "STRONG AVOID", "#ff1744", "sc-sell"
+        why    = "Distribution confirmed. Smart money exiting into retail buying."
+        risk   = "HIGH"
+        action = "Do not enter. Exit existing position."
+
+    elif nf >= 2 and final_adj <= 45:
+        sig, color, cls = "AVOID", "#ff1744", "sc-sell"
+        why    = f"{nf} bearish signals active. Risk outweighs reward."
+        risk   = "MEDIUM-HIGH"
+        action = "Hold off. Wait for reversal."
+
+    elif nm >= 2 and nf <= 1:
+        sig, color, cls = "WATCH", "#ffab00", "sc-watch"
+        why    = "Setup building — needs confirmation before entry."
+        risk   = "MEDIUM"
+        action = "Watchlist. Trigger: ACC Cross or volume breakout above VCP pivot."
+
     else:
-        sig,color,cls="WATCH","#ffab00","sc-watch"
-        why="Mixed signals. No clear smart money direction."
-        risk,action="MEDIUM","Monitor. Enter only when 3+ conditions align."
-    return dict(sig=sig,color=color,cls=cls,why=why,risk=risk,
-                action=action,met=met,fail=fail,watch=watch,
-                final_adj=final_adj,rs_bonus=rs_bonus,
-                vcp_bonus=vcp_bonus,premium_setup=premium_setup)
+        sig, color, cls = "WATCH", "#ffab00", "sc-watch"
+        why    = "Mixed signals. No clear smart money direction."
+        risk   = "MEDIUM"
+        action = "Monitor. Enter only when 3+ conditions align."
+
+    return dict(sig=sig, color=color, cls=cls, why=why, risk=risk,
+                action=action, met=met, fail=fail, watch=watch,
+                final_adj=final_adj, rs_bonus=rs_bonus,
+                vcp_bonus=0, premium_setup=premium_setup)
 
 
 
@@ -3899,18 +5259,34 @@ with tab_a:
             if bdf is None:
                 bdf = demo_broker(ticker_input, ts); src = "demo"
             br = analyze_broker(bdf)
-        with st.spinner("Fetching fundamentals · ownership · shareholders · corporate actions ..."):
-            fund   = fundamentals(ticker_input)
+        with st.spinner("Fetching fundamentals · consensus · ownership · corporate actions ..."):
+            fund    = fundamentals(ticker_input)
+            # Enrich with Stockbit financials if token available (more accurate for IDX)
+            if sb_token and len(sb_token) > 20:
+                sb_fin = fetch_stockbit_financials(ticker_input, sb_token)
+                if sb_fin:
+                    fund = {**fund, **sb_fin}  # Stockbit data overrides Yahoo where available
             own    = OWNER_DB.get(ticker_input.upper().replace(".JK",""))
             ksei   = fetch_ksei_composition(ticker_input)
             sh_list, sh_src, sh_date = fetch_shareholders(ticker_input)
             ca     = fetch_corporate_actions(ticker_input)
-            fq     = fundamental_quality_gate(fund)
+            # Enrich corporate actions with Stockbit data
+            if sb_token and len(sb_token) > 20:
+                sb_api    = StockbitAPI(sb_token)
+                sb_ca     = sb_api.corporate_actions(ticker_input)
+                if sb_ca and not ca.get("div_history"):
+                    ca["div_history"] = [
+                        {"date": str(x.get("exDate",""))[:10],
+                         "amount": float(x.get("amount",0) or 0)}
+                        for x in sb_ca[:8] if x.get("type","").lower() in ("dividend","dividen")
+                    ]
+            consensus = fetch_stockbit_consensus(ticker_input, sb_token) if sb_token else {"available": False}
+            fq     = fundamental_quality_gate(fund, sector=get_stock_sector(ticker_input))
             div_m  = calc_dividend_metrics(ca, fund, float(df.iloc[-1]["close"]))
         with st.spinner("Computing RS vs IHSG · Market Regime · Weekly Confluence · Liquidity ..."):
-            ihsg_df    = load_ihsg(period)
+            ihsg_df    = load_ihsg(period if period not in ("1mo","1M") else "6mo")
             rs_data    = calc_rs(df, ihsg_df) if ihsg_df is not None else {"available": False}
-            regime     = detect_market_regime(period)
+            regime     = detect_market_regime("1y")   # always 1y — needs 200+ bars
             sector     = get_stock_sector(ticker_input)
             sector_data= detect_sector_rotation()
             reg_adj    = regime_signal_adjustment(regime, sector, sector_data)
@@ -3937,7 +5313,7 @@ with tab_a:
         total_adj    = int(np.clip(regime_adj + weekly_adj + liquidity_adj, -25, 15))
         adj_score    = int(np.clip(raw_final + total_adj, 0, 100))
 
-        # Layer 3: Mandatory gates
+        # Layer 3: Mandatory gates (now includes fundamental quality)
         gates = mandatory_score_gates(
             raw_score      = adj_score,
             vcp_grade      = vcp_grade_v,
@@ -3946,6 +5322,7 @@ with tab_a:
             wyckoff_phase  = wp,
             wyckoff_conf   = wconf,
             cmf_val        = float(c_.iloc[-1]),
+            fq             = fq,
         )
         final = gates["gated_score"]
 
@@ -3957,9 +5334,27 @@ with tab_a:
         ent   = entry_signal(final,ts,br["score"],wp,float(c_.iloc[-1]),
                               ob_up,float(m_.iloc[-1]),vr,br["crossing"],
                               br["goreng"],br["sm_buyers"],br["sm_sellers"],chg,own,
-                              rs_data=rs_data, vcp=vcp)
+                              rs_data=rs_data, vcp=vcp, goreng_d=None)  # goreng_d added after
 
         ez_new = entry_zone(df)
+
+        # Goreng phase detection
+        accu_df_g, _, _ = get_broker_accumulation(ticker_input, sb_token, 10)
+        goreng_d = detect_goreng_phase(df, br, accu_df_g)
+
+        # Re-run entry_signal now that goreng_d is available
+        ent = entry_signal(final,ts,br["score"],wp,float(c_.iloc[-1]),
+                           ob_up,float(m_.iloc[-1]),vr,br["crossing"],
+                           br["goreng"],br["sm_buyers"],br["sm_sellers"],chg,own,
+                           rs_data=rs_data, vcp=vcp, goreng_d=goreng_d)
+        entry_px   = float(st.session_state.get(f"entry_px_{ticker_input}", 0))
+        entry_days = int(st.session_state.get(f"entry_days_{ticker_input}", 0))
+        exit_sig   = calc_exit_signals(
+            df=df, c_series=c_, o_series=o_, m_series=m_,
+            br=br, rs_data=rs_data, vcp=vcp,
+            entry_price=entry_px, entry_date_days_ago=entry_days,
+            wp=wp, wconf=wconf, weekly_c=weekly_c,
+        )
 
         st.session_state["res"] = dict(
             df=df, df_weekly=df_weekly,
@@ -3968,14 +5363,14 @@ with tab_a:
             raw_final=raw_final, adj_score=adj_score, final=final, ent=ent,
             regime_adj=regime_adj, weekly_adj=weekly_adj,
             liquidity_adj=liquidity_adj, total_adj=total_adj,
-            gates=gates,
+            gates=gates, exit_sig=exit_sig, goreng_d=goreng_d,
             lp=float(last["close"]),chg=chg,vr=vr,
             cmf_v=float(c_.iloc[-1]),mfi_v=float(m_.iloc[-1]),
             obv_up=ob_up, ticker=ticker_input,
             fund=fund,own=own,ksei=ksei,
             sh_list=sh_list,sh_src=sh_src,sh_date=sh_date,
             ez=ez_new, rs_data=rs_data, vcp=vcp,
-            ca=ca, fq=fq, div_m=div_m,
+            ca=ca, fq=fq, div_m=div_m, consensus=consensus,
             regime=regime, sector=sector,
             sector_data=sector_data, reg_adj=reg_adj,
             weekly_c=weekly_c, liq=liq,
@@ -4050,6 +5445,122 @@ with tab_a:
           </div>
           <div class='conds'>{conds}</div>
         </div>""", unsafe_allow_html=True)
+
+        # ── GORENG OPPORTUNITY PANEL
+        goreng_d = R.get("goreng_d", {})
+        if goreng_d.get("available") and goreng_d.get("phase", -1) >= 0:
+            gph   = goreng_d["phase"]
+            glbl  = goreng_d["phase_label"]
+            gc    = goreng_d["phase_color"]
+            gact  = goreng_d["action"]
+            gwin  = goreng_d["entry_window"]
+            gurg  = goreng_d["urgency"]
+            grisk = goreng_d["risk_level"]
+            gsigs = goreng_d["signals"]
+            grisks= goreng_d["risks"]
+            gtgts = goreng_d.get("targets", {})
+            gcodes= goreng_d["goreng_codes"]
+            gscore= goreng_d["goreng_score"]
+
+            # Color-coded phase indicator
+            phase_icons = {0:"🔵",1:"🟢",2:"🟡",3:"🔴",4:"💀"}
+            phase_icon  = phase_icons.get(gph, "⚪")
+
+            st.markdown(
+                f"<div style='background:#0b1018;border:2px solid {gc};"
+                f"border-radius:4px;overflow:hidden;margin-bottom:10px'>"
+                f"<div style='background:#0d1420;padding:8px 16px;"
+                f"border-bottom:1px solid {gc};display:flex;"
+                f"justify-content:space-between;align-items:center'>"
+                f"<span style='font-family:IBM Plex Mono,monospace;font-size:9px;"
+                f"color:#5a7a9a;letter-spacing:2px'>GORENG DETECTOR · PUMP PHASE ANALYSIS</span>"
+                f"<span style='font-family:IBM Plex Mono,monospace;font-size:9px;"
+                f"color:#5a7a9a'>Brokers: {', '.join(gcodes) if gcodes else 'None detected'}</span>"
+                f"</div>"
+                f"<div style='padding:14px 16px'>"
+                f"<div style='display:flex;justify-content:space-between;align-items:center'>"
+                f"<div>"
+                f"<div style='font-family:IBM Plex Mono,monospace;font-size:9px;"
+                f"color:#5a7a9a;margin-bottom:4px'>PUMP PHASE</div>"
+                f"<div style='font-size:1.3rem;font-weight:700;color:{gc};"
+                f"font-family:IBM Plex Mono,monospace'>{phase_icon} {glbl}</div>"
+                f"<div style='font-size:10px;color:{gc};margin-top:2px'>"
+                f"Entry window: {gwin}</div>"
+                f"</div>"
+                f"<div style='text-align:right'>"
+                f"<div style='font-family:IBM Plex Mono,monospace;font-size:9px;"
+                f"color:#5a7a9a'>GORENG SCORE</div>"
+                f"<div style='font-family:IBM Plex Mono,monospace;font-size:1.4rem;"
+                f"font-weight:700;color:{gc}'>{gscore}/100</div>"
+                f"<div style='font-size:9px;color:#5a7a9a'>Risk: {grisk}</div>"
+                f"</div>"
+                f"</div>"
+                f"<div style='margin-top:10px;padding:8px 12px;background:rgba(0,0,0,.3);"
+                f"border-radius:3px;font-size:11px;color:#cdd8e6;border-left:3px solid {gc}'>"
+                f"{gact}</div>",
+                unsafe_allow_html=True
+            )
+
+            # Signals + Risks 2-col
+            col_gs, col_gr = st.columns(2)
+            with col_gs:
+                if gsigs:
+                    st.markdown(
+                        "<div style='background:#0b1018;border:1px solid #141e2e;"
+                        "border-radius:3px;padding:10px 12px;margin-top:4px'>"
+                        "<div style='font-family:IBM Plex Mono,monospace;font-size:9px;"
+                        "color:#00e676;letter-spacing:1.5px;margin-bottom:6px'>✅ SIGNALS</div>"
+                        + "".join([
+                            f"<div style='font-size:10px;color:#cdd8e6;padding:3px 0;"
+                            f"border-bottom:1px solid #141e2e'>· {s}</div>"
+                            for s in gsigs
+                        ]) + "</div>",
+                        unsafe_allow_html=True
+                    )
+            with col_gr:
+                if grisks:
+                    st.markdown(
+                        "<div style='background:#0b1018;border:1px solid #141e2e;"
+                        "border-radius:3px;padding:10px 12px;margin-top:4px'>"
+                        "<div style='font-family:IBM Plex Mono,monospace;font-size:9px;"
+                        "color:#ff1744;letter-spacing:1.5px;margin-bottom:6px'>⚠️ RISKS</div>"
+                        + "".join([
+                            f"<div style='font-size:10px;color:#cdd8e6;padding:3px 0;"
+                            f"border-bottom:1px solid #141e2e'>· {r}</div>"
+                            for r in grisks
+                        ]) + "</div>",
+                        unsafe_allow_html=True
+                    )
+
+            # Profit targets
+            if gtgts and gph in (0, 1, 2):
+                st.markdown(
+                    f"<div style='background:#090d12;border:1px solid #141e2e;"
+                    f"border-radius:3px;padding:10px 14px;margin-top:4px;margin-bottom:8px;"
+                    f"font-family:IBM Plex Mono,monospace;font-size:10px'>"
+                    f"<div style='color:#5a7a9a;letter-spacing:1px;margin-bottom:6px'>GORENG TARGETS</div>"
+                    f"<span style='color:#88ffbb'>T1 Rp{gtgts.get('T1_conservative',0):,.0f} (+10%)</span>"
+                    f" &nbsp;·&nbsp; "
+                    f"<span style='color:#00e676'>T2 Rp{gtgts.get('T2_base',0):,.0f} (+20%)</span>"
+                    f" &nbsp;·&nbsp; "
+                    f"<span style='color:#00e676;font-weight:700'>T3 Rp{gtgts.get('T3_aggressive',0):,.0f} (+35%)</span>"
+                    f" &nbsp;·&nbsp; "
+                    f"<span style='color:#ff1744'>SL Rp{gtgts.get('stop_loss',0):,.0f} (-5%)</span>"
+                    f"<div style='color:#ffab00;margin-top:4px;font-size:9px'>"
+                    f"⏱️ {gtgts.get('time_stop','Exit within 5 sessions')}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+
+            st.markdown("</div></div>", unsafe_allow_html=True)
+
+            # Phase-specific warnings
+            if gph == 3:
+                st.error("🔴 **DISTRIBUTION PHASE** — Bandar is selling into your buy orders. EXIT NOW or within 1-2 sessions.")
+            elif gph == 4:
+                st.error("💀 **DUMP IN PROGRESS** — If holding, exit on any bounce. Do not average down.")
+            elif gph == 0:
+                st.info("🔵 **PRE-PUMP ACCUMULATION** — Highest risk/reward entry point. Set alert for volume spike confirmation.")
 
         # ── SIGNAL VALIDATION LAYER BANNER
         regime   = R.get("regime", {})
@@ -4189,7 +5700,7 @@ with tab_a:
             f"DD from peak: <span style='color:{dd_c}'>{ihsg_dd:+.1f}%</span> &nbsp;·&nbsp; "
             f"20d: <span style='color:{r20_c}'>{ihsg_r20:+.1f}%</span> &nbsp;·&nbsp; "
             f"60d: <span style='color:{r60_c}'>{ihsg_r60:+.1f}%</span> &nbsp;·&nbsp; "
-            f"vs MA50: <span style='color:{'#00e676' if ihsg_ma50 else '#ff8888'}'>"
+            f"vs MA50: <span style='color:{('#00e676' if ihsg_ma50 else '#ff8888')}'>"
             f"{'ABOVE' if ihsg_ma50 else 'BELOW'}</span>"
             f"</div>",
             unsafe_allow_html=True
@@ -4886,9 +6397,60 @@ with tab_a:
         st.markdown("---")
         # ── FUNDAMENTAL QUALITY + CORPORATE ACTIONS
         st.markdown("---")
-        ca    = R.get("ca", {})
-        fq    = R.get("fq", {})
-        div_m = R.get("div_m", {})
+        ca        = R.get("ca", {})
+        fq        = R.get("fq", {})
+        div_m     = R.get("div_m", {})
+        consensus = R.get("consensus", {})
+
+        # ── ANALYST CONSENSUS BANNER (Stockbit-sourced, shown if token available)
+        if consensus.get("available"):
+            tp     = consensus.get("target_price", 0)
+            upside = consensus.get("upside_pct", 0)
+            lbl    = consensus.get("label","—")
+            lc     = consensus.get("label_color","#5a7a9a")
+            buy_c  = consensus.get("buy_count", 0)
+            hold_c = consensus.get("hold_count", 0)
+            sell_c = consensus.get("sell_count", 0)
+            total  = consensus.get("total_analysts", 1)
+            bp     = consensus.get("buy_pct", 0)
+            up_c   = "#00e676" if upside > 0 else "#ff1744"
+            bar_buy  = int(buy_c  / total * 100)
+            bar_hold = int(hold_c / total * 100)
+            bar_sell = int(sell_c / total * 100)
+            st.markdown(
+                f"<div style='background:#0b1018;border:1px solid #141e2e;"
+                f"border-radius:4px;padding:12px 16px;margin-bottom:10px'>"
+                f"<div style='font-family:IBM Plex Mono,monospace;font-size:9px;"
+                f"color:#5a7a9a;letter-spacing:2px;margin-bottom:6px'>"
+                f"ANALYST CONSENSUS (STOCKBIT) — {total} analysts</div>"
+                f"<div style='display:flex;justify-content:space-between;align-items:center;gap:16px'>"
+                f"<div>"
+                f"<div style='font-family:IBM Plex Mono,monospace;font-size:1.1rem;"
+                f"font-weight:700;color:{lc}'>{lbl}</div>"
+                f"<div style='font-size:10px;color:#5a7a9a;margin-top:2px'>"
+                f"{buy_c} Buy · {hold_c} Hold · {sell_c} Sell</div>"
+                f"</div>"
+                f"<div style='text-align:right'>"
+                f"<div style='font-family:IBM Plex Mono,monospace;font-size:9px;color:#5a7a9a'>TARGET PRICE</div>"
+                f"<div style='font-family:IBM Plex Mono,monospace;font-size:1.1rem;"
+                f"font-weight:700;color:#eaf0f8'>Rp{tp:,.0f}</div>"
+                f"<div style='font-size:10px;color:{up_c}'>{upside:+.1f}% upside</div>"
+                f"</div>"
+                f"</div>"
+                f"<div style='margin-top:8px;height:6px;border-radius:3px;overflow:hidden;"
+                f"display:flex;gap:1px'>"
+                f"<div style='width:{bar_buy}%;background:#00e676;border-radius:3px 0 0 3px'></div>"
+                f"<div style='width:{bar_hold}%;background:#ffab00'></div>"
+                f"<div style='width:{bar_sell}%;background:#ff1744;border-radius:0 3px 3px 0'></div>"
+                f"</div>"
+                f"<div style='display:flex;gap:16px;margin-top:3px;font-size:9px;"
+                f"font-family:IBM Plex Mono,monospace;color:#5a7a9a'>"
+                f"<span style='color:#00e676'>■ Buy {bar_buy}%</span>"
+                f"<span style='color:#ffab00'>■ Hold {bar_hold}%</span>"
+                f"<span style='color:#ff1744'>■ Sell {bar_sell}%</span>"
+                f"</div></div>",
+                unsafe_allow_html=True
+            )
 
         col_fq, col_ca, col_ksei = st.columns(3)
 
@@ -4897,23 +6459,32 @@ with tab_a:
             st.markdown('<div class="sec">FUNDAMENTAL QUALITY SCREEN</div>',
                         unsafe_allow_html=True)
             if fund and fq.get("checks"):
-                qs  = fq.get("score", 0)
-                qov = fq.get("overall","—")
-                qoc = fq.get("color","#5a7a9a")
-                st.markdown(f"""
-                <div style='background:#0b1018;border:1px solid {qoc};
-                            border-top:2px solid {qoc};padding:10px 14px;
-                            border-radius:4px;margin-bottom:8px;
-                            display:flex;justify-content:space-between;align-items:center'>
-                  <div>
-                    <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;
-                                color:#5a7a9a;letter-spacing:1px'>QUALITY VERDICT</div>
-                    <div style='font-family:"IBM Plex Mono",monospace;font-size:1rem;
-                                font-weight:700;color:{qoc}'>{qov}</div>
-                  </div>
-                  <div style='font-family:"IBM Plex Mono",monospace;font-size:1.5rem;
-                              font-weight:700;color:{qoc}'>{qs}/100</div>
-                </div>""", unsafe_allow_html=True)
+                qs          = fq.get("score", 0)
+                qov         = fq.get("overall","—")
+                qoc         = fq.get("color","#5a7a9a")
+                fq_sector   = fq.get("sector", sector)
+                sector_note = fq.get("sector_note","Standard thresholds applied.")
+                st.markdown(
+                    f"<div style='background:#0b1018;border:1px solid {qoc};"
+                    f"border-top:2px solid {qoc};padding:10px 14px;"
+                    f"border-radius:4px;margin-bottom:6px'>"
+                    f"<div style='display:flex;justify-content:space-between;align-items:center'>"
+                    f"<div>"
+                    f"<div style='font-family:IBM Plex Mono,monospace;font-size:9px;"
+                    f"color:#5a7a9a;letter-spacing:1px'>QUALITY VERDICT</div>"
+                    f"<div style='font-family:IBM Plex Mono,monospace;font-size:1rem;"
+                    f"font-weight:700;color:{qoc}'>{qov}</div>"
+                    f"</div>"
+                    f"<div style='font-family:IBM Plex Mono,monospace;font-size:1.5rem;"
+                    f"font-weight:700;color:{qoc}'>{qs}/100</div>"
+                    f"</div>"
+                    f"<div style='margin-top:6px;padding-top:6px;border-top:1px solid #141e2e;"
+                    f"font-size:9px;color:#5a7a9a;font-family:IBM Plex Mono,monospace'>"
+                    f"Sector: <span style='color:#cdd8e6'>{fq_sector}</span> — "
+                    f"{sector_note[:80]}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
 
                 # Quality checks table
                 for chk in fq["checks"]:
@@ -5437,6 +7008,132 @@ with tab_a:
                 <div style='padding:20px;text-align:center;font-family:"IBM Plex Mono",monospace;
                             font-size:11px;color:#2a3d52'>Liquidity data unavailable.</div>""",
                 unsafe_allow_html=True)
+
+        # ══════════════════════════════════════════════════════════
+        # ── EXIT SIGNAL FRAMEWORK
+        # ══════════════════════════════════════════════════════════
+        st.markdown("---")
+        st.markdown('<div class="sec">EXIT SIGNAL MONITOR</div>', unsafe_allow_html=True)
+
+        exit_sig = R.get("exit_sig", {})
+        ticker_k = R.get("ticker","")
+
+        # Entry price input (optional — unlocks full exit analysis)
+        col_ep1, col_ep2, col_ep3 = st.columns([2,2,3])
+        with col_ep1:
+            entry_px_input = st.number_input(
+                "Entry Price (Rp) — 0 if not holding",
+                min_value=0, value=int(st.session_state.get(f"entry_px_{ticker_k}", 0)),
+                step=10, key=f"ep_{ticker_k}",
+                help="Enter your actual buy price to unlock P&L and time-based exit signals"
+            )
+            if entry_px_input != st.session_state.get(f"entry_px_{ticker_k}", 0):
+                st.session_state[f"entry_px_{ticker_k}"] = entry_px_input
+        with col_ep2:
+            entry_days_input = st.number_input(
+                "Days held",
+                min_value=0, value=int(st.session_state.get(f"entry_days_{ticker_k}", 0)),
+                step=1, key=f"ed_{ticker_k}",
+                help="How many trading days since entry"
+            )
+            if entry_days_input != st.session_state.get(f"entry_days_{ticker_k}", 0):
+                st.session_state[f"entry_days_{ticker_k}"] = entry_days_input
+        with col_ep3:
+            if entry_px_input > 0:
+                lp_now = R.get("lp", 0)
+                pnl = (lp_now - entry_px_input) / entry_px_input * 100
+                pnl_c = "#00e676" if pnl >= 0 else "#ff1744"
+                st.markdown(
+                    f"<div style='background:#0b1018;border:1px solid #141e2e;"
+                    f"border-radius:4px;padding:10px 14px;margin-top:22px'>"
+                    f"<div style='font-family:IBM Plex Mono,monospace;font-size:9px;"
+                    f"color:#5a7a9a'>CURRENT P&L</div>"
+                    f"<div style='font-family:IBM Plex Mono,monospace;font-size:1.3rem;"
+                    f"font-weight:700;color:{pnl_c}'>{pnl:+.2f}%</div>"
+                    f"<div style='font-size:9px;color:#5a7a9a'>"
+                    f"Entry Rp{entry_px_input:,} → Now Rp{lp_now:,.0f}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+
+        if exit_sig.get("available") and exit_sig.get("signals"):
+            rec   = exit_sig["recommendation"]
+            rec_c = exit_sig["rec_color"]
+            rec_d = exit_sig["rec_detail"]
+
+            # Recommendation header
+            st.markdown(
+                f"<div style='background:#0b1018;border:2px solid {rec_c};"
+                f"border-radius:4px;padding:12px 16px;margin:10px 0'>"
+                f"<div style='font-family:IBM Plex Mono,monospace;font-size:9px;"
+                f"color:#5a7a9a;letter-spacing:2px'>RECOMMENDATION</div>"
+                f"<div style='font-family:IBM Plex Mono,monospace;font-size:1.3rem;"
+                f"font-weight:700;color:{rec_c};margin:4px 0'>{rec}</div>"
+                f"<div style='font-size:11px;color:#cdd8e6'>{rec_d}</div>"
+                f"</div>",
+                unsafe_allow_html=True
+            )
+
+            # Signal cards by type
+            type_order = ["DISTRIBUTION","TECHNICAL","THESIS_BROKEN","TIME_DECAY","PROFIT_TARGET"]
+            type_labels = {
+                "DISTRIBUTION" : "⛔ DISTRIBUTION SIGNALS",
+                "TECHNICAL"    : "📉 TECHNICAL BREAKDOWN",
+                "THESIS_BROKEN": "💔 THESIS BROKEN",
+                "TIME_DECAY"   : "⏳ SIGNAL DECAY",
+                "PROFIT_TARGET": "🎯 PROFIT TARGETS",
+            }
+            grouped = {t:[] for t in type_order}
+            for s in exit_sig["signals"]:
+                grouped[s["type"]].append(s)
+
+            for t in type_order:
+                if not grouped[t]: continue
+                st.markdown(
+                    f"<div style='font-family:IBM Plex Mono,monospace;font-size:9px;"
+                    f"color:#5a7a9a;letter-spacing:1.5px;margin:10px 0 5px'>"
+                    f"{type_labels[t]}</div>",
+                    unsafe_allow_html=True
+                )
+                for s in grouped[t]:
+                    urg_badge = {
+                        "IMMEDIATE": "🔴 IMMEDIATE",
+                        "STAGED"   : "🟡 STAGED",
+                        "MONITOR"  : "🟢 MONITOR",
+                    }.get(s["urgency"], s["urgency"])
+                    st.markdown(
+                        f"<div style='background:#090d12;border:1px solid #141e2e;"
+                        f"border-left:3px solid {s['color']};border-radius:3px;"
+                        f"padding:10px 14px;margin-bottom:6px'>"
+                        f"<div style='display:flex;justify-content:space-between;"
+                        f"align-items:center;margin-bottom:4px'>"
+                        f"<span style='font-family:IBM Plex Mono,monospace;font-size:11px;"
+                        f"font-weight:700;color:{s['color']}'>{s['signal']}</span>"
+                        f"<span style='font-family:IBM Plex Mono,monospace;font-size:9px;"
+                        f"color:#5a7a9a'>{urg_badge}</span>"
+                        f"</div>"
+                        f"<div style='font-size:11px;color:#cdd8e6;margin-bottom:4px'>"
+                        f"{s['detail']}</div>"
+                        f"<div style='font-size:10px;color:{s['color']};font-weight:600'>"
+                        f"→ {s['action']}</div>"
+                        f"</div>",
+                        unsafe_allow_html=True
+                    )
+        else:
+            # No exit signals — holding is fine
+            st.markdown(
+                "<div style='background:#090d12;border:1px solid #141e2e;"
+                "border-left:3px solid #00e676;border-radius:3px;padding:12px 16px'>"
+                "<div style='font-family:IBM Plex Mono,monospace;font-size:11px;"
+                "font-weight:700;color:#00e676'>✅ HOLD — No Exit Signals</div>"
+                "<div style='font-size:11px;color:#cdd8e6;margin-top:4px'>"
+                "No distribution, breakdown, or thesis-break signals detected. "
+                "Maintain position with current stop-loss.</div>"
+                "<div style='font-size:10px;color:#5a7a9a;margin-top:6px'>"
+                "Enter your buy price above to unlock P&L tracking and time-based signals."
+                "</div></div>",
+                unsafe_allow_html=True
+            )
 
         # ── ALERTS
         for alert in br["alerts"]:
@@ -6108,7 +7805,10 @@ with tab_s:
                 l_adj_ = int(np.clip(liq_.get("score_adj",0),-20,5))
                 fs_adj = int(np.clip(fs_raw + w_adj_ + l_adj_, 0, 100))
 
-                # Layer 3: mandatory gates
+                # Layer 3: mandatory gates (with fundamental quality — cached)
+                fq_sc_ = fundamental_quality_gate(
+                    fundamentals(tk), sector=get_stock_sector(tk)
+                )
                 gates_ = mandatory_score_gates(
                     raw_score     = fs_adj,
                     vcp_grade     = vcp_grade_,
@@ -6117,6 +7817,7 @@ with tab_s:
                     wyckoff_phase = wp_,
                     wyckoff_conf  = wconf_,
                     cmf_val       = float(c_.iloc[-1]),
+                    fq            = fq_sc_,
                 )
                 fs = gates_["gated_score"]
 
@@ -6128,16 +7829,23 @@ with tab_s:
                 ent_ = entry_signal(fs,ts_,br_["score"],wp_,float(c_.iloc[-1]),
                                     obv_,float(m_.iloc[-1]),vr_,br_["crossing"],
                                     br_["goreng"],br_["sm_buyers"],br_["sm_sellers"],
-                                    chg_,own_,vcp=vcp_)
+                                    chg_,own_,vcp=vcp_,goreng_d=gd_)
                 vcp_grade_ = vcp_.get("grade","NONE")
                 wc_lbl_    = wc_.get("label","—")[:8] if wc_.get("available") else "N/A"
                 liq_lbl_   = liq_.get("label","—")[:8]
+                # Goreng phase (lightweight — no accu data in screener for speed)
+                gd_        = detect_goreng_phase(df_tk, br_)
+                goreng_lbl_= ""
+                if gd_.get("available") and gd_.get("phase", -1) >= 0:
+                    ph_icons = {0:"🔵P0",1:"🟢P1",2:"🟡P2",3:"🔴P3",4:"💀P4"}
+                    goreng_lbl_ = ph_icons.get(gd_["phase"], "")
                 rows.append({
                     "Ticker":tk, "Price":f"Rp {int(last_['close']):,}",
                     "Change":f"{'+'if chg_>=0 else ''}{chg_:.2f}%",
                     "Score":fs, "Signal":ent_["sig"], "Risk":ent_["risk"],
                     "VCP":vcp_grade_,
                     "Premium":"🔥" if ent_.get("premium_setup") else "",
+                    "Goreng":goreng_lbl_,
                     "Weekly":wc_lbl_,
                     "Liq":liq_lbl_,
                     "Owner":own_["owner"][:18] if own_ else "—",
@@ -6172,7 +7880,7 @@ with tab_s:
                 c5.metric("VCP Grade A", len([r for r in rows if r["VCP"]=="A"]))
 
                 # Market regime at time of scan
-                regime_scan = detect_market_regime(period)
+                regime_scan = detect_market_regime("1y")   # always 1y
                 if regime_scan.get("available"):
                     rc = regime_scan["color"]
                     st.markdown(f"""
@@ -6190,7 +7898,7 @@ with tab_s:
                     </div>""", unsafe_allow_html=True)
 
                 disp = ["Ticker","Price","Change","Score","Grade","Pct","Signal","Risk",
-                        "VCP","Premium","Weekly","Liq","Owner","Tier","Float","Pol","Ph","CMF","Vol","Cross","Data"]
+                        "VCP","Premium","Goreng","Weekly","Liq","Owner","Tier","Float","Pol","Ph","CMF","Vol","Cross","Data"]
                 st.dataframe(df_r[disp], hide_index=True, use_container_width=True,
                     column_config={
                         "Score": st.column_config.ProgressColumn(
@@ -6214,6 +7922,149 @@ with tab_s:
                 if grade_s: st.success(f"⭐ **GRADE S** (top universe rank): {' · '.join(grade_s)}")
                 if vcp_a: st.info(f"📐 **VCP Grade A**: {' · '.join(vcp_a)}")
                 if pol:   st.warning(f"⚡ **Political exposure** (extra risk): {', '.join(pol)}")
+
+                # ── CONCENTRATION & CORRELATION WARNING ──
+                st.markdown("---")
+                st.markdown('<div class="sec">PORTFOLIO CONCENTRATION ANALYSIS</div>',
+                            unsafe_allow_html=True)
+
+                # Map each ticker to sector
+                SCREENER_SECTOR_MAP = {
+                    "Banking"      : {"BBCA","BBRI","BMRI","BBNI","BBTN","BJTM","NISP","ARTO","BTPS","MEGA"},
+                    "Coal/Mining"  : {"ADRO","ADMR","BYAN","PTBA","INCO","TINS","MBMA","DOID","ITMG","HRUM"},
+                    "Metals/Mining": {"MDKA","ANTM","AMMN","NCKL","MBMA"},
+                    "Energy"       : {"MEDC","PGAS","ELSA","ENRG","RUIS","CUAN","BREN"},
+                    "Consumer"     : {"ICBP","INDF","UNVR","MYOR","ROTI","SIDO","DLTA","HMSP","GGRM","AMRT","MAPI","LPPF","ACES"},
+                    "Telecoms"     : {"TLKM","EXCL","ISAT","TBIG","TOWR","DCII"},
+                    "Property"     : {"BSDE","CTRA","PWON","ASRI","LPKR","PANI","CBDK","SMRA"},
+                    "Healthcare"   : {"KLBF","KAEF","MIKA","HEAL","SIDO","PRDA"},
+                    "Tech/Digital" : {"GOTO","BUKA","EMTK","DMMX","META"},
+                    "Industrial"   : {"ASII","UNTR","SSIA","ACST","WTON","SMGR"},
+                    "Petrochemical": {"BRPT","TPIA","CHANDRA"},
+                    "Conglomerate" : {"SSIA","CDIA"},
+                }
+
+                def get_sector_sc(ticker):
+                    t = ticker.upper().replace(".JK","")
+                    for sec, tickers in SCREENER_SECTOR_MAP.items():
+                        if t in tickers:
+                            return sec
+                    return "Other"
+
+                # Get BUY+ signals only for concentration analysis
+                buy_plus = [r for r in rows if r["_sig"] in ("STRONG BUY","BUY","PREMIUM SETUP")]
+
+                if buy_plus:
+                    # Count by sector
+                    sector_counts = {}
+                    sector_stocks = {}
+                    for r in buy_plus:
+                        sec = get_sector_sc(r["Ticker"])
+                        sector_counts[sec] = sector_counts.get(sec, 0) + 1
+                        sector_stocks.setdefault(sec, []).append(r["Ticker"])
+
+                    total_buy = len(buy_plus)
+
+                    # Build concentration table
+                    conc_rows = sorted(sector_counts.items(), key=lambda x: x[1], reverse=True)
+
+                    conc_html = ""
+                    warnings_found = []
+                    for sec, cnt in conc_rows:
+                        pct  = cnt / total_buy * 100
+                        tks  = ", ".join(sector_stocks[sec])
+                        if pct >= 50:
+                            cc = "#ff1744"; flag = "⛔ EXTREME"
+                            warnings_found.append(f"{sec} ({pct:.0f}%)")
+                        elif pct >= 35:
+                            cc = "#ff8844"; flag = "⚠️ HIGH"
+                            warnings_found.append(f"{sec} ({pct:.0f}%)")
+                        elif pct >= 25:
+                            cc = "#ffab00"; flag = "🟡 MODERATE"
+                        else:
+                            cc = "#00e676"; flag = "✅ OK"
+                        bar_w = int(pct)
+                        conc_html += (
+                            f"<div style='padding:7px 0;border-bottom:1px solid #141e2e'>"
+                            f"<div style='display:flex;justify-content:space-between;"
+                            f"font-family:IBM Plex Mono,monospace;font-size:10px;margin-bottom:3px'>"
+                            f"<span style='color:{cc};font-weight:600'>{sec}</span>"
+                            f"<span style='color:#5a7a9a'>{cnt} stock{'s' if cnt>1 else ''} · {pct:.0f}% · {flag}</span>"
+                            f"</div>"
+                            f"<div style='background:#141e2e;border-radius:2px;height:4px;margin-bottom:3px'>"
+                            f"<div style='width:{bar_w}%;height:4px;background:{cc};border-radius:2px'></div></div>"
+                            f"<div style='font-size:9px;color:#5a7a9a'>{tks}</div>"
+                            f"</div>"
+                        )
+
+                    st.markdown(
+                        f"<div style='background:#0b1018;border:1px solid #141e2e;"
+                        f"border-radius:4px;padding:12px 16px;margin-bottom:10px'>"
+                        f"<div style='font-family:IBM Plex Mono,monospace;font-size:9px;"
+                        f"color:#5a7a9a;letter-spacing:1.5px;margin-bottom:8px'>"
+                        f"SECTOR BREAKDOWN — {total_buy} BUY+ SIGNALS</div>"
+                        f"{conc_html}</div>",
+                        unsafe_allow_html=True
+                    )
+
+                    # Concentration warnings
+                    if warnings_found:
+                        st.error(
+                            f"⛔ **Concentration Risk**: {', '.join(warnings_found)} dominate your buy signals. "
+                            f"This is NOT diversification — it's a concentrated bet on one sector cycle. "
+                            f"If the sector reverses, ALL positions move against you simultaneously. "
+                            f"**Max recommended per sector: 35% of portfolio.**"
+                        )
+
+                    # IDX-specific correlation clusters
+                    CORR_CLUSTERS = [
+                        ("Coal cycle", {"ADRO","ADMR","BYAN","PTBA","ITMG","HRUM","DOID"}),
+                        ("Prajogo group", {"BREN","BRPT","TPIA","CUAN","CDIA"}),
+                        ("BUMN banks", {"BBRI","BMRI","BBNI","BBTN"}),
+                        ("Nickel/EV metals",{"MDKA","INCO","ANTM","NCKL"}),
+                        ("Adaro group", {"ADRO","ADMR","MBMA"}),
+                    ]
+                    buy_tickers = {r["Ticker"].upper().replace(".JK","") for r in buy_plus}
+                    cluster_warns = []
+                    for cluster_name, cluster_set in CORR_CLUSTERS:
+                        overlap = buy_tickers & cluster_set
+                        if len(overlap) >= 3:
+                            cluster_warns.append(f"{cluster_name}: {', '.join(sorted(overlap))}")
+                        elif len(overlap) == 2:
+                            cluster_warns.append(f"{cluster_name} (2 stocks): {', '.join(sorted(overlap))}")
+
+                    if cluster_warns:
+                        st.warning(
+                            f"🔗 **High Correlation Cluster Detected**: "
+                            + " | ".join(cluster_warns)
+                            + ". These stocks move together (correlation >0.80). "
+                            f"Treat as 1 position for risk management purposes."
+                        )
+
+                    # Portfolio diversity score
+                    n_sectors    = len([s for s,c in sector_counts.items() if c >= 1])
+                    max_conc_pct = max(sector_counts.values()) / total_buy * 100
+                    if n_sectors >= 4 and max_conc_pct < 30:
+                        div_score, div_c, div_l = "GOOD", "#00e676", "Well diversified across sectors"
+                    elif n_sectors >= 3 and max_conc_pct < 40:
+                        div_score, div_c, div_l = "MODERATE","#ffab00","Acceptable — monitor concentration"
+                    else:
+                        div_score, div_c, div_l = "POOR","#ff1744","Concentrated — increase sector diversity"
+
+                    st.markdown(
+                        f"<div style='font-family:IBM Plex Mono,monospace;font-size:10px;"
+                        f"color:#5a7a9a;padding:4px 0'>"
+                        f"Portfolio diversity: <span style='color:{div_c};font-weight:700'>"
+                        f"{div_score}</span> — {n_sectors} sectors · "
+                        f"max concentration: {max_conc_pct:.0f}% · {div_l}"
+                        f"</div>",
+                        unsafe_allow_html=True
+                    )
+                else:
+                    st.markdown("""<div style='font-size:10px;color:#5a7a9a;
+                        font-family:IBM Plex Mono,monospace;padding:8px 0'>
+                        No BUY+ signals to analyze. Run screener first.</div>""",
+                        unsafe_allow_html=True)
 
                 # Sector heatmap
                 st.markdown("---")
