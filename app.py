@@ -715,18 +715,234 @@ def atr(df, p=14):
     return pd.concat([hl,hc,lc],axis=1).max(axis=1).rolling(p).mean()
 
 def wyckoff(df, c, o):
-    n = len(df); p = df["close"]
-    tr  = (p.iloc[-n//3:].mean()-p.iloc[:n//3].mean()) / p.iloc[:n//3].mean()
-    r20 = (p.tail(20).max()-p.tail(20).min()) / p.tail(20).mean()
-    sp  = df["volume"].tail(5).max() > df["volume"].rolling(20).mean().iloc[-1]*1.8
-    ob  = o.iloc[-1] > o.iloc[-min(10,n-1)]
-    cu  = c.iloc[-1] > c.iloc[-min(10,len(c)-1)]
-    if tr<-0.07 and not sp: return "A","Selling Climax","Bandar begins absorbing supply."
-    if r20<0.07  and cu:    return "B","Building Cause","Sideways accumulation. Bandar quietly building."
-    if r20<0.09  and sp and tr<0.03: return "C","Spring","⭐ Retail shaken out — ideal entry zone."
-    if tr>0.03   and ob:    return "D","Sign of Strength","Breakout confirmed."
-    if tr>0.08   and ob:    return "E","Markup","Trending up. Watch for distribution."
-    return "B","Building Cause","Consolidation. Wait for confirmation."
+    """
+    Improved Wyckoff Phase Detection with Volume Climax Analysis.
+
+    Key improvements over v1:
+    1. Volume Climax detection — Phase A/C REQUIRE volume spike, not just price
+    2. Effort vs Result — high volume + small price move = absorption (bearish)
+    3. Trading Range width for Phase B confirmation
+    4. Spring = false breakdown below range + reversal (not just sideways + spike)
+    5. No more arbitrary default to Phase B
+    6. Returns 4-tuple: phase, name, description, confidence (0-100)
+    """
+    n   = len(df)
+    p   = df["close"]
+    vol = df["volume"]
+    hi  = df["high"]
+    lo  = df["low"]
+
+    # ── Core measurements ──
+    # Trend: 3-segment return (early vs late)
+    seg = max(n // 3, 5)
+    tr  = (p.iloc[-seg:].mean() - p.iloc[:seg].mean()) / (p.iloc[:seg].mean() + 1e-9)
+
+    # Volatility: 20-day range relative to price
+    r20 = (p.tail(20).max() - p.tail(20).min()) / (p.tail(20).mean() + 1e-9)
+
+    # Volume: average over multiple windows
+    vol_ma20  = vol.rolling(20).mean().iloc[-1]
+    vol_ma5   = vol.tail(5).mean()
+    vol_max5  = vol.tail(5).max()
+    vol_ratio = vol_max5 / (vol_ma20 + 1) if vol_ma20 > 0 else 1
+
+    # Volume Climax: spike 2.5x+ recent average = climax event
+    vol_climax     = vol_ratio >= 2.5
+    vol_high       = vol_ratio >= 1.5
+    vol_dry        = vol_ma5 < vol_ma20 * 0.7  # volume drying up
+
+    # OBV and CMF direction
+    ob_rising = o.iloc[-1] > o.iloc[-min(10,n-1)]
+    cmf_pos   = float(c.iloc[-1]) > 0.0 if not pd.isna(c.iloc[-1]) else False
+
+    # Price position relative to recent range (is price near lows or highs?)
+    range_hi = p.tail(20).max()
+    range_lo = p.tail(20).min()
+    range_w  = range_hi - range_lo
+    price_pos = (p.iloc[-1] - range_lo) / (range_w + 1e-9)  # 0=at low, 1=at high
+
+    # Effort vs Result: volume spike but price barely moved = absorption
+    last_body = abs(df["close"].iloc[-1] - df["open"].iloc[-1])
+    last_range_h = hi.iloc[-1] - lo.iloc[-1]
+    effort_vs_result = last_body / (last_range_h + 1e-9)  # small = absorption
+
+    # Narrow range days (last 5 days): key for Phase B/C
+    recent_ranges = (hi.tail(5) - lo.tail(5)) / (p.tail(5) + 1e-9)
+    range_contracting = recent_ranges.iloc[-1] < recent_ranges.mean() * 0.85
+
+    # ── Phase Classification (with confidence) ──
+
+    # Phase A — Selling Climax
+    # Requires: downtrend + volume climax + price near lows
+    if (tr < -0.06 and vol_climax and price_pos < 0.35):
+        conf = min(95, int(60 + (abs(tr)*200) + (vol_ratio-2.5)*10))
+        return "A","Selling Climax","Heavy volume selloff — smart money beginning to absorb supply.", conf
+
+    # Phase E — Markup / Late Stage
+    # Requires: strong uptrend + OBV rising + price near highs
+    if (tr > 0.10 and ob_rising and price_pos > 0.75):
+        conf = min(90, int(55 + tr*150 + (price_pos-0.5)*40))
+        return "E","Markup","Strong uptrend in progress. Watch for distribution signals.", conf
+
+    # Phase D — Sign of Strength / Breakout
+    # Requires: rising trend + OBV rising + volume confirmation + above range
+    if (tr > 0.03 and ob_rising and vol_high and price_pos > 0.65):
+        conf = min(88, int(50 + tr*120 + (vol_ratio-1)*15))
+        return "D","Sign of Strength","Breakout with volume — accumulation phase complete.", conf
+
+    # Phase C — Spring (False Breakdown)
+    # MUST have: recent new low + immediate recovery + volume spike on reversal
+    # Key: price went BELOW recent support then came back
+    p_min20   = p.tail(20).min()
+    p_min10   = p.tail(10).min()
+    broke_low = p_min10 <= p_min20 * 1.002  # recent low tested the 20-day low
+    recovered = p.iloc[-1] > p.tail(5).min() * 1.015  # price recovered ≥1.5%
+    if (broke_low and recovered and vol_climax and tr < 0.05 and r20 < 0.15):
+        conf = min(85, int(50 + (1 - price_pos)*20 + vol_ratio*8))
+        return "C","Spring","⭐ False breakdown with recovery — classic Wyckoff Spring. Entry zone.", conf
+
+    # Phase C — Testing (alternative: Spring without volume climax)
+    if (broke_low and recovered and vol_high and tr < 0.08 and r20 < 0.18):
+        conf = min(72, int(40 + vol_ratio*10))
+        return "C","Testing","Possible Spring — testing support. Confirm with CMF > 0 before entry.", conf
+
+    # Phase B — Building Cause (sideways accumulation)
+    # Requires: range-bound price + no strong directional trend + volume contracting
+    if (r20 < 0.10 and abs(tr) < 0.05 and not vol_climax):
+        # Sub-classify B: early vs late
+        if vol_dry and range_contracting:
+            conf = min(80, int(45 + (0.10-r20)*200))
+            return "B","Building Cause","Tight consolidation + volume dry-up — late Phase B, breakout approaching.", conf
+        else:
+            conf = min(68, int(35 + (0.10-r20)*150))
+            return "B","Building Cause","Sideways range — smart money quietly accumulating. Wait for Phase C/D.", conf
+
+    # Phase A — Secondary Test (after initial selling climax)
+    if (tr < -0.03 and not vol_climax and r20 < 0.12):
+        conf = min(65, int(35 + abs(tr)*100))
+        return "A","Secondary Test","Post-climax consolidation — supply being absorbed. Watch for Phase B.", conf
+
+    # Ambiguous / Transition
+    if tr > 0.02:
+        conf = 45
+        return "D","Transitional","Early sign of strength — confirm with volume and CMF before entry.", conf
+
+    conf = 40
+    return "B","Indeterminate","Mixed signals — no clear Wyckoff phase. Reduce position size.", conf
+
+
+def mandatory_score_gates(raw_score: int, vcp_grade: str, weekly_score: int,
+                          liq_score: int, wyckoff_phase: str,
+                          wyckoff_conf: int, cmf_val: float) -> dict:
+    """
+    Mandatory gates that CAP the final score regardless of components.
+
+    Philosophy: A score of 100 should mean ALL conditions are aligned.
+    These gates prevent inflated scores when critical conditions are absent.
+
+    Rules:
+    1. VCP incomplete  → cap at 88 (setup not fully formed)
+    2. Weekly opposes  → cap at 70 (fighting institutional timeframe)
+    3. Illiquid        → cap at 75 (signal can't be executed reliably)
+    4. Wyckoff Phase A → cap at 72 (in selloff, not accumulation zone)
+    5. Wyckoff Phase E → cap at 80 (late stage, distribution risk)
+    6. CMF strongly neg→ cap at 75 (money flowing OUT despite other signals)
+    7. Low Wyckoff conf→ reduce max by confidence delta
+    """
+    gates = []
+    cap   = 100
+
+    # Gate 1: VCP completeness
+    if vcp_grade == "NONE":
+        new_cap = 85
+        if cap > new_cap:
+            cap = new_cap
+            gates.append({"rule": "No VCP pattern", "cap": new_cap,
+                          "tip": "Setup not yet formed — wait for contraction"})
+    elif vcp_grade == "C":
+        new_cap = 88
+        if cap > new_cap:
+            cap = new_cap
+            gates.append({"rule": "VCP Grade C (early)", "cap": new_cap,
+                          "tip": "Contraction forming but not complete"})
+
+    # Gate 2: Weekly timeframe opposition
+    if weekly_score < 40:
+        new_cap = 70
+        if cap > new_cap:
+            cap = new_cap
+            gates.append({"rule": "Weekly opposes daily", "cap": new_cap,
+                          "tip": "Institutional timeframe bearish — wait"})
+    elif weekly_score < 55:
+        new_cap = 82
+        if cap > new_cap:
+            cap = new_cap
+            gates.append({"rule": "Weekly neutral", "cap": new_cap,
+                          "tip": "Weekly not confirming — reduce size"})
+
+    # Gate 3: Liquidity
+    if liq_score < 30:
+        new_cap = 70
+        if cap > new_cap:
+            cap = new_cap
+            gates.append({"rule": "Very illiquid", "cap": new_cap,
+                          "tip": "Cannot build position without market impact"})
+    elif liq_score < 50:
+        new_cap = 78
+        if cap > new_cap:
+            cap = new_cap
+            gates.append({"rule": "Illiquid", "cap": new_cap,
+                          "tip": "Significant execution risk"})
+
+    # Gate 4: Wyckoff phase
+    if wyckoff_phase == "A":
+        new_cap = 72
+        if cap > new_cap:
+            cap = new_cap
+            gates.append({"rule": "Wyckoff Phase A (selloff)", "cap": new_cap,
+                          "tip": "Still in distribution/selloff — not entry zone"})
+    elif wyckoff_phase == "E":
+        new_cap = 80
+        if cap > new_cap:
+            cap = new_cap
+            gates.append({"rule": "Wyckoff Phase E (late markup)", "cap": new_cap,
+                          "tip": "Late stage — risk of distribution starting"})
+
+    # Gate 5: Wyckoff confidence
+    if wyckoff_conf < 50:
+        conf_penalty = int((50 - wyckoff_conf) * 0.3)
+        new_cap = min(cap, 100 - conf_penalty)
+        if cap > new_cap:
+            cap = new_cap
+            gates.append({"rule": f"Low Wyckoff confidence ({wyckoff_conf}%)", "cap": new_cap,
+                          "tip": "Phase unclear — signals ambiguous"})
+
+    # Gate 6: CMF strongly negative
+    if cmf_val < -0.15:
+        new_cap = 72
+        if cap > new_cap:
+            cap = new_cap
+            gates.append({"rule": f"CMF strongly negative ({cmf_val:.3f})", "cap": new_cap,
+                          "tip": "Money flowing out — distribution likely"})
+    elif cmf_val < -0.05:
+        new_cap = 82
+        if cap > new_cap:
+            cap = new_cap
+            gates.append({"rule": f"CMF negative ({cmf_val:.3f})", "cap": new_cap,
+                          "tip": "Mild distribution detected"})
+
+    gated_score = min(raw_score, cap)
+    was_capped  = gated_score < raw_score
+
+    return {
+        "cap"         : cap,
+        "gated_score" : gated_score,
+        "was_capped"  : was_capped,
+        "gates_hit"   : gates,
+        "n_gates"     : len(gates),
+        "primary_gate": gates[0]["rule"] if gates else None,
+    }
+
 
 def tech_score(df, c, o, m):
     sc = 50.0
@@ -2737,7 +2953,7 @@ def _compute_signal_on_slice(df_slice: pd.DataFrame) -> str:
         o_ = obv(df_slice)
         m_ = mfi(df_slice)
         ts = tech_score(df_slice, c_, o_, m_)
-        wp, _, _ = wyckoff(df_slice, c_, o_)
+        wp, _, _, _wc = wyckoff(df_slice, c_, o_)
         cmf_v = float(c_.iloc[-1]) if not pd.isna(c_.iloc[-1]) else 0
         mfi_v = float(m_.iloc[-1]) if not pd.isna(m_.iloc[-1]) else 50
         obv_up = o_.iloc[-1] > o_.iloc[-min(10, len(o_)-1)]
@@ -3589,7 +3805,7 @@ with tab_a:
             st.stop()
         with st.spinner("Computing CMF · OBV · MFI · RSI · Wyckoff · ATR · VCP ..."):
             c_ = cmf(df); o_ = obv(df); m_ = mfi(df)
-            wp,wn,wd = wyckoff(df,c_,o_); ts = tech_score(df,c_,o_,m_)
+            wp,wn,wd,wconf = wyckoff(df,c_,o_); ts = tech_score(df,c_,o_,m_)
             ez = entry_zone(df)
             # VCP needs min 120 days — load 6M if current period is too short
             if len(df) < 120:
@@ -3626,21 +3842,33 @@ with tab_a:
             ps_cap_liq = st.session_state.get("ps_capital", 100_000_000)
             liq        = calc_liquidity_score(df, ps_cap_liq * 0.20, own)
 
-        # ── COMPOSITE SCORE v2 — Signal Validation Layer
+        # ── COMPOSITE SCORE v3 — Raw + Adjustments + Mandatory Gates
         # Layer 1: Raw signal  = Technical 55% + Broker 35% + VCP 10%
-        # Layer 2: Validation  = Regime adj + Weekly confluence + Liquidity
-        # Total adjustment capped at ±25 to preserve signal integrity
+        # Layer 2: Adjustments = Regime + Weekly + Liquidity (±25 cap)
+        # Layer 3: Mandatory Gates = hard caps based on critical conditions
         vcp_score  = vcp.get("score", 0)
+        vcp_grade_v= vcp.get("grade", "NONE")
         raw_final  = int(np.clip(round(ts*.55 + br["score"]*.35 + vcp_score*.10), 0, 100))
 
         # Layer 2 adjustments
-        regime_adj   = np.clip(reg_adj["score_adj"], -15, 15)
+        regime_adj   = int(np.clip(reg_adj["score_adj"], -15, 15))
         weekly_adj   = int(round((weekly_c["confluence_mult"] - 1.0) * raw_final * 0.3))
         weekly_adj   = int(np.clip(weekly_adj, -12, 10))
         liquidity_adj= int(np.clip(liq.get("score_adj", 0), -20, 5))
+        total_adj    = int(np.clip(regime_adj + weekly_adj + liquidity_adj, -25, 15))
+        adj_score    = int(np.clip(raw_final + total_adj, 0, 100))
 
-        total_adj  = int(np.clip(regime_adj + weekly_adj + liquidity_adj, -25, 15))
-        final      = int(np.clip(raw_final + total_adj, 0, 100))
+        # Layer 3: Mandatory gates
+        gates = mandatory_score_gates(
+            raw_score      = adj_score,
+            vcp_grade      = vcp_grade_v,
+            weekly_score   = weekly_c.get("score", 50),
+            liq_score      = liq.get("score", 50),
+            wyckoff_phase  = wp,
+            wyckoff_conf   = wconf,
+            cmf_val        = float(c_.iloc[-1]),
+        )
+        final = gates["gated_score"]
 
         last  = df.iloc[-1]; prev = df.iloc[-2]
         chg   = (last["close"]-prev["close"]) / prev["close"] * 100
@@ -3656,11 +3884,12 @@ with tab_a:
 
         st.session_state["res"] = dict(
             df=df, df_weekly=df_weekly,
-            c=c_,o=o_,m=m_,wp=wp,wn=wn,wd=wd,ts=ts,
+            c=c_,o=o_,m=m_,wp=wp,wn=wn,wd=wd,wconf=wconf,ts=ts,
             br=br,bdf=bdf,src=src,
-            raw_final=raw_final, final=final, ent=ent,
+            raw_final=raw_final, adj_score=adj_score, final=final, ent=ent,
             regime_adj=regime_adj, weekly_adj=weekly_adj,
             liquidity_adj=liquidity_adj, total_adj=total_adj,
+            gates=gates,
             lp=float(last["close"]),chg=chg,vr=vr,
             cmf_v=float(c_.iloc[-1]),mfi_v=float(m_.iloc[-1]),
             obv_up=ob_up, ticker=ticker_input,
@@ -3751,10 +3980,13 @@ with tab_a:
         sector   = R.get("sector", "Other")
 
         raw_sc       = R.get("raw_final", R["final"])
+        adj_score_v  = R.get("adj_score", R.get("raw_final", R["final"]))
         regime_adj_v = R.get("regime_adj", 0)
         weekly_adj_v = R.get("weekly_adj", 0)
         liq_adj_v    = R.get("liquidity_adj", 0)
         total_adj_v  = R.get("total_adj", 0)
+        gates        = R.get("gates", {})
+        wconf_v      = R.get("wconf", 50)
 
         # Pre-compute ALL colors before HTML (avoid nested expressions in f-strings)
         def _ac(v):
@@ -3879,7 +4111,32 @@ with tab_a:
                 f"Daily signal contradicts weekly trend. Do not enter."
             )
 
-
+        # ── MANDATORY GATES BANNER (show when gates were triggered)
+        if gates.get("was_capped"):
+            gate_items = gates.get("gates_hit", [])
+            gate_html  = "".join([
+                f"<div style='display:flex;justify-content:space-between;"
+                f"padding:5px 0;border-bottom:1px solid #141e2e'>"
+                f"<span style='font-family:IBM Plex Mono,monospace;font-size:10px;"
+                f"color:#ffab00'>⛔ {g['rule']}</span>"
+                f"<span style='font-family:IBM Plex Mono,monospace;font-size:10px;"
+                f"color:#5a7a9a'>cap → {g['cap']} &nbsp;·&nbsp; {g['tip']}</span>"
+                f"</div>"
+                for g in gate_items
+            ])
+            raw_before = adj_score_v
+            final_after = gates["gated_score"]
+            st.markdown(
+                f"<div style='background:#110d00;border:1px solid #3d2e00;"
+                f"border-left:4px solid #ffab00;padding:10px 14px;"
+                f"border-radius:4px;margin-bottom:10px'>"
+                f"<div style='font-family:IBM Plex Mono,monospace;font-size:9px;"
+                f"color:#ffab00;letter-spacing:2px;margin-bottom:6px'>"
+                f"MANDATORY GATES TRIGGERED — Score capped: {raw_before} → {final_after}</div>"
+                f"{gate_html}"
+                f"</div>",
+                unsafe_allow_html=True
+            )
 
         # ── KEY METRICS — compute live statuses
         obv_status = "Rising ▲" if R["obv_up"] else "Falling ▼"
@@ -4289,13 +4546,22 @@ with tab_a:
                 else: cl="ph"
                 ph += f'<div class="{cl}">Ph {code}<div style="font-size:7px;margin-top:2px">{lbl}</div></div>'
             ph += "</div>"
-            st.markdown(f"""
-            <div style='background:#0b1018;border:1px solid #141e2e;padding:10px;border-radius:3px'>
-              <div style='font-family:"IBM Plex Mono",monospace;font-size:.9rem;
-                          color:#00b0ff;font-weight:700'>Ph {R["wp"]} — {R["wn"]}</div>
-              <div style='font-size:11px;color:#cdd8e6;margin-top:3px;line-height:1.5'>{R["wd"]}</div>
-              {ph}
-            </div>""", unsafe_allow_html=True)
+            wconf_disp = R.get("wconf", 50)
+            wconf_c    = "#00e676" if wconf_disp>=70 else "#ffab00" if wconf_disp>=50 else "#ff8888"
+            st.markdown(
+                f"<div style='background:#0b1018;border:1px solid #141e2e;"
+                f"padding:10px;border-radius:3px'>"
+                f"<div style='display:flex;justify-content:space-between;align-items:center'>"
+                f"<div style='font-family:IBM Plex Mono,monospace;font-size:.9rem;"
+                f"color:#00b0ff;font-weight:700'>Ph {R['wp']} — {R['wn']}</div>"
+                f"<div style='font-family:IBM Plex Mono,monospace;font-size:9px;"
+                f"color:{wconf_c}'>Confidence: {wconf_disp}%</div>"
+                f"</div>"
+                f"<div style='font-size:11px;color:#cdd8e6;margin-top:3px;line-height:1.5'>{R['wd']}</div>"
+                f"{ph}"
+                f"</div>",
+                unsafe_allow_html=True
+            )
 
             # ── VCP mini-panel in right column
             vcp = R.get("vcp",{})
@@ -5726,30 +5992,43 @@ with tab_s:
                     df_vcp_ = df_tk
 
                 c_=cmf(df_tk); o_=obv(df_tk); m_=mfi(df_tk)
-                wp_,wn_,_ = wyckoff(df_tk,c_,o_)
+                wp_,wn_,_,wconf_ = wyckoff(df_tk,c_,o_)
                 ts_ = tech_score(df_tk,c_,o_,m_)
                 vcp_ = detect_vcp(df_vcp_)      # VCP always uses 6M+ data
                 bdf_,src_ = get_broker_today(tk, sb_token)
                 if bdf_ is None: bdf_ = demo_broker(tk,ts_)
                 br_  = analyze_broker(bdf_)
-                vcp_s_ = vcp_.get("score",0)
+                vcp_s_     = vcp_.get("score",0)
+                vcp_grade_ = vcp_.get("grade","NONE")
+                own_       = OWNER_DB.get(tk.upper().replace(".JK",""))  # MUST be before liq_
 
                 # Layer 1: raw signal
                 fs_raw = int(np.clip(round(ts_*.55+br_["score"]*.35+vcp_s_*.10),0,100))
 
-                # Layer 2: validation (weekly + liquidity — regime already global)
+                # Layer 2: validation (weekly + liquidity)
                 wc_  = calc_weekly_confluence(tk, "2y")
-                liq_ = calc_liquidity_score(df_tk, 50_000_000, own_)  # Rp50M default
+                liq_ = calc_liquidity_score(df_tk, 50_000_000, own_)
                 w_adj_ = int(np.clip(int(round((wc_["confluence_mult"]-1.0)*fs_raw*0.3)),-12,10)) if wc_.get("available") else 0
                 l_adj_ = int(np.clip(liq_.get("score_adj",0),-20,5))
-                fs     = int(np.clip(fs_raw + w_adj_ + l_adj_, 0, 100))
+                fs_adj = int(np.clip(fs_raw + w_adj_ + l_adj_, 0, 100))
+
+                # Layer 3: mandatory gates
+                gates_ = mandatory_score_gates(
+                    raw_score     = fs_adj,
+                    vcp_grade     = vcp_grade_,
+                    weekly_score  = wc_.get("score",50),
+                    liq_score     = liq_.get("score",50),
+                    wyckoff_phase = wp_,
+                    wyckoff_conf  = wconf_,
+                    cmf_val       = float(c_.iloc[-1]),
+                )
+                fs = gates_["gated_score"]
 
                 last_= df_tk.iloc[-1]; prev_=df_tk.iloc[-2]
                 chg_ = (last_["close"]-prev_["close"])/prev_["close"]*100
                 av_  = df_tk["volume"].tail(20).mean()
                 vr_  = last_["volume"]/(av_ if av_>0 else 1)
                 obv_ = o_.iloc[-1]>o_.iloc[-min(10,len(o_)-1)]
-                own_ = OWNER_DB.get(tk.upper().replace(".JK",""))
                 ent_ = entry_signal(fs,ts_,br_["score"],wp_,float(c_.iloc[-1]),
                                     obv_,float(m_.iloc[-1]),vr_,br_["crossing"],
                                     br_["goreng"],br_["sm_buyers"],br_["sm_sellers"],
