@@ -5446,9 +5446,32 @@ with tab_a:
           <div class='conds'>{conds}</div>
         </div>""", unsafe_allow_html=True)
 
-        # ── GORENG OPPORTUNITY PANEL
+        # ── GORENG OPPORTUNITY PANEL — always shown
+        st.markdown("---")
+        st.markdown('<div class="sec">GORENG / PUMP DETECTOR</div>', unsafe_allow_html=True)
         goreng_d = R.get("goreng_d", {})
-        if goreng_d.get("available") and goreng_d.get("phase", -1) >= 0:
+
+        if not goreng_d.get("available") or goreng_d.get("phase", -1) < 0:
+            # Not detected — show informational state
+            st.markdown(
+                "<div style='background:#090d12;border:1px solid #141e2e;"
+                "border-left:3px solid #2a3d52;border-radius:3px;padding:12px 16px'>"
+                "<div style='font-family:IBM Plex Mono,monospace;font-size:10px;"
+                "color:#2a3d52;font-weight:700'>⚫ NO GORENG SIGNAL DETECTED</div>"
+                "<div style='font-size:10px;color:#5a7a9a;margin-top:6px'>"
+                "None of the known pump brokers (MK/EP/II/DD) are active in today's "
+                "transaction data for this stock. "
+                "This is the normal/healthy state for fundamentally-driven stocks.<br><br>"
+                "<b style='color:#cdd8e6'>Goreng detector monitors:</b> "
+                "Phase 0 🔵 Pre-pump quiet accumulation · "
+                "Phase 1 🟢 Markup start · "
+                "Phase 2 🟡 Active pump · "
+                "Phase 3 🔴 Distribution (exit) · "
+                "Phase 4 💀 Dump"
+                "</div></div>",
+                unsafe_allow_html=True
+            )
+        else:
             gph   = goreng_d["phase"]
             glbl  = goreng_d["phase_label"]
             gc    = goreng_d["phase_color"]
@@ -7205,6 +7228,18 @@ with tab_bh:
           &nbsp;·&nbsp; Shares OS: <b style='color:#cdd8e6'>{so_display}</b>
         </div>""", unsafe_allow_html=True)
 
+    # ── Auto-invalidate cache when ticker or accu_days changes ──
+    if "bh_res" in st.session_state:
+        bh_cached = st.session_state["bh_res"]
+        stale_ticker = bh_cached.get("ticker","") != ticker_input
+        stale_days   = bh_cached.get("days", 0) != accu_days
+        if stale_ticker or stale_days:
+            st.session_state.pop("bh_res", None)
+            reason = []
+            if stale_ticker: reason.append(f"ticker changed → {ticker_input}")
+            if stale_days:   reason.append(f"trading days changed → {accu_days}d")
+            st.info(f"🔄 Cache cleared ({' · '.join(reason)}). Click **CALCULATE** to refresh.")
+
     if run_bh:
         st.session_state.pop("bh_res", None)
         with st.spinner(f"Fetching {accu_days}-day broker data for {ticker_input} ..."):
@@ -7236,6 +7271,7 @@ with tab_bh:
         st.session_state["bh_res"] = dict(
             accu_df=accu_df, sh_df=sh_df,
             src=accu_src, days=days_got,
+            accu_days_requested=accu_days,
             shares_out=shares_out,
             ticker=ticker_input,
             fetched=datetime.now().strftime("%H:%M:%S WIB"),
