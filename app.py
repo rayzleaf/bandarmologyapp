@@ -7859,19 +7859,19 @@ with tab_s:
                 av_  = df_tk["volume"].tail(20).mean()
                 vr_  = last_["volume"]/(av_ if av_>0 else 1)
                 obv_ = o_.iloc[-1]>o_.iloc[-min(10,len(o_)-1)]
-                ent_ = entry_signal(fs,ts_,br_["score"],wp_,float(c_.iloc[-1]),
-                                    obv_,float(m_.iloc[-1]),vr_,br_["crossing"],
-                                    br_["goreng"],br_["sm_buyers"],br_["sm_sellers"],
-                                    chg_,own_,vcp=vcp_,goreng_d=gd_)
                 vcp_grade_ = vcp_.get("grade","NONE")
                 wc_lbl_    = wc_.get("label","—")[:8] if wc_.get("available") else "N/A"
                 liq_lbl_   = liq_.get("label","—")[:8]
-                # Goreng phase (lightweight — no accu data in screener for speed)
+                # Goreng phase — MUST be before entry_signal (uses gd_)
                 gd_        = detect_goreng_phase(df_tk, br_)
                 goreng_lbl_= ""
                 if gd_.get("available") and gd_.get("phase", -1) >= 0:
                     ph_icons = {0:"🔵P0",1:"🟢P1",2:"🟡P2",3:"🔴P3",4:"💀P4"}
                     goreng_lbl_ = ph_icons.get(gd_["phase"], "")
+                ent_ = entry_signal(fs,ts_,br_["score"],wp_,float(c_.iloc[-1]),
+                                    obv_,float(m_.iloc[-1]),vr_,br_["crossing"],
+                                    br_["goreng"],br_["sm_buyers"],br_["sm_sellers"],
+                                    chg_,own_,vcp=vcp_,goreng_d=gd_)
                 rows.append({
                     "Ticker":tk, "Price":f"Rp {int(last_['close']):,}",
                     "Change":f"{'+'if chg_>=0 else ''}{chg_:.2f}%",
