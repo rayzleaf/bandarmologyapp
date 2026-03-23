@@ -1581,6 +1581,8 @@ def calc_liquidity_score(df: pd.DataFrame, position_value_idr: float = 100_000_0
 
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def detect_market_regime(ihsg_period: str = "1y") -> dict:
     """
     Detect current IDX market regime using IHSG technical analysis.
 
