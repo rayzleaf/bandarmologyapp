@@ -16,6 +16,15 @@ Features:
 """
 
 import streamlit as st
+
+def _c(cond, c_true="#00e676", c_false="#ff1744", c_neutral=None):
+    """Safe color picker — avoids nested quotes in f-strings."""
+    if c_neutral is not None:
+        if cond is True or cond == True: return c_true
+        if cond is False or cond == False: return c_false
+        return c_neutral
+    return c_true if cond else c_false
+
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -3537,7 +3546,7 @@ st.markdown(f"""
                  margin-left:14px;letter-spacing:3px'>IDX SMART MONEY · v6</span>
   </div>
   <div style='text-align:right;font-family:"IBM Plex Mono",monospace;font-size:9px;color:#2a3d52'>
-    <span style='color:{"#00e676" if ms_now["open"] else "#ffab00"}'>{ms_now["label"]}</span>
+    <span style='color:{_c(ms_now["open"])}'>{ms_now["label"]}</span>
     · {ms_now["wib"].strftime("%H:%M:%S WIB  %d %b %Y")}
   </div>
 </div>""", unsafe_allow_html=True)
@@ -3568,7 +3577,7 @@ with tab_a:
           &nbsp;·&nbsp; Period: {period}
           &nbsp;·&nbsp; Broker: {'<span style="color:#00e676">Stockbit</span>'
             if sb_token and len(sb_token)>20 else '<span style="color:#00b0ff">IDX API</span>'}
-          &nbsp;·&nbsp; Market: <span style='color:{"#00e676" if ms_now["open"] else "#ffab00"}'>{ms_now["label"]}</span>
+          &nbsp;·&nbsp; Market: <span style='color:{_c(ms_now["open"])}'>{ms_now["label"]}</span>
         </div>""", unsafe_allow_html=True)
 
     if run:
@@ -3702,7 +3711,7 @@ with tab_a:
               <span style='font-family:"IBM Plex Mono",monospace;font-size:1.35rem;color:#00b0ff'>
                 Rp {R["lp"]:,.0f}</span>
               <span style='font-family:"IBM Plex Mono",monospace;
-                           color:{"#00e676" if R["chg"]>=0 else "#ff1744"}'>
+                           color:{_c(R["chg"]>=0)}'>
                 {"▲" if R["chg"]>=0 else "▼"} {abs(R["chg"]):.2f}%</span>
             </div>
             <div style='display:flex;align-items:center;gap:8px'>
@@ -3734,7 +3743,7 @@ with tab_a:
           <div class='conds'>{conds}</div>
         </div>""", unsafe_allow_html=True)
 
-        # ── SIGNAL VALIDATION LAYER BANNER (Regime + Weekly + Liquidity)
+        # ── SIGNAL VALIDATION LAYER BANNER
         regime   = R.get("regime", {})
         reg_adj  = R.get("reg_adj", {})
         weekly_c = R.get("weekly_c", {})
@@ -3747,111 +3756,127 @@ with tab_a:
         liq_adj_v    = R.get("liquidity_adj", 0)
         total_adj_v  = R.get("total_adj", 0)
 
-        wc_label = weekly_c.get("label","—") if weekly_c.get("available") else "Unavail."
-        wc_color = weekly_c.get("color","#5a7a9a")
-        liq_label= liq.get("label","—")
-        liq_color= liq.get("color","#5a7a9a")
+        # Pre-compute ALL colors before HTML (avoid nested expressions in f-strings)
+        def _ac(v):
+            return "#00e676" if v > 0 else "#ff1744" if v < 0 else "#5a7a9a"
 
-        reg_name  = regime.get("regime","—") if regime.get("available") else "—"
-        reg_color = regime.get("color","#5a7a9a")
-        sect_info = (R.get("sector_data",{}).get("sectors",{}) or {}).get(sector,{})
-        sect_status = sect_info.get("status","—")
-        sect_color  = sect_info.get("color","#5a7a9a")
+        c_regime  = _ac(regime_adj_v)
+        c_weekly  = _ac(weekly_adj_v)
+        c_liq     = _ac(liq_adj_v)
+        c_total   = _ac(total_adj_v)
+        c_final   = "#00e676" if R["final"] >= 65 else "#ff1744" if R["final"] <= 35 else "#ffab00"
+        c_raw     = "#cdd8e6"
 
-        def _adj_color(v): return "#00e676" if v>0 else "#ff1744" if v<0 else "#5a7a9a"
+        wc_label  = weekly_c.get("label", "—") if weekly_c.get("available") else "Unavail."
+        wc_color  = weekly_c.get("color", "#5a7a9a")
+        wc_score  = weekly_c.get("score", "—")
+        wc_action = (weekly_c.get("action", "—")[:80]
+                     if weekly_c.get("available") else "Weekly data unavailable")
 
-        st.markdown(f"""
-        <div style='background:#0b1018;border:1px solid #141e2e;border-radius:4px;
-                    overflow:hidden;margin-bottom:12px'>
+        liq_label = liq.get("label", "—")
+        liq_color = liq.get("color", "#5a7a9a")
+        liq_adv   = liq.get("adv_str", "—")
 
-          <!-- Header -->
-          <div style='background:#0d1420;padding:8px 16px;border-bottom:1px solid #141e2e;
-                      font-family:"IBM Plex Mono",monospace;font-size:9px;color:#5a7a9a;
-                      letter-spacing:2px'>
-            SIGNAL VALIDATION LAYER — Score decomposition: Raw → Regime → Weekly → Liquidity → Final
-          </div>
+        reg_color = regime.get("color", "#5a7a9a")
+        reg_name  = regime.get("regime", "—") if regime.get("available") else "—"
 
-          <!-- Score flow -->
-          <div style='display:grid;grid-template-columns:repeat(7,1fr);
-                      padding:12px 16px;gap:4px;align-items:center'>
+        sect_info   = (R.get("sector_data",{}).get("sectors",{}) or {}).get(sector, {})
+        sect_status = sect_info.get("status", "—")
+        sect_color  = sect_info.get("color", "#5a7a9a")
 
-            <div style='text-align:center'>
-              <div style='font-size:9px;color:#5a7a9a;font-family:"IBM Plex Mono",monospace'>RAW SCORE</div>
-              <div style='font-size:1.6rem;font-weight:700;color:#cdd8e6;
-                          font-family:"IBM Plex Mono",monospace'>{raw_sc}</div>
-              <div style='font-size:9px;color:#5a7a9a'>Tech+Broker+VCP</div>
-            </div>
+        # Render using native Streamlit (no complex nested HTML f-strings)
+        st.markdown(
+            f"<div style='background:#0b1018;border:1px solid #141e2e;border-radius:4px;"
+            f"overflow:hidden;margin-bottom:12px'>"
+            f"<div style='background:#0d1420;padding:8px 16px;border-bottom:1px solid #141e2e;"
+            f"font-family:IBM Plex Mono,monospace;font-size:9px;color:#5a7a9a;letter-spacing:2px'>"
+            f"SIGNAL VALIDATION LAYER — Score decomposition: Raw → Regime → Weekly → Liquidity → Final"
+            f"</div></div>",
+            unsafe_allow_html=True
+        )
 
-            <div style='text-align:center;font-size:1.2rem;color:#2a3d52'>→</div>
+        # Score flow using st.columns (reliable, no HTML issues)
+        sv1, sv2, sv3, sv4, sv5, sv6, sv7 = st.columns([2,0.5,2,2,2,0.5,2])
 
-            <div style='text-align:center;background:#090d12;border:1px solid #141e2e;
-                        border-top:2px solid {reg_color};border-radius:3px;padding:8px 4px'>
-              <div style='font-size:9px;color:#5a7a9a;font-family:"IBM Plex Mono",monospace'>
-                REGIME</div>
-              <div style='font-size:1.1rem;font-weight:700;color:{_adj_color(regime_adj_v)};
-                          font-family:"IBM Plex Mono",monospace'>{regime_adj_v:+d}</div>
-              <div style='font-size:9px;color:{reg_color}'>{reg_name}</div>
-              <div style='font-size:8px;color:{sect_color}'>{sector}: {sect_status}</div>
-            </div>
+        with sv1:
+            st.markdown(
+                f"<div style='text-align:center;padding:10px 4px;background:#090d12;"
+                f"border:1px solid #141e2e;border-radius:3px'>"
+                f"<div style='font-family:IBM Plex Mono,monospace;font-size:9px;color:#5a7a9a'>RAW SCORE</div>"
+                f"<div style='font-family:IBM Plex Mono,monospace;font-size:1.8rem;font-weight:700;color:{c_raw}'>{raw_sc}</div>"
+                f"<div style='font-size:9px;color:#5a7a9a'>Tech+Broker+VCP</div>"
+                f"</div>",
+                unsafe_allow_html=True
+            )
+        with sv2:
+            st.markdown("<div style='text-align:center;padding-top:20px;font-size:1.2rem;color:#2a3d52'>→</div>",
+                        unsafe_allow_html=True)
+        with sv3:
+            st.markdown(
+                f"<div style='text-align:center;padding:10px 4px;background:#090d12;"
+                f"border:1px solid #141e2e;border-top:2px solid {reg_color};border-radius:3px'>"
+                f"<div style='font-family:IBM Plex Mono,monospace;font-size:9px;color:#5a7a9a'>REGIME</div>"
+                f"<div style='font-family:IBM Plex Mono,monospace;font-size:1.2rem;font-weight:700;color:{c_regime}'>{regime_adj_v:+d}</div>"
+                f"<div style='font-size:9px;color:{reg_color}'>{reg_name}</div>"
+                f"<div style='font-size:8px;color:{sect_color}'>{sector}: {sect_status}</div>"
+                f"</div>",
+                unsafe_allow_html=True
+            )
+        with sv4:
+            st.markdown(
+                f"<div style='text-align:center;padding:10px 4px;background:#090d12;"
+                f"border:1px solid #141e2e;border-top:2px solid {wc_color};border-radius:3px'>"
+                f"<div style='font-family:IBM Plex Mono,monospace;font-size:9px;color:#5a7a9a'>WEEKLY</div>"
+                f"<div style='font-family:IBM Plex Mono,monospace;font-size:1.2rem;font-weight:700;color:{c_weekly}'>{weekly_adj_v:+d}</div>"
+                f"<div style='font-size:9px;color:{wc_color}'>{wc_label}</div>"
+                f"<div style='font-size:8px;color:#5a7a9a'>Score: {wc_score}/100</div>"
+                f"</div>",
+                unsafe_allow_html=True
+            )
+        with sv5:
+            st.markdown(
+                f"<div style='text-align:center;padding:10px 4px;background:#090d12;"
+                f"border:1px solid #141e2e;border-top:2px solid {liq_color};border-radius:3px'>"
+                f"<div style='font-family:IBM Plex Mono,monospace;font-size:9px;color:#5a7a9a'>LIQUIDITY</div>"
+                f"<div style='font-family:IBM Plex Mono,monospace;font-size:1.2rem;font-weight:700;color:{c_liq}'>{liq_adj_v:+d}</div>"
+                f"<div style='font-size:9px;color:{liq_color}'>{liq_label}</div>"
+                f"<div style='font-size:8px;color:#5a7a9a'>{liq_adv}</div>"
+                f"</div>",
+                unsafe_allow_html=True
+            )
+        with sv6:
+            st.markdown("<div style='text-align:center;padding-top:20px;font-size:1.2rem;color:#2a3d52'>→</div>",
+                        unsafe_allow_html=True)
+        with sv7:
+            st.markdown(
+                f"<div style='text-align:center;padding:10px 4px;background:#090d12;"
+                f"border:1px solid {c_final};border-top:2px solid {c_final};border-radius:3px'>"
+                f"<div style='font-family:IBM Plex Mono,monospace;font-size:9px;color:#5a7a9a'>FINAL SCORE</div>"
+                f"<div style='font-family:IBM Plex Mono,monospace;font-size:1.8rem;font-weight:700;color:{c_final}'>{R['final']}</div>"
+                f"<div style='font-size:9px;color:{c_total}'>adj: {total_adj_v:+d}</div>"
+                f"</div>",
+                unsafe_allow_html=True
+            )
 
-            <div style='text-align:center;background:#090d12;border:1px solid #141e2e;
-                        border-top:2px solid {wc_color};border-radius:3px;padding:8px 4px'>
-              <div style='font-size:9px;color:#5a7a9a;font-family:"IBM Plex Mono",monospace'>
-                WEEKLY</div>
-              <div style='font-size:1.1rem;font-weight:700;color:{_adj_color(weekly_adj_v)};
-                          font-family:"IBM Plex Mono",monospace'>{weekly_adj_v:+d}</div>
-              <div style='font-size:9px;color:{wc_color}'>{wc_label}</div>
-              <div style='font-size:8px;color:#5a7a9a'>
-                Score: {weekly_c.get("score","—")}/100</div>
-            </div>
+        # Action note
+        st.markdown(
+            f"<div style='padding:5px 4px;font-size:10px;color:#5a7a9a;"
+            f"font-family:IBM Plex Mono,monospace;margin-bottom:8px'>"
+            f"Weekly: <span style='color:{wc_color}'>{wc_action}</span>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
 
-            <div style='text-align:center;background:#090d12;border:1px solid #141e2e;
-                        border-top:2px solid {liq_color};border-radius:3px;padding:8px 4px'>
-              <div style='font-size:9px;color:#5a7a9a;font-family:"IBM Plex Mono",monospace'>
-                LIQUIDITY</div>
-              <div style='font-size:1.1rem;font-weight:700;color:{_adj_color(liq_adj_v)};
-                          font-family:"IBM Plex Mono",monospace'>{liq_adj_v:+d}</div>
-              <div style='font-size:9px;color:{liq_color}'>{liq_label}</div>
-              <div style='font-size:8px;color:#5a7a9a'>
-                {liq.get("adv_str","—")}</div>
-            </div>
-
-            <div style='text-align:center;font-size:1.2rem;color:#2a3d52'>→</div>
-
-            <div style='text-align:center'>
-              <div style='font-size:9px;color:#5a7a9a;font-family:"IBM Plex Mono",monospace'>
-                FINAL SCORE</div>
-              <div style='font-size:1.8rem;font-weight:700;
-                          color:{"#00e676" if R["final"]>=65 else "#ff1744" if R["final"]<=35 else "#ffab00"};
-                          font-family:"IBM Plex Mono",monospace'>{R["final"]}</div>
-              <div style='font-size:9px;color:{_adj_color(total_adj_v)}'>
-                Total adj: {total_adj_v:+d}</div>
-            </div>
-
-          </div>
-
-          <!-- Action bar -->
-          <div style='padding:6px 16px 10px;font-size:10px;color:#5a7a9a;
-                      font-family:"IBM Plex Mono",monospace;border-top:1px solid #141e2e'>
-            Weekly: <span style='color:{wc_color}'>{weekly_c.get("action","—")[:80] if weekly_c.get("available") else "Weekly data unavailable"}</span>
-          </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        # Liquidity warning if illiquid
+        # Warnings
         if liq.get("available") and liq.get("impact_days", 0) > 3:
             st.warning(
-                f"⚠️ **Liquidity Warning** — Market impact: **{liq['impact_days']:.1f} days** to build position "
-                f"at standard 20% ADV participation. ADV: {liq['adv_str']}. "
-                f"{'FCA stock — float only {:.0f}%. '.format(liq['float_pct']) if liq.get('is_fca') else ''}"
-                f"Reduce position size or wait for higher-volume session."
+                f"⚠️ **Liquidity Warning** — Market impact: **{liq['impact_days']:.1f} days** "
+                f"at 20% ADV. ADV: {liq.get('adv_str','—')}. Reduce position size."
             )
         if weekly_c.get("available") and weekly_c.get("label") == "OPPOSE":
             st.error(
-                f"🚫 **Weekly Confluence OPPOSE** — Daily signal contradicts weekly trend. "
-                f"Weekly score: {weekly_c['score']}/100. "
-                f"Do not enter regardless of daily signal strength. "
-                f"Wait for weekly to confirm."
+                f"🚫 **Weekly Confluence OPPOSE** (score {weekly_c.get('score',0)}/100) — "
+                f"Daily signal contradicts weekly trend. Do not enter."
             )
 
 
@@ -3885,6 +3910,7 @@ with tab_a:
         vcp_r = R.get("vcp",{}); vcp_grade = vcp_r.get("grade","NONE")
         vcp_gc2 = vcp_r.get("grade_color","#5a7a9a")
         vcp_s   = vcp_r.get("score",0)
+        _adj_sc_c = "#00e676" if adj_sc>0 else ("#ff1744" if adj_sc<0 else "#5a7a9a")
         st.markdown(f"""
         <div style='display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:10px'>
 
@@ -3903,7 +3929,7 @@ with tab_a:
             <div style='margin-top:6px;font-size:9px;color:#5a7a9a;font-family:"IBM Plex Mono",monospace;
                         border-top:1px solid #141e2e;padding-top:5px'>
               Raw {raw_sc}
-              <span style='color:{"#00e676" if adj_sc>0 else "#ff1744" if adj_sc<0 else "#5a7a9a"}'>
+              <span style='color:{_adj_sc_c}'>
                 {adj_sc:+d} regime</span>
               → <b style='color:{comp_color}'>{R["final"]}</b>
             </div>
@@ -4238,6 +4264,7 @@ with tab_a:
                 vcp_gc     = vcp.get("grade_color","#5a7a9a")
                 vcp_pivot  = vcp.get("pivot_price",0)
                 vcp_tight  = vcp.get("current_tight",0)
+                _vcp_tight_c = "#00e676" if vcp_tight<=6 else ("#ffab00" if vcp_tight<=15 else "#5a7a9a")
                 vcp_n_ct   = vcp.get("n_contractions",0)
                 vcp_dry    = vcp.get("vol_is_dry",False)
                 vcp_trend  = vcp.get("in_uptrend",False)
@@ -4286,11 +4313,11 @@ with tab_a:
                   <div style='margin-top:8px;font-size:10px;color:#cdd8e6;
                               font-family:"IBM Plex Mono",monospace;line-height:1.8'>
                     Contractions: <b style='color:{vcp_gc}'>{vcp_n_ct}</b><br>
-                    Tightness: <b style='color:{"#00e676" if vcp_tight<=6 else "#ffab00" if vcp_tight<=15 else "#5a7a9a"}'>{vcp_tight:.1f}%</b>
+                    Tightness: <b style='color:{_vcp_tight_c}'>{vcp_tight:.1f}%</b>
                     {"✅ TIGHT" if vcp_tight<=6 else "🟡 OK" if vcp_tight<=15 else ""}<br>
-                    Vol Dry-Up: <b style='color:{"#00e676" if vcp_dry else "#5a7a9a"}'>
+                    Vol Dry-Up: <b style='color:{_c(vcp_dry, "#00e676", "#5a7a9a")}'>
                     {"✅ YES" if vcp_dry else "Not yet"}</b><br>
-                    Uptrend: <b style='color:{"#00e676" if vcp_trend else "#ff8888"}'>
+                    Uptrend: <b style='color:{_c(vcp_trend, "#00e676", "#ff8888")}'>
                     {"✅ YES" if vcp_trend else "❌ Below MAs"}</b><br>
                     Pivot: <b style='color:#ffab00'>Rp {vcp_pivot:,.0f}</b>
                     {"  <span style='color:#00e676'>← NEAR!</span>" if near_piv else ""}
@@ -4340,7 +4367,7 @@ with tab_a:
                           <span style='color:#5a7a9a'>Contraction {ct["idx"]}</span>
                           <span style='color:{d_col}'>{depth:.1f}% depth
                             {"▼ Shrinking ✓" if shrinking and contractions.index(ct)>0 else ""}</span>
-                          <span style='color:{"#00e676" if dry else "#5a7a9a"}'>
+                          <span style='color:{_c(dry, "#00e676", "#5a7a9a")}'>
                             {"📉 Vol ↓" if dry else "Vol ~"}</span>
                         </div>""", unsafe_allow_html=True)
 
@@ -4375,7 +4402,7 @@ with tab_a:
                         Pivot (buy above): <b style='color:#ffab00'>Rp {pivot_p:,.0f}</b><br>
                         Current: <b>Rp {last_p:,.0f}</b>
                         ({((last_p/pivot_p-1)*100):+.1f}% from pivot)<br>
-                        Vol dry-up: <b style='color:{"#00e676" if vcp_dry_v<0.75 else "#5a7a9a"}'>
+                        Vol dry-up: <b style='color:{_c(vcp_dry_v<0.75, "#00e676", "#5a7a9a")}'>
                         {vcp_dry_v:.2f}x avg {"✅" if vcp_dry_v<0.75 else ""}</b><br><br>
                         <b style='color:#eaf0f8'>Entry:</b> Buy breakout above pivot
                         with volume <b>≥ 1.5x average</b><br>
@@ -4627,10 +4654,11 @@ with tab_a:
                     st.markdown('<div class="sec" style="margin-top:8px">EARNINGS SURPRISE HISTORY</div>',
                                 unsafe_allow_html=True)
                     beats = sum(1 for e in earn_hist if e.get("beat"))
+                    _beats_c = "#00e676" if beats>=3 else ("#ffab00" if beats>=2 else "#ff8888")
                     st.markdown(f"""
                     <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;
                                 color:#5a7a9a;margin-bottom:5px'>
-                      Beat streak: <span style='color:{"#00e676" if beats>=3 else "#ffab00" if beats>=2 else "#ff8888"}'>
+                      Beat streak: <span style='color:{_beats_c}'>
                       {beats}/{len(earn_hist)} quarters</span>
                     </div>""", unsafe_allow_html=True)
                     for e in earn_hist[:4]:
@@ -4738,6 +4766,7 @@ with tab_a:
             note  = rs_data.get("note","")
             rs_score = rs_data.get("score",50)
             rs_bonus = ent.get("rs_bonus",0)
+            _rs_bonus_c = "#00e676" if rs_bonus>0 else ("#ff1744" if rs_bonus<0 else "#5a7a9a")
 
             # RS banner
             st.markdown(f"""
@@ -4756,22 +4785,22 @@ with tab_a:
                   <div style='text-align:center'>
                     <div style='font-size:9px;color:#5a7a9a;letter-spacing:1px'>RS 20D</div>
                     <div style='font-size:1.3rem;font-weight:700;
-                                color:{"#00e676" if rs20v>=100 else "#ff1744"}'>{rs20v:.1f}</div>
-                    <div style='font-size:9px;color:{"#00e676" if t20=="rising" else "#ff1744"}'>
+                                color:{_c(rs20v>=100)}'>{rs20v:.1f}</div>
+                    <div style='font-size:9px;color:{_c(t20=="rising")}'>
                       {"▲ Rising" if t20=="rising" else "▼ Falling"}</div>
                   </div>
                   <div style='text-align:center'>
                     <div style='font-size:9px;color:#5a7a9a;letter-spacing:1px'>RS 60D</div>
                     <div style='font-size:1.3rem;font-weight:700;
-                                color:{"#00e676" if rs60v>=100 else "#ff1744"}'>{rs60v:.1f}</div>
-                    <div style='font-size:9px;color:{"#00e676" if t60=="rising" else "#ff1744"}'>
+                                color:{_c(rs60v>=100)}'>{rs60v:.1f}</div>
+                    <div style='font-size:9px;color:{_c(t60=="rising")}'>
                       {"▲ Rising" if t60=="rising" else "▼ Falling"}</div>
                   </div>
                   <div style='text-align:center'>
                     <div style='font-size:9px;color:#5a7a9a;letter-spacing:1px'>RS SCORE</div>
                     <div style='font-size:1.3rem;font-weight:700;color:{rc}'>{rs_score}/100</div>
                     <div style='font-size:9px;color:#5a7a9a'>
-                      Score adj: <span style='color:{"#00e676" if rs_bonus>0 else "#ff1744" if rs_bonus<0 else "#5a7a9a"}'>
+                      Score adj: <span style='color:{_rs_bonus_c}'>
                       {rs_bonus:+d}</span></div>
                   </div>
                 </div>
@@ -4790,7 +4819,7 @@ with tab_a:
                   <div style='font-size:11px;color:#cdd8e6;line-height:1.7'>
                     RS 20d <b>{">100" if rs20v>100 else "<100"}</b>
                     = saham {"outperform" if rs20v>=100 else "underperform"} IHSG<br>
-                    Trend: <b style='color:{"#00e676" if t20=="rising" else "#ff1744"}'>
+                    Trend: <b style='color:{_c(t20=="rising")}'>
                     {"Menguat ▲" if t20=="rising" else "Melemah ▼"}</b><br>
                     RS 20d {">" if rs20v>rs60v else "<"} RS 60d
                     = momentum {"accelerating" if rs20v>rs60v else "decelerating"}
@@ -4935,6 +4964,7 @@ with tab_a:
                 vol_cov    = liq["vol_cov"]
                 is_fca     = liq.get("is_fca", False)
                 liq_adj    = liq["score_adj"]
+                liq_adj_c_ = "#00e676" if liq_adj>0 else ("#ff1744" if liq_adj<0 else "#5a7a9a")
                 adj_label  = liq["adj_label"]
 
                 trend_color = "#00e676" if adv_trend=="GROWING" else "#ff8888" if adv_trend=="SHRINKING" else "#5a7a9a"
@@ -4955,7 +4985,7 @@ with tab_a:
                     <div style='text-align:right;font-family:"IBM Plex Mono",monospace;
                                 font-size:10px'>
                       <div style='color:#5a7a9a'>Score adj</div>
-                      <div style='color:{"#00e676" if liq_adj>0 else "#ff1744" if liq_adj<0 else "#5a7a9a"};
+                      <div style='color:{liq_adj_c_};
                                   font-size:1.1rem;font-weight:700'>{liq_adj:+d}</div>
                     </div>
                   </div>
@@ -5213,7 +5243,7 @@ with tab_bh:
                   <div class='bh-code' style='color:{cc}'>{row["broker"]}</div>
                   <div>
                     <div class='bh-name'>{row.get("flag","🇮🇩")} {row.get("name","")[:20]}</div>
-                    <div style='font-size:9px;color:{"#5a7a9a" if is_retail else "#2a3d52"};
+                    <div style='font-size:9px;color:{_c(is_retail, "#5a7a9a", "#2a3d52")};
                                 font-family:"IBM Plex Mono",monospace'>{note or CAT_LABEL.get(cat,cat)}</div>
                   </div>
                   <div class='bh-lots' style='color:#ff1744'>{row["cum_net"]:,} lots</div>
@@ -5492,15 +5522,15 @@ with tab_bt:
                   <div>
                     <div style='font-size:9px;color:#5a7a9a'>RS 20D</div>
                     <div style='font-size:1.4rem;font-weight:700;
-                                color:{"#00e676" if rs20v>=100 else "#ff1744"}'>{rs20v:.1f}</div>
-                    <div style='font-size:9px;color:{"#00e676" if t20=="rising" else "#ff1744"}'>
+                                color:{_c(rs20v>=100)}'>{rs20v:.1f}</div>
+                    <div style='font-size:9px;color:{_c(t20=="rising")}'>
                       {"▲ Rising" if t20=="rising" else "▼ Falling"}</div>
                   </div>
                   <div>
                     <div style='font-size:9px;color:#5a7a9a'>RS 60D</div>
                     <div style='font-size:1.4rem;font-weight:700;
-                                color:{"#00e676" if rs60v>=100 else "#ff1744"}'>{rs60v:.1f}</div>
-                    <div style='font-size:9px;color:{"#00e676" if t60=="rising" else "#ff1744"}'>
+                                color:{_c(rs60v>=100)}'>{rs60v:.1f}</div>
+                    <div style='font-size:9px;color:{_c(t60=="rising")}'>
                       {"▲ Rising" if t60=="rising" else "▼ Falling"}</div>
                   </div>
                   <div>
