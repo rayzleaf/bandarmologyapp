@@ -1811,11 +1811,17 @@ def detect_market_regime(ihsg_period: str = "1y") -> dict:
     """
     Detect current IDX market regime using IHSG technical analysis.
 
-    Returns:
-        regime: BULL / SECTOR_ROTATION / RISK_OFF / CRASH
-        cause:  List of suspected drivers
-        conviction_multiplier: How to adjust signal scores
-        description: Human-readable explanation
+    Regime classification (priority order, first match wins):
+      CRASH          → dd_pct < -20% OR ret60 < -18%
+      RISK_OFF       → dd_pct < -10% OR (ret60 < -6% AND below MA50)
+      SECTOR_ROTATION→ IHSG sideways (|ret20| < 4%) AND not in downtrend
+      BULL           → above MA50 + MA200 + MA50 rising
+      MIXED          → everything else (catch-all)
+
+    IDX-specific calibration:
+    - IHSG is more volatile than S&P500 (avg 20-day vol ~18% annualized)
+    - Normal corrections of 5-8% are frequent and should NOT trigger RISK_OFF
+    - RISK_OFF should only trigger on confirmed intermediate downtrend
     """
     ihsg = load_ihsg(ihsg_period)
     if ihsg is None or len(ihsg) < 50:
@@ -1825,81 +1831,123 @@ def detect_market_regime(ihsg_period: str = "1y") -> dict:
     p  = ihsg["close"]
     n  = len(p)
 
+    # ── Moving averages
     ma20  = p.rolling(20).mean()
     ma50  = p.rolling(50).mean()
     ma200 = p.rolling(200).mean() if n >= 200 else p.rolling(min(n,120)).mean()
 
-    lp    = float(p.iloc[-1])
-    ma20v = float(ma20.iloc[-1])
-    ma50v = float(ma50.iloc[-1])
-    ma200v= float(ma200.iloc[-1])
+    lp     = float(p.iloc[-1])
+    ma20v  = float(ma20.iloc[-1])
+    ma50v  = float(ma50.iloc[-1])
+    ma200v = float(ma200.iloc[-1])
 
-    # 20-day and 60-day IHSG return
-    ret20  = (lp - float(p.iloc[-min(20,n-1)])) / float(p.iloc[-min(20,n-1)])  * 100
-    ret60  = (lp - float(p.iloc[-min(60,n-1)])) / float(p.iloc[-min(60,n-1)]) * 100
-    ret5   = (lp - float(p.iloc[-min(5, n-1)])) / float(p.iloc[-min(5, n-1)]) * 100
+    # ── Returns over multiple windows
+    ret5   = (lp / float(p.iloc[-min(5 ,n-1)]) - 1) * 100
+    ret20  = (lp / float(p.iloc[-min(20,n-1)]) - 1) * 100
+    ret60  = (lp / float(p.iloc[-min(60,n-1)]) - 1) * 100
+    ret120 = (lp / float(p.iloc[-min(120,n-1)]) - 1) * 100
 
-    # Peak drawdown (from 52-week high)
+    # ── Peak drawdown (from rolling 52-week high — more stable than point-in-time)
     peak   = float(p.tail(252).max()) if n >= 252 else float(p.max())
     dd_pct = (lp - peak) / peak * 100
 
-    # Volatility (20-day realized)
-    daily_ret  = p.pct_change().dropna()
-    vol_20     = float(daily_ret.tail(20).std() * np.sqrt(252) * 100)
+    # ── Realized volatility (20-day annualized)
+    daily_ret = p.pct_change().dropna()
+    vol_20    = float(daily_ret.tail(20).std() * (252**0.5) * 100)
 
-    # ── Regime Classification
+    # ── Trend quality
+    above_ma20  = lp > ma20v
     above_ma50  = lp > ma50v
     above_ma200 = lp > ma200v
     ma50_rising = float(ma50.iloc[-1]) > float(ma50.iloc[-min(20,n-1)])
+    ma20_rising = float(ma20.iloc[-1]) > float(ma20.iloc[-min(10,n-1)])
+    # Consecutive down days (bearish momentum indicator)
+    recent_rets = p.pct_change().tail(10)
+    down_days   = int((recent_rets < 0).sum())
 
     causes = []
 
-    # Check commodity signals (proxy: check if we can detect from IHSG vs global)
-    # In practice: IHSG flat/down while commodity stocks (ADRO/BYAN) are up = commodity rotation
+    # ── REGIME CLASSIFICATION (priority order) ──
 
-    if dd_pct < -25 or ret60 < -20:
-        regime = "CRASH"
-        multiplier = 0.5
-        description = (f"IHSG is in systemic decline ({dd_pct:.1f}% from peak, "
-                       f"{ret60:.1f}% over 60d). Most signals are unreliable. "
-                       "Only defensive/commodity plays with specific catalysts.")
+    # 1. CRASH — systemic / severe decline
+    # IDX calibration: -20% peak drawdown or -18% over 60d = genuine bear
+    if dd_pct < -20 or ret60 < -18:
+        regime      = "CRASH"
+        multiplier  = 0.50
+        regime_color= "#ff1744"
+        description = (
+            f"IHSG in severe decline ({dd_pct:.1f}% from 52w peak, {ret60:.1f}% over 60d). "
+            f"Systematic risk — most signals unreliable. "
+            f"Only defensive / commodity plays with specific catalysts."
+        )
         causes = ["systematic_selloff"]
-        regime_color = "#ff1744"
 
-    elif dd_pct < -12 or ret60 < -8:
-        regime = "RISK_OFF"
-        multiplier = 0.75
-        description = (f"IHSG under pressure ({dd_pct:.1f}% from peak). Risk-off environment. "
-                       "Raise entry thresholds — only Grade A VCP + ACC Cross qualify. "
-                       "Sector rotation to defensives/commodities likely.")
-        if not above_ma50: causes.append("below_ma50")
-        if vol_20 > 20:    causes.append("elevated_volatility")
-        regime_color = "#ff8844"
+    # 2. RISK_OFF — confirmed intermediate downtrend
+    # IDX calibration: tighten from -12% to -10% dd, require ALSO below MA50
+    # This prevents normal 8-10% corrections from wrongly triggering RISK_OFF
+    elif (dd_pct < -10 and not above_ma50) or ret60 < -12:
+        regime      = "RISK_OFF"
+        multiplier  = 0.80   # was 0.75 — slightly less penalizing
+        regime_color= "#ff8844"
+        description = (
+            f"IHSG in intermediate downtrend ({dd_pct:.1f}% from peak, {ret60:.1f}% / 60d, "
+            f"{'below' if not above_ma50 else 'near'} MA50). "
+            f"Risk-off environment — raise entry thresholds. "
+            f"Commodity / defensive sectors may still outperform."
+        )
+        if not above_ma50:  causes.append("below_ma50")
+        if not above_ma200: causes.append("below_ma200")
+        if vol_20 > 22:     causes.append("elevated_volatility")
 
-    elif abs(ret20) < 3 and ret60 < 5 and above_ma200:
-        regime = "SECTOR_ROTATION"
-        multiplier = 1.0
-        description = (f"IHSG sideways ({ret20:.1f}% / 20d, {ret60:.1f}% / 60d). "
-                       "Capital is rotating between sectors — not leaving the market. "
-                       "Best environment for stock picking. Focus on sectors with rising RS.")
+    # 3. NORMAL CORRECTION — pullback within bull trend
+    # New regime: common in IDX, not bearish but not ideal entry timing
+    elif dd_pct < -5 and above_ma200 and ret60 < -3:
+        regime      = "CORRECTION"
+        multiplier  = 0.90
+        regime_color= "#ffab00"
+        description = (
+            f"IHSG in normal correction ({dd_pct:.1f}% from peak, {ret60:.1f}% / 60d). "
+            f"Still above MA200 — bull intact. "
+            f"Wait for stabilization or buy only highest-conviction setups."
+        )
+        causes = ["normal_pullback"]
+
+    # 4. SECTOR_ROTATION — sideways IHSG, money rotating between sectors
+    # Condition: low 20d movement + not in a clear downtrend + above MA200
+    elif abs(ret20) < 4 and ret60 > -5 and above_ma200:
+        regime      = "SECTOR_ROTATION"
+        multiplier  = 1.00
+        regime_color= "#ffab00"
+        description = (
+            f"IHSG sideways ({ret20:.1f}% / 20d, {ret60:.1f}% / 60d). "
+            f"Capital rotating between sectors — not leaving the market. "
+            f"Best environment for stock picking. Focus on sectors with rising RS."
+        )
         causes = ["sector_rotation"]
-        regime_color = "#ffab00"
 
+    # 5. BULL — confirmed uptrend
     elif above_ma50 and above_ma200 and ma50_rising:
-        regime = "BULL"
-        multiplier = 1.15
-        description = (f"IHSG in uptrend (above MA50 & MA200, MA50 rising). "
-                       f"Recent: {ret20:.1f}% / 20d, {ret60:.1f}% / 60d. "
-                       "Broad market tailwind. All sectors eligible, focus on highest RS.")
+        regime      = "BULL"
+        multiplier  = 1.15
+        regime_color= "#00e676"
+        description = (
+            f"IHSG in confirmed uptrend (above MA50 & MA200, MA50 rising). "
+            f"20d: {ret20:.1f}% · 60d: {ret60:.1f}% · 120d: {ret120:.1f}%. "
+            f"Broad market tailwind — all sectors eligible."
+        )
         causes = ["broad_uptrend"]
-        regime_color = "#00e676"
 
+    # 6. MIXED — transition / unclear
     else:
-        regime = "MIXED"
-        multiplier = 0.90
-        description = (f"IHSG in mixed/uncertain state. {ret20:.1f}% / 20d. "
-                       "Exercise caution, increase confirmation requirements.")
-        regime_color = "#5a7a9a"
+        regime      = "MIXED"
+        multiplier  = 0.90
+        regime_color= "#5a7a9a"
+        description = (
+            f"IHSG in mixed/transitional state. "
+            f"20d: {ret20:.1f}% · 60d: {ret60:.1f}% · DD: {dd_pct:.1f}%. "
+            f"Exercise caution — wait for clearer directional signal."
+        )
+        causes = ["uncertain"]
 
     return {
         "available"   : True,
@@ -1909,16 +1957,18 @@ def detect_market_regime(ihsg_period: str = "1y") -> dict:
         "description" : description,
         "causes"      : causes,
         "ihsg_last"   : round(lp, 2),
+        "ma50v"       : round(ma50v, 0),
+        "ma200v"      : round(ma200v, 0),
+        "ret5"        : round(ret5, 2),
         "ret20"       : round(ret20, 2),
         "ret60"       : round(ret60, 2),
-        "ret5"        : round(ret5, 2),
+        "ret120"      : round(ret120, 2),
         "dd_pct"      : round(dd_pct, 2),
         "vol_20"      : round(vol_20, 1),
         "above_ma50"  : above_ma50,
         "above_ma200" : above_ma200,
         "ma50_rising" : ma50_rising,
-        "ma50v"       : round(ma50v, 0),
-        "ma200v"      : round(ma200v, 0),
+        "down_days_10": down_days,
     }
 
 
@@ -1998,77 +2048,106 @@ def get_stock_sector(ticker: str) -> str:
 def regime_signal_adjustment(regime: dict, sector: str,
                                sector_data: dict) -> dict:
     """
-    Adjust signal conviction based on:
-    1. Overall market regime (multiplier)
-    2. Whether this stock's sector is receiving inflows
-    3. Regime-sector alignment (e.g., Mining in commodity_up = no penalty)
+    Adjust signal conviction based on regime + sector alignment.
 
-    Returns adjustment dict with score_adj, note, allowed.
+    Key fix: Mining/Energy in RISK_OFF with sector inflow = POSITIVE adjustment
+    (commodity rotation is a key IDX pattern — don't penalize it)
     """
     if not regime.get("available"):
-        return {"score_adj": 0, "note": "", "allowed": True, "regime_ok": True}
+        return {"score_adj": 0, "notes": [], "allowed": True, "regime_ok": True}
 
-    base_mult  = regime["multiplier"]
-    reg_name   = regime["regime"]
-    causes     = regime.get("causes", [])
-    score_adj  = 0
-    notes      = []
-    allowed    = True
+    reg_name  = regime["regime"]
+    causes    = regime.get("causes", [])
+    score_adj = 0
+    notes     = []
 
-    # Sector inflow/outflow check
+    # Sector inflow/outflow from sector rotation data
     sectors_data = sector_data.get("sectors", {}) if sector_data.get("available") else {}
     sect_info    = sectors_data.get(sector, {})
     sect_inflow  = sect_info.get("inflow",  False)
     sect_outflow = sect_info.get("outflow", False)
+    sect_rs20    = sect_info.get("rs20", 0)
 
-    # Core regime adjustment
+    # ── Per-regime adjustment logic ──
+
     if reg_name == "CRASH":
-        score_adj = -20
-        notes.append("Market in systematic decline — reduce all position sizes")
-        # Exception: commodity sectors might still work
-        if sector in ("Mining","Energy") and "systematic_selloff" in causes:
-            score_adj = -10
-            notes.append("Commodity sector — partial exception to crash filter")
+        if sector in ("Mining","Energy") and sect_inflow:
+            # Commodity rotation in crash (e.g. war → energy spike)
+            score_adj = -5
+            notes.append(f"{sector} receiving inflows despite crash — commodity catalyst active")
+        elif sector in ("Healthcare","Consumer","Telecoms"):
+            score_adj = -8
+            notes.append(f"{sector} = defensive sector — partial protection in crash")
+        else:
+            score_adj = -20
+            notes.append("Systematic market decline — reduce all position sizes significantly")
 
     elif reg_name == "RISK_OFF":
-        score_adj = -10
-        notes.append("Risk-off environment — raise entry bar")
-        # Defensives and commodities get less penalty
-        if sector in ("Healthcare","Consumer","Telecoms"):
-            score_adj = -3
-            notes.append(f"{sector} is a defensive sector — less impacted by risk-off")
-        elif sector in ("Mining","Energy") and sect_inflow:
+        if sector in ("Mining","Energy") and sect_inflow:
+            # KEY FIX: Mining + inflow in risk-off = commodity rotation = POSITIVE
+            score_adj = +5
+            notes.append(f"{sector} receiving inflows in risk-off — commodity rotation active. Favorable.")
+        elif sector in ("Healthcare","Consumer","Telecoms"):
+            score_adj = -2
+            notes.append(f"{sector} = defensive — minimal impact from risk-off")
+        elif sect_inflow:
             score_adj = 0
-            notes.append(f"{sector} receiving inflows — commodity rotation may be active")
+            notes.append(f"{sector} receiving inflows — partially offsetting risk-off headwind")
+        else:
+            score_adj = -8
+            notes.append("Risk-off environment — raise entry thresholds")
+
+    elif reg_name == "CORRECTION":
+        # Normal pullback — good opportunity if sector is still receiving inflows
+        if sect_inflow:
+            score_adj = +3
+            notes.append(f"Correction + {sector} inflow — pullback buying opportunity")
+        elif sect_outflow:
+            score_adj = -5
+            notes.append(f"{sector} outflow during correction — avoid")
+        else:
+            score_adj = -2
+            notes.append("Normal market correction — wait for stabilization signal")
 
     elif reg_name == "SECTOR_ROTATION":
-        # Bonus for sectors receiving inflows, penalty for outflows
         if sect_inflow:
             score_adj = +8
-            notes.append(f"{sector} sector receiving inflows — rotation tailwind")
+            notes.append(f"{sector} receiving inflows — sector rotation tailwind")
         elif sect_outflow:
             score_adj = -8
-            notes.append(f"{sector} sector losing capital — rotation headwind")
+            notes.append(f"{sector} losing capital — rotation headwind")
+        elif sect_rs20 > 2:
+            score_adj = +3
+            notes.append(f"{sector} outperforming IHSG — mild tailwind")
         else:
-            notes.append("Sector rotation active — check sector RS")
+            notes.append("Sector rotation active — check sector RS tab")
 
     elif reg_name == "BULL":
         if sect_inflow:
             score_adj = +5
             notes.append(f"Bull market + {sector} inflow = double tailwind")
+        elif sect_outflow:
+            score_adj = -3
+            notes.append(f"{sector} underperforming in bull — rotation away from sector")
         else:
-            score_adj = 0
+            score_adj = +2
+            notes.append("Bull market tailwind — broad participation")
 
-    # Final: apply multiplier to adjustment magnitude
-    score_adj = int(round(score_adj * base_mult))
+    # MIXED: small penalty for uncertainty
+    else:
+        score_adj = -3
+        notes.append("Mixed/transitional market — maintain caution")
+
+    # Clamp to reasonable range
+    score_adj = int(np.clip(score_adj, -20, 10))
 
     return {
-        "score_adj"  : score_adj,
-        "notes"      : notes,
-        "allowed"    : allowed,
-        "regime_ok"  : reg_name in ("BULL","SECTOR_ROTATION","MIXED"),
-        "sect_inflow": sect_inflow,
-        "sect_outflow":sect_outflow,
+        "score_adj"   : score_adj,
+        "notes"       : notes,
+        "allowed"     : True,
+        "regime_ok"   : reg_name in ("BULL","SECTOR_ROTATION","CORRECTION","MIXED"),
+        "sect_inflow" : sect_inflow,
+        "sect_outflow": sect_outflow,
     }
 
 
@@ -4090,11 +4169,28 @@ with tab_a:
                 unsafe_allow_html=True
             )
 
-        # Action note
+        # Action note + IHSG metrics for transparency
+        ihsg_dd   = regime.get("dd_pct", 0)
+        ihsg_r20  = regime.get("ret20", 0)
+        ihsg_r60  = regime.get("ret60", 0)
+        ihsg_ma50 = regime.get("above_ma50", True)
+        ihsg_last = regime.get("ihsg_last", 0)
+        dd_c      = "#00e676" if ihsg_dd > -5 else "#ffab00" if ihsg_dd > -10 else "#ff1744"
+        r20_c     = "#00e676" if ihsg_r20 > 0 else "#ff8888"
+        r60_c     = "#00e676" if ihsg_r60 > 0 else "#ff8888"
         st.markdown(
-            f"<div style='padding:5px 4px;font-size:10px;color:#5a7a9a;"
-            f"font-family:IBM Plex Mono,monospace;margin-bottom:8px'>"
+            f"<div style='padding:7px 4px 4px;font-family:IBM Plex Mono,monospace;"
+            f"font-size:10px;color:#5a7a9a;margin-bottom:4px'>"
             f"Weekly: <span style='color:{wc_color}'>{wc_action}</span>"
+            f"</div>"
+            f"<div style='padding:4px 4px 8px;font-family:IBM Plex Mono,monospace;"
+            f"font-size:9px;color:#5a7a9a;border-bottom:1px solid #141e2e;margin-bottom:8px'>"
+            f"IHSG {ihsg_last:,.0f} &nbsp;·&nbsp; "
+            f"DD from peak: <span style='color:{dd_c}'>{ihsg_dd:+.1f}%</span> &nbsp;·&nbsp; "
+            f"20d: <span style='color:{r20_c}'>{ihsg_r20:+.1f}%</span> &nbsp;·&nbsp; "
+            f"60d: <span style='color:{r60_c}'>{ihsg_r60:+.1f}%</span> &nbsp;·&nbsp; "
+            f"vs MA50: <span style='color:{'#00e676' if ihsg_ma50 else '#ff8888'}'>"
+            f"{'ABOVE' if ihsg_ma50 else 'BELOW'}</span>"
             f"</div>",
             unsafe_allow_html=True
         )
