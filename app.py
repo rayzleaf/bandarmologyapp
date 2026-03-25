@@ -962,39 +962,49 @@ def calc_broker_shareholding(accu_df: pd.DataFrame, shares_outstanding: int,
 @st.cache_data(ttl=900, show_spinner=False)   # 15 min
 def load_price(ticker, period):
     """
-    Load OHLCV from Yahoo Finance with fallback period upgrade.
-    
-    Fixes:
-    - yfinance "1mo" for IDX sometimes returns 0-5 rows during early session
-    - MultiIndex columns from newer yfinance versions
-    - Auto-clears cache on empty result (retry mechanism via different period)
+    Load OHLCV from Yahoo Finance.
+    NOTE: Fallback to longer periods is handled OUTSIDE this function
+    so each period result is independently cached. This prevents a
+    cached None for "1mo" from blocking the "3mo" fallback attempt.
     """
     ticker_clean = ticker.upper().replace(".JK","") + ".JK"
-    # Period upgrade chain: if requested period returns too few bars,
-    # automatically try longer periods
-    period_chain = {
-        "1mo" : ["1mo", "3mo"],
-        "3mo" : ["3mo", "6mo"],
-        "6mo" : ["6mo", "1y"],
-        "1y"  : ["1y",  "2y"],
-        "2y"  : ["2y"],
+    try:
+        df = yf.download(ticker_clean, period=period, interval="1d",
+                         progress=False, auto_adjust=True)
+        if df is None or df.empty: return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df = df.rename(columns={"Open":"open","High":"high","Low":"low",
+                                 "Close":"close","Volume":"volume"})
+        df = df[["open","high","low","close","volume"]].dropna()
+        return df if len(df) >= 3 else None   # return even small df, caller decides
+    except:
+        return None
+
+
+def load_price_safe(ticker: str, requested_period: str):
+    """
+    Load price with automatic period upgrade fallback.
+    Fallback is handled HERE (outside cached function) so each period
+    is cached independently — stale None for "1mo" won't block "3mo".
+
+    Returns: (df, actual_period_used)
+    """
+    # Period upgrade chain — each tried independently
+    chains = {
+        "1mo": ["1mo", "3mo", "6mo"],
+        "3mo": ["3mo", "6mo"],
+        "6mo": ["6mo", "1y"],
+        "1y" : ["1y",  "2y"],
+        "2y" : ["2y"],
     }
-    periods_to_try = period_chain.get(period, [period, "3mo"])
-    
+    periods_to_try = chains.get(requested_period, [requested_period, "3mo", "6mo"])
+
     for p in periods_to_try:
-        try:
-            df = yf.download(ticker_clean, period=p, interval="1d",
-                             progress=False, auto_adjust=True)
-            if df is None or df.empty: continue
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            df = df.rename(columns={"Open":"open","High":"high","Low":"low",
-                                     "Close":"close","Volume":"volume"})
-            df = df[["open","high","low","close","volume"]].dropna()
-            if len(df) >= 15:  # minimum viable — enough for basic analysis
-                return df
-        except: continue
-    return None
+        df = load_price(ticker, p)
+        if df is not None and len(df) >= 15:
+            return df, p
+    return None, requested_period
 
 def cmf(df, p=14):
     """
@@ -5413,29 +5423,33 @@ with tab_a:
     if run:
         st.session_state.pop("res", None)
         with st.spinner(f"Loading price data for {ticker_input}.JK ..."):
-            df = load_price(ticker_input, period)
+            df, actual_period = load_price_safe(ticker_input, period)
+
         if df is None or len(df) < 15:
             st.error(
                 f"Could not load **{ticker_input}.JK** — "
-                f"no price data available. Check ticker spelling. "
-                f"Try: BBCA, BREN, AMMN, ADRO, BMRI"
+                f"no price data returned by Yahoo Finance. "
+                f"Try switching to **3M or 6M** period, or wait a few minutes and retry. "
+                f"Also try: BBCA, BREN, AMMN, ADRO, BMRI"
             )
             st.stop()
 
-        # Warn if 1M returns fewer than expected bars (yfinance limitation)
-        # and note that some indicators will have limited accuracy
         actual_bars = len(df)
-        if period == "1mo" and actual_bars < 22:
+
+        # Notify user if period was auto-upgraded
+        if actual_period != period:
             st.warning(
-                f"⚠️ **Limited data**: {actual_bars} bars loaded for 1M period "
-                f"(expected ~22). Some indicators (CMF, OBV trend) need more data "
-                f"for accuracy. **Switch to 3M or 6M for best results.**"
+                f"⚠️ **Period auto-upgraded**: {period} had insufficient data "
+                f"({actual_bars} bars) — showing **{actual_period}** data instead. "
+                f"This is normal during early market session for IDX stocks."
             )
-        elif period == "1mo" and actual_bars >= 22:
-            st.info(
-                "💡 **1M period**: Good for intraday/short-term view. "
-                "For VCP, Wyckoff, and RS analysis, use **3M or 6M**."
+        elif period == "1mo" and actual_bars < 22:
+            st.warning(
+                f"⚠️ **Limited data**: only {actual_bars} bars for 1M. "
+                f"Indicators less accurate. Switch to **3M or 6M** for best results."
             )
+        elif period == "1mo":
+            st.info("💡 **1M period**: Use **3M or 6M** for VCP, Wyckoff, and RS analysis.")
 
         # Adapt CMF period to available data (p=14 standard, min 7 for short periods)
         cmf_period = min(14, max(7, actual_bars // 2))
@@ -8072,7 +8086,7 @@ with tab_s:
                 prog.progress((i+1)/len(wl), text=f"Analyzing {tk} ... ({i+1}/{len(wl)})")
                 try:
                     # Load price for selected period
-                    df_tk = load_price(tk, period)
+                    df_tk, _ = load_price_safe(tk, period)
                     if df_tk is None or len(df_tk) < 15:
                         skipped.append(f"{tk}(no data)")
                         continue
@@ -8681,7 +8695,7 @@ with tab_g:
         unsafe_allow_html=True)
         for grade, gc, desc in [
             ("A","#00e676","3–4 contractions + vol dry-up + above all MAs + tight ≤6% = IDEAL. Enter at pivot breakout."),
-            ("B","#88ffbb","2–3 contractions + some volume contraction. Good setup, nearly ready."),
+            ("B","#88ffbb","2–3 contractions + some volum	e contraction. Good setup, nearly ready."),
             ("C","#ffab00","Early contraction forming. Promising but incomplete. Monitor daily."),
             ("C-","#ff8888","Contraction present but stock is BELOW key MAs. High risk — avoid or short only."),
             ("NONE","#5a7a9a","No VCP pattern detected. Use other signals only."),
