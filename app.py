@@ -962,10 +962,13 @@ def calc_broker_shareholding(accu_df: pd.DataFrame, shares_outstanding: int,
 @st.cache_data(ttl=900, show_spinner=False)   # 15 min
 def load_price(ticker, period):
     """
-    Load OHLCV from Yahoo Finance.
-    NOTE: Fallback to longer periods is handled OUTSIDE this function
-    so each period result is independently cached. This prevents a
-    cached None for "1mo" from blocking the "3mo" fallback attempt.
+    Load OHLCV — Yahoo Finance only (no auth required).
+    Volume returned in SHARES not lots — caller must divide by 100 for lot display.
+    NOTE: Yahoo Finance IDX has known issues:
+      - Split adjustment sometimes wrong (BREN, CUAN, rights issues)
+      - Volume unit inconsistent across tickers
+      - 1mo period unreliable during early market session
+    Use load_price_safe() which handles fallback periods.
     """
     ticker_clean = ticker.upper().replace(".JK","") + ".JK"
     try:
@@ -977,20 +980,57 @@ def load_price(ticker, period):
         df = df.rename(columns={"Open":"open","High":"high","Low":"low",
                                  "Close":"close","Volume":"volume"})
         df = df[["open","high","low","close","volume"]].dropna()
-        return df if len(df) >= 3 else None   # return even small df, caller decides
+        # Volume sanity check: Yahoo sometimes returns shares, sometimes lots
+        # IDX lot = 100 shares. If median volume > 1B, likely in shares → convert
+        # (Most IDX stocks trade 1M-500M lots/day = 100M-50B shares)
+        median_vol = df["volume"].median()
+        if median_vol > 5e8:   # > 500M → almost certainly in shares
+            df["volume"] = df["volume"] / 100
+        return df if len(df) >= 3 else None
     except:
         return None
 
 
-def load_price_safe(ticker: str, requested_period: str):
+@st.cache_data(ttl=900, show_spinner=False)
+def load_price_stockbit(ticker: str, token: str, days: int = 365):
     """
-    Load price with automatic period upgrade fallback.
-    Fallback is handled HERE (outside cached function) so each period
-    is cached independently — stale None for "1mo" won't block "3mo".
+    Load OHLCV from Stockbit — more accurate for IDX.
+    Advantages over Yahoo Finance:
+      - Better split/rights issue adjustment (sourced from IDX directly)
+      - Volume in lots (consistent)
+      - More reliable during IDX market hours
+    Falls back silently if endpoint unavailable.
+    """
+    if not token or len(token) < 20: return None
+    try:
+        sb = StockbitAPI(token)
+        df = sb.ohlcv(ticker, period_days=days)
+        if df is None or df.empty or len(df) < 3: return None
+        # Validate: must have all required columns
+        required = {"open","high","low","close","volume"}
+        if not required.issubset(df.columns): return None
+        # Stockbit volume is in lots — keep as-is (consistent)
+        return df
+    except:
+        return None
 
-    Returns: (df, actual_period_used)
+
+def load_price_safe(ticker: str, requested_period: str, token: str = ""):
     """
-    # Period upgrade chain — each tried independently
+    Load price with source priority + automatic period upgrade fallback.
+
+    Source priority:
+      1. Stockbit (if token available) — better IDX accuracy
+      2. Yahoo Finance — universal fallback
+
+    Period fallback chain (outside cached functions to avoid cache poisoning):
+      "1mo" → try "1mo", "3mo", "6mo"
+      "3mo" → try "3mo", "6mo"
+      etc.
+
+    Returns: (df, actual_period_used, source_used)
+    """
+    period_to_days = {"1mo":35, "3mo":95, "6mo":185, "1y":370, "2y":740}
     chains = {
         "1mo": ["1mo", "3mo", "6mo"],
         "3mo": ["3mo", "6mo"],
@@ -1000,11 +1040,20 @@ def load_price_safe(ticker: str, requested_period: str):
     }
     periods_to_try = chains.get(requested_period, [requested_period, "3mo", "6mo"])
 
+    # Try Stockbit first (if token available)
+    if token and len(token) > 20:
+        days = period_to_days.get(requested_period, 370)
+        df_sb = load_price_stockbit(ticker, token, days)
+        if df_sb is not None and len(df_sb) >= 15:
+            return df_sb, requested_period, "stockbit"
+
+    # Fallback: Yahoo Finance with period upgrade chain
     for p in periods_to_try:
         df = load_price(ticker, p)
         if df is not None and len(df) >= 15:
-            return df, p
-    return None, requested_period
+            return df, p, "yahoo"
+
+    return None, requested_period, "none"
 
 def cmf(df, p=14):
     """
@@ -5423,33 +5472,34 @@ with tab_a:
     if run:
         st.session_state.pop("res", None)
         with st.spinner(f"Loading price data for {ticker_input}.JK ..."):
-            df, actual_period = load_price_safe(ticker_input, period)
+            df, actual_period, price_src = load_price_safe(ticker_input, period, token=sb_token)
 
         if df is None or len(df) < 15:
             st.error(
                 f"Could not load **{ticker_input}.JK** — "
-                f"no price data returned by Yahoo Finance. "
-                f"Try switching to **3M or 6M** period, or wait a few minutes and retry. "
-                f"Also try: BBCA, BREN, AMMN, ADRO, BMRI"
+                f"no price data returned. "
+                f"Try switching to **3M or 6M** period, or wait a few minutes. "
+                f"Also check: BBCA, BREN, AMMN, ADRO, BMRI"
             )
             st.stop()
 
         actual_bars = len(df)
+        src_label   = "🟢 Stockbit" if price_src == "stockbit" else "🟡 Yahoo Finance"
 
-        # Notify user if period was auto-upgraded
         if actual_period != period:
             st.warning(
-                f"⚠️ **Period auto-upgraded**: {period} had insufficient data "
-                f"({actual_bars} bars) — showing **{actual_period}** data instead. "
-                f"This is normal during early market session for IDX stocks."
+                f"⚠️ **Period auto-upgraded**: {period} → **{actual_period}** "
+                f"(insufficient data for {period}). Source: {src_label}."
             )
         elif period == "1mo" and actual_bars < 22:
             st.warning(
-                f"⚠️ **Limited data**: only {actual_bars} bars for 1M. "
-                f"Indicators less accurate. Switch to **3M or 6M** for best results."
+                f"⚠️ **Limited data**: {actual_bars} bars. "
+                f"Switch to **3M or 6M** for best results. Source: {src_label}."
             )
+        elif price_src == "stockbit":
+            st.success(f"✅ **Price data: Stockbit** — higher accuracy for IDX splits & volume.")
         elif period == "1mo":
-            st.info("💡 **1M period**: Use **3M or 6M** for VCP, Wyckoff, and RS analysis.")
+            st.info(f"💡 **1M period** via Yahoo Finance. Use **3M or 6M** for full analysis.")
 
         # Adapt CMF period to available data (p=14 standard, min 7 for short periods)
         cmf_period = min(14, max(7, actual_bars // 2))
@@ -8086,7 +8136,7 @@ with tab_s:
                 prog.progress((i+1)/len(wl), text=f"Analyzing {tk} ... ({i+1}/{len(wl)})")
                 try:
                     # Load price for selected period
-                    df_tk, _ = load_price_safe(tk, period)
+                    df_tk, _, _ = load_price_safe(tk, period, token=sb_token)
                     if df_tk is None or len(df_tk) < 15:
                         skipped.append(f"{tk}(no data)")
                         continue
@@ -8695,7 +8745,7 @@ with tab_g:
         unsafe_allow_html=True)
         for grade, gc, desc in [
             ("A","#00e676","3–4 contractions + vol dry-up + above all MAs + tight ≤6% = IDEAL. Enter at pivot breakout."),
-            ("B","#88ffbb","2–3 contractions + some volum	e contraction. Good setup, nearly ready."),
+            ("B","#88ffbb","2–3 contractions + some volume contraction. Good setup, nearly ready."),
             ("C","#ffab00","Early contraction forming. Promising but incomplete. Monitor daily."),
             ("C-","#ff8888","Contraction present but stock is BELOW key MAs. High risk — avoid or short only."),
             ("NONE","#5a7a9a","No VCP pattern detected. Use other signals only."),
