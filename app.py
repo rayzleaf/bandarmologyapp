@@ -719,31 +719,64 @@ def fetch_stockbit(ticker: str, token: str, date_from: str, date_to: str):
     if data == "EXPIRED": return "EXPIRED"
     if not data: return None
     try:
-        t       = ticker.upper().replace(".JK","")
+        rows = []
         payload = data.get("data", data)
-        if isinstance(payload, dict):
-            payload = payload.get("brokerSummary", payload)
-        buyers  = payload.get("buyer",  payload.get("buyers",  [])) if isinstance(payload,dict) else []
-        sellers = payload.get("seller", payload.get("sellers", [])) if isinstance(payload,dict) else []
-        def ep(items):
+
+        def extract_broker(items):
+            """Parse broker items — handles multiple Stockbit response formats."""
             m = {}
             for i in (items or []):
-                c = (i.get("broker_code") or i.get("brokerCode") or i.get("code","")).upper()
+                # Stockbit uses different field names across API versions
+                c = (i.get("BrokerCode") or i.get("broker_code") or
+                     i.get("brokerCode") or i.get("code","")).upper()
                 if not c: continue
-                m[c] = {"lot"  : int(i.get("lot") or i.get("volume") or 0),
-                        "value": int(i.get("value") or 0),
-                        "avg"  : float(i.get("avg") or i.get("averagePrice") or 0)}
+                m[c] = {
+                    "lot"  : int(i.get("TradedLot")   or i.get("lot")    or i.get("volume") or 0),
+                    "value": int(i.get("TradedValue")  or i.get("value")  or 0),
+                    "avg"  : float(i.get("AveragePrice") or i.get("avg") or i.get("averagePrice") or 0),
+                }
             return m
-        bm = ep(buyers); sm = ep(sellers)
-        if not (set(bm) | set(sm)): return None
-        rows = [{"broker":c,
-            "buy_lot"  : bm.get(c,{"lot":0})["lot"],
-            "sell_lot" : sm.get(c,{"lot":0})["lot"],
-            "buy_value": bm.get(c,{"value":0})["value"],
-            "sell_value":sm.get(c,{"value":0})["value"],
-            "buy_avg"  : bm.get(c,{"avg":0})["avg"],
-            "sell_avg" : sm.get(c,{"avg":0})["avg"],
-        } for c in set(bm)|set(sm)]
+
+        # Format 1: {"BrokerBuyerSummary": [...], "BrokerSellerSummary": [...]}
+        # Format 2: {"buyer": [...], "sellers": [...]} or {"buyers":[...], "sellers":[...]}
+        # Format 3: list of {"BrokerCode":..., "BuyVolume":..., "SellVolume":...}
+        # Format 4: nested {"data": {"brokerSummary": {...}}}
+
+        if isinstance(payload, dict):
+            inner = payload.get("brokerSummary", payload)
+
+            # Format 1 — Stockbit official field names
+            if "BrokerBuyerSummary" in inner or "BrokerSellerSummary" in inner:
+                bm = extract_broker(inner.get("BrokerBuyerSummary",  []))
+                sm = extract_broker(inner.get("BrokerSellerSummary", []))
+            # Format 2 — generic
+            else:
+                bm = extract_broker(inner.get("buyer", inner.get("buyers", [])))
+                sm = extract_broker(inner.get("seller", inner.get("sellers", [])))
+
+            for c in set(bm) | set(sm):
+                b = bm.get(c, {"lot":0,"value":0,"avg":0})
+                s = sm.get(c, {"lot":0,"value":0,"avg":0})
+                rows.append({"broker":c,
+                    "buy_lot":b["lot"], "sell_lot":s["lot"],
+                    "buy_value":b["value"], "sell_value":s["value"],
+                    "buy_avg":b["avg"], "sell_avg":s["avg"]})
+
+        elif isinstance(payload, list):
+            # Format 3 — flat list with BuyVolume/SellVolume
+            for i in payload:
+                c = (i.get("BrokerCode") or i.get("broker","")).upper()
+                if not c: continue
+                rows.append({"broker":c,
+                    "buy_lot"  : int(i.get("BuyVolume",  i.get("buy_lot",  0))),
+                    "sell_lot" : int(i.get("SellVolume", i.get("sell_lot", 0))),
+                    "buy_value": int(i.get("BuyValue",   i.get("buy_value",0))),
+                    "sell_value":int(i.get("SellValue",  i.get("sell_value",0))),
+                    "buy_avg"  : float(i.get("BuyAvg",   i.get("buy_avg",  0))),
+                    "sell_avg" : float(i.get("SellAvg",  i.get("sell_avg", 0))),
+                })
+
+        if not rows: return None
         df = pd.DataFrame(rows)
         df["net_lot"]   = df["buy_lot"]   - df["sell_lot"]
         df["net_value"] = df["buy_value"] - df["sell_value"]
@@ -778,28 +811,37 @@ def get_broker_today(ticker, token=""):
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_broker_accumulation(ticker: str, token: str, n_days: int = 20):
     """
-    Cumulative net lot per broker over n_days trading days.
-    = estimated accumulated position (clients' long/short bias).
-    Positive → broker clients are net long (accumulated).
-    Negative → broker clients are net short / exited.
+    Net lot flow per broker over n_days trading days.
+
+    Returns cumulative NET activity — NOT absolute holdings.
+    A broker with large position built months ago will show 0 if
+    they had no net activity in this window.
+
+    Data sources (priority order):
+    1. Stockbit: single API call with date range (startDate, endDate)
+       → Stockbit aggregates net_lot over entire range server-side
+       → cum_net = net_lot over date range (verified: Stockbit API
+         returns aggregate when startDate != endDate)
+    2. IDX Official API: fetches up to 10 days individually, sums
     """
-    days = trade_days(n_days)
+    days  = trade_days(n_days)
     today = days[0]; oldest = days[-1]
 
-    # 1. Stockbit aggregated (one call)
+    # 1. Stockbit: date-range aggregated call
     if token and len(token) > 20:
         r = fetch_stockbit(ticker, token, oldest, today)
         if r is not None and r != "EXPIRED" and len(r) >= 3:
             r = r.copy()
-            r["cum_net"] = r["net_lot"]
+            r["cum_net"] = r["net_lot"]  # net_lot = aggregate over date range
             return r, "stockbit", n_days
 
-    # 2. IDX API day-by-day (limit to 5 to avoid rate limits)
+    # 2. IDX API: fetch individual days and sum (increased from 5 to 10 days)
     dfs = []
-    for d in days[:5]:
+    for d in days[:min(n_days, 10)]:   # up to 10 days (was 5)
         df_d = fetch_idx_day(ticker, d)
         if df_d is not None:
             dfs.append(df_d)
+        if len(dfs) >= 10: break        # rate limit safety
 
     if dfs:
         combined = pd.concat(dfs, ignore_index=True)
@@ -5442,7 +5484,7 @@ st.markdown(f"""
 
 tab_a, tab_bh, tab_bt, tab_s, tab_o, tab_g = st.tabs([
     "  ANALYSIS  ",
-    "  BROKER SHAREHOLDING  ",
+    "  BROKER ACCUMULATION  ",
     "  BACKTEST & RS  ",
     "  SCREENER  ",
     "  OWNERSHIP DB  ",
@@ -7455,7 +7497,7 @@ with tab_a:
 # ══════════════════════════════════════════════════════════════════════
 
 with tab_bh:
-    st.markdown("#### BROKER SHAREHOLDING — ESTIMATED ACCUMULATED POSITION")
+    st.markdown("#### BROKER ACCUMULATION — NET FLOW ANALYSIS")
 
     # Explanation banner
     st.markdown(f"""
@@ -7465,12 +7507,13 @@ with tab_bh:
       <span style='color:#eaf0f8;font-weight:600;letter-spacing:1px'>HOW THIS WORKS</span><br>
       <span style='color:#5a7a9a'>
       We sum each broker's daily <b style='color:#cdd8e6'>net lot</b> (buy − sell) over
-      <b style='color:#00e676'>{accu_days} trading days</b> to estimate their clients' accumulated position.
-      Positive = broker clients are net long (accumulated shares).
-      Negative = broker clients are net short / distributing.<br><br>
-      <b style='color:#ffab00'>Methodology note:</b> This is the same approach used by RTI Business, Stockbit Pro, and Bloomberg
-      IDX broker screens. True sub-account holdings are KSEI private data and not publicly available per broker.
-      Lot size assumed: <b style='color:#cdd8e6'>100 shares/lot</b>.
+      <b style='color:#00e676'>{accu_days} trading days</b> to measure recent buying/selling pressure per broker.
+      Positive = net buyer in this window. Negative = net seller.<br><br>
+      <b style='color:#ffab00'>⚠️ Important caveat:</b> This shows <b style='color:#eaf0f8'>NET FLOW</b> during the analysis window,
+      <b style='color:#ff8844'>NOT actual shareholding</b>. A broker with large existing positions built months ago
+      will not appear here unless they transacted in this window.
+      For actual ownership, see the <b style='color:#cdd8e6'>Shareholders</b> section in Analysis tab (KSEI/IDX data).<br><br>
+      Same methodology as RTI Business "Broker Accumulation" screen. Lot size: <b style='color:#cdd8e6'>100 shares/lot</b>.
       </span>
     </div>""", unsafe_allow_html=True)
 
@@ -7585,13 +7628,17 @@ with tab_bh:
         # ── SHAREHOLDING CHART (only if shares_out available)
         if so and so > 0:
             st.markdown("---")
-            st.markdown('<div class="sec">ESTIMATED % OF OUTSTANDING SHARES HELD PER BROKER</div>',
+            st.markdown('<div class="sec">NET ACCUMULATION AS % OF OUTSTANDING SHARES (analysis window only)</div>',
                         unsafe_allow_html=True)
-            st.markdown(f"""
-            <div style='font-family:"IBM Plex Mono",monospace;font-size:9px;color:#5a7a9a;margin-bottom:8px'>
-              Based on cumulative net lot × 100 shares/lot ÷ {so/1e9:.2f}B shares outstanding.
-              Shows net accumulation in analysis window only — not absolute portfolio position.
-            </div>""", unsafe_allow_html=True)
+            st.markdown(
+                f"<div style='font-family:IBM Plex Mono,monospace;font-size:9px;"
+                f"color:#5a7a9a;margin-bottom:8px'>"
+                f"Net lots in window × 100 ÷ {so/1e9:.2f}B shares OS. "
+                f"<b style='color:#ffab00'>This is net FLOW %, not ownership %.</b> "
+                f"Brokers inactive this window show 0 even if they hold large positions."
+                f"</div>",
+                unsafe_allow_html=True
+            )
             fig_sh = chart_shareholding(sh_df, ticker_input, so)
             if fig_sh:
                 st.plotly_chart(fig_sh, use_container_width=True)
@@ -7657,9 +7704,9 @@ with tab_bh:
         st.markdown("---")
         st.markdown('<div class="sec">INTERPRETATION</div>', unsafe_allow_html=True)
         if fn > 10000 and rn < 0:
-            st.success(f"🔥 **STRONG ACCUMULATION**: Foreign smart money +{fn:,} lots over {BH['days']} days while retail selling {rn:,} lots. Classic Accumulation Cross — bandar absorbing supply.")
+            st.success(f"🔥 **STRONG NET BUYING**: Foreign smart money +{fn:,} lots over {BH['days']} days while retail selling {rn:,} lots. Classic Accumulation Cross — bandar absorbing supply.")
         elif fn < -10000 and rn > 0:
-            st.error(f"💀 **DISTRIBUTION**: Smart money {fn:,} lots while retail buying +{rn:,} lots. Retailer likely bag-holding for bandar.")
+            st.error(f"💀 **STRONG NET SELLING**: Smart money {fn:,} lots while retail buying +{rn:,} lots. Retailer likely bag-holding for bandar.")
         elif fn > 3000:
             st.info(f"📊 Foreign smart money net +{fn:,} lots. Moderate accumulation signal — monitor for confirmation.")
         else:
